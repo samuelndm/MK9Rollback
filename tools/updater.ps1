@@ -37,10 +37,11 @@ function Get-LatestRelease([int]$TimeoutSec = 8) {
     }
     $tag = "$($r.tag_name)"
     if ($tag -notmatch '^v(\d{8}-\d{4})$') { $script:UpdateError = "unexpected release tag '$tag'"; return $null }
+    $version = $Matches[1]  # now: the -match below replaces $Matches
     $zip = $r.assets | Where-Object { $_.name -match '^MK9Rollback-netplay-\d{8}-\d{4}\.zip$' } | Select-Object -First 1
     $sha = $r.assets | Where-Object { $_.name -eq "$($zip.name).sha256" } | Select-Object -First 1
     if (-not $zip -or -not $sha) { $script:UpdateError = "release $tag has no zip and checksum"; return $null }
-    [pscustomobject]@{ Version = $Matches[1]; Tag = $tag; ZipUrl = $zip.browser_download_url; ZipName = $zip.name
+    [pscustomobject]@{ Version = $version; Tag = $tag; ZipUrl = $zip.browser_download_url; ZipName = $zip.name
         ShaUrl = $sha.browser_download_url; Page = $r.html_url; Notes = "$($r.body)" }
 }
 

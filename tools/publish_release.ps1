@@ -36,8 +36,12 @@ MK9Rollback.dll SHA-256: $dll
 "@
 $gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
 if (-not $gh) { $gh = 'C:\Program Files\GitHub CLI\gh.exe' }
-$ghArgs = @('release', 'create', "v$stamp", $zipPath, $sha, '--repo', $repo, '--title', "MK9Rollback $stamp", '--notes', $body)
+# The notes go through a file: Windows PowerShell passes double quotes inside an argument to a program unescaped, so
+# gh split the text at them and took the pieces for asset names.
+$notesFile = Join-Path $env:TEMP "mk9r-release-notes-$stamp.md"
+[IO.File]::WriteAllText($notesFile, $body, (New-Object Text.UTF8Encoding($false)))
+$ghArgs = @('release', 'create', "v$stamp", $zipPath, $sha, '--repo', $repo, '--title', "MK9Rollback $stamp", '--notes-file', $notesFile)
 if ($Draft) { $ghArgs += '--draft' }
-& $gh @ghArgs
+try { & $gh @ghArgs } finally { Remove-Item $notesFile -ErrorAction SilentlyContinue }
 if ($LASTEXITCODE) { throw "gh release create failed ($LASTEXITCODE)" }
 "published v$stamp to $repo"
