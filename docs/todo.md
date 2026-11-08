@@ -1151,6 +1151,15 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       clang2 hold rc18; build\clang\libggpo.a is now build\ggpo_retry's (FC9817FC; sparse2 kept in build\ggpo_sparse2).
       Next: a field session on it (both players' logs: the friend's freezes with the memory figures, the network
       freezes' lengths after the resend change, moving right after an X-ray).
+    - **GitHub and the updater (2026-11-08):** public repository samuelndm/MK9Rollback (source, tools, docs; results,
+      analysis, build and dist ignored; two real SteamIDs and the Windows user name scrubbed first). The Play Online
+      window shows its version (version.txt, written by tools\package.ps1) and checks the latest GitHub release when it
+      opens (tools\updater.ps1: tag v<stamp>, assets zip + .sha256); "Update now" (game closed) downloads, checks the
+      SHA-256 and the version inside, keeps the replaced files in previous_version and restarts the window.
+      tools\publish_release.ps1 publishes a gated zip. **Release v20261108-1633** (rc18 DLL DB580C09 + the updater):
+      end-to-end test from an older install: found, downloaded, verified, installed, then "up to date". v20261108-1631
+      (published first) has an updater that read an empty version ($Matches replaced by the asset match) and never
+      offers an update: superseded, its install needs one manual download.
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as
