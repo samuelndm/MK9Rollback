@@ -1,0 +1,20 @@
+# Build outputs, release zips and test results stay local (releases go to GitHub Releases).
+/build/
+/dist/
+/results/
+# Reverse-engineering workspace: game disassembly, Ghidra runtime and logs (not ours to publish).
+/analysis/
+# RE tool outputs describing the game executable in detail.
+/docs/build_identity.json
+/docs/mk9hook_verification.json
+# Logs and local settings anywhere.
+*.log
+*.pdb
+*.obj
+*.o
+*.a
+*.exe
+*.dll
+*.zip
+/tools/netplay_gui.txt
+/tools/*.local.*
