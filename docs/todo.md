@@ -1159,7 +1159,7 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       tools\publish_release.ps1 publishes a gated zip. **Release v20261108-1633** (rc18 DLL DB580C09 + the updater):
       end-to-end test from an older install: found, downloaded, verified, installed, then "up to date". v20261108-1631
       (published first) has an updater that read an empty version ($Matches replaced by the asset match) and never
-      offers an update: superseded, its install needs one manual download.
+      offers an update: deleted from GitHub (user, 2026-11-08), together with its tag.
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as
