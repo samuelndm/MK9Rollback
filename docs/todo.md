@@ -1625,8 +1625,9 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         example); replaced by a generic one, selftest 57 / 57, packaged again from the unchanged build\clang. Entry by
         entry the two zips differ in updater.ps1 (that comment), README.txt and version.txt (the stamp) only. Notes:
         rollbacks no longer shown, aligned starts, a leaving player noticed at once, go-back in the updater; both
-        players need this version; "if the update does not take, extract the zip again" (rc27's updater). Source
-        changes rc19-rc28 are not committed. Next evidence: both players' logs from a match on it (the hello /
+        players need this version; "if the update does not take, extract the zip again" (rc27's updater). Source:
+        commit 9d7a704 on main (rc19-rc28 in one commit, pushed 11:40 after the same scan over every added line; the
+        release tag itself sits on the commit before it). Next evidence: both players' logs from a match on it (the hello /
         build-agreement path, LATENCY and TIMING lines, the DISPLAY note).
       - Not done (follow-ups, by expected value): (1) one PaceControl with a raw frame-gap exchange ('MK9T') replacing
         BALANCE's whole-frame samples and the start barrier's wait-based guess (each game's frame-0 instant sent to
