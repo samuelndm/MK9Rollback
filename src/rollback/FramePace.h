@@ -21,7 +21,22 @@ void Add(Part p, int64_t ticks);
 void Rollback(uint32_t depth);
 void SkippedSave();
 void Report(uint32_t gf);             // the window since the last report
+// Live frames of >= 25 ms whose boundary replayed (a rollback's load) and all live frames since the last call, then reset:
+// the online mode's CPU check for a 1-frame delay (src\net\OnlineMode.cpp, gCpuFloor).
+uint32_t TakeReplayHitches(uint32_t* frames);
+// For the status line (rc25): the longest wait for the other game's input and the longest frame of this PC's own (the
+// interval minus that wait) in the last 10 s, in ms (0: none of 50 ms or more), and the seconds since each.
+void Quality(uint16_t* waitMs, uint16_t* waitAgoS, uint16_t* hitchMs, uint16_t* hitchAgoS);
 void SessionReport(const char* why);  // the whole session
+// Windows power throttling of the game process (EcoQoS: lower clocks and efficiency cores for a window Windows thinks is
+// in the background; Windows 11 also drops a hidden window's timer resolution). Off from the DLL's start (dllmain);
+// 'ecoqos 1' gives the choice back to Windows (stock), 'ecoqos 0' turns it off again.
+void SetPowerThrottling(bool allow);
+
+// 'limiterwait 0|1' (default 0): MK9's frame limiter waits on a high-resolution timer instead of spinning a core for
+// the whole wait; its last 4 ms stay the game's own spin (FramePace.cpp).
+void SetLimiterWait(bool on);
+void LimiterReport(const char* why);  // the session's timer waits and late wake-ups (LIMITER line)
 
 // Present intervals, filled by the render thread (Overlay's pre-EndScene hook): 1 ms buckets, cumulative.
 constexpr int kBuckets = 256;

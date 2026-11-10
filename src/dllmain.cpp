@@ -17,7 +17,11 @@
 #include "hook/ObjectHooks.h"
 #include "hook/Ue3Refs.h"
 #include "net/OnlineMode.h"
+#include "rollback/FramePace.h"
 #include "rollback/FreeQuarantine.h"
+#include "rollback/ParallelMem.h"
+#include "rollback/RenderTag.h"
+#include "rollback/Snapshot.h"
 
 namespace {
 HMODULE gModule = nullptr;
@@ -62,6 +66,9 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
     InterlockedExchange(&gHooksInstalled, 1);
+    // A match must keep its pace when the window is not in front (alt-tab, a chat window over it): no EcoQoS / efficiency
+    // cores or lowered timer resolution from Windows for this process.
+    FramePace::SetPowerThrottling(false);
     // In-game status line (render thread, drawn before MKKE's EndScene); display only, the hooks above do not need it.
     if (!Overlay::Install()) Logger::Info("OVERLAY not installed (the game runs without the status line)");
     Logger::Info("Hook initialized successfully");
@@ -74,6 +81,7 @@ DWORD WINAPI InitThread(LPVOID) {
 extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     InterlockedExchange(&gUnloading, 1);
     Overlay::Disable();  // the stub passes through until CodePatch::RestoreAll removes it
+    RenderTag::Disable();  // frames queued from here on carry the game's own render command again
     if (InterlockedExchange(&gHooksInstalled, 0)) {
         GameLoopHook::Uninstall();
         for (int i = 0; i < 200 && GameLoopHook::InFlight() != 0; ++i) Sleep(10);
@@ -96,6 +104,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
         CodePatch::RestoreAll();
         Sleep(100);
     }
+    Snapshot::StopPageWarmer();
+    ParallelMem::Stop();
     CrashLog::StopWatchdog();
     CrashLog::Uninstall();
     Logger::Info("[MK9Rollback] ===== unload =====");

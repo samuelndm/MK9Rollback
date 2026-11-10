@@ -29,21 +29,21 @@ The window does the rest:
 - It picks the sides without asking: the lower code is player 1.
 - It re-arms after every fight.
 - It shows the log as plain status lines.
-- "Save logs to the Desktop" zips both logs for a bug report.
+- "Save logs to the Desktop" zips the logs for a bug report (send it together with your opponent's zip). Steam IDs become steam-self / steam-peer1, ..., IP addresses lan-ip-N / ip-N, and the Windows user and PC names `<user>` / `<pc>`; PRIVACY.txt in the zip lists what was replaced. "Having trouble?" lists the usual fixes for stutter and connection problems.
 
 The players still pick the same Versus fight in the game.
 
-## Inside MK9's own online mode (experimental, 2026-10-25, never run)
+## Inside MK9's own online mode (the main mode of "Play Online.bat")
 
-"Where you fight: MK9 Online" in the window arms `online <friend's SteamID64> <delay>` instead of a Versus session. Then:
+"Where you fight: MK9 Online" in the window arms `online auto <delay>` instead of a Versus session. Then:
 - **Meeting:** the two players meet through MK9's own Online menu, in a **1 vs 1** Player Match (invite or private room). King of the Hill rooms and Ranked matches always use MK9's own netcode: in King of the Hill, spectators receive the fighters' inputs through the exchange the mod replaces.
-- **Handshake:** when an online fight is active and the game's own Steam P2P connection is with the named friend, each DLL sends a hello on Steam channel 79.
+- **Handshake:** when an online fight is active and the game's own Steam P2P connection is with the opponent, each DLL sends a hello on Steam channel 79.
 - **Takeover:** once both hellos arrive, rollback starts at the first fight frame of the current fight, or of the next one if the current fight has already started.
   - The DLL takes the local side from the game's local pad list, at every fight.
   - It skips MK9's own per-frame input exchange (`0x00885F80`) on both games while a session runs.
   - It keeps the connection's idle timer at 0, so MK9 doesn't drop the opponent while its exchange is quiet.
   - When a fight ends, the session ends with it and is re-armed at once for the next fight of the same match (rematches).
-- **Fallback:** when the friend's game has no mod, the room is not 1 vs 1, or the opponent is anyone else (for example a ranked stranger), nothing changes and MK9's own netcode runs. A session that fails mid-match hands the rest of that match back to MK9's netcode.
+- **Fallback:** when the opponent's game has no mod, the room is not 1 vs 1, or the opponent is anyone else (for example a ranked stranger), nothing changes and MK9's own netcode runs. A session that fails mid-match hands the rest of that match back to MK9's netcode.
 
 **Settled by static analysis (2026-10-26).**
 - MK9 restarts its exchange at every fight (StartSendingGamepadData: rings reset, GameFrame 0, a shared RNG seed).
@@ -157,3 +157,23 @@ Then use the same `ggpo netplay ...` / `ggpo steamnetplay ...` commands as above
 - **Cost:** input delay, plus a short stall when the other side's inputs are late.
 - **Checksums:** the side channel still compares them every frame. `NETPLAY DESYNC` lines in the log mean the game itself is not deterministic between the PCs.
 - **Turning it off:** `ggpo lockstep 0` returns to rollback.
+
+## Network display and troubleshooting
+
+In a fight the top left shows `ROLLBACK  22 ms  delay 1` and a three-bar marker: green (round trip up to 60 ms, little rollback, no
+stalls), yellow (61-120 ms, 3-4 frames of rollback, or a wait of 150 ms or more for the opponent) or red (above 120 ms, 5+ frames
+of rollback, a wait of 500 ms or more, or an opponent that stopped responding). A second line explains a hiccup for a few seconds
+("Connection hiccup", "This PC hitched" when the freeze came from this PC, "Opponent not responding..."). F9 switches to the detailed
+line (rtt, ping, rollback depths, loads, kbps, queue, waits) and back; the window's "Network display" box chooses the start state
+(Compact, Detailed or Off, sent to the game as `overlay 1|2|0`). When a session stops, the line says why in plain words and that MK9's own
+netcode plays the rest of the match.
+
+If the game stutters, freezes or will not connect:
+- Allow MKKE.exe through the Windows firewall (Windows Security > Firewall > Allow an app).
+- Add the MK9 Rollback folder to your antivirus exclusions.
+- Run the game from an SSD, and turn off disk sleep.
+- On a laptop: plug it in and set the Windows power mode to "Best performance".
+- Close browsers and other heavy apps (downloads, streaming, launchers).
+- Use a wired (Ethernet) connection instead of Wi-Fi.
+- Both players need the same version ("Check for updates" in the window).
+- In a fight, F9 shows or hides the network details.

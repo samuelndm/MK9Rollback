@@ -23,6 +23,13 @@
 // strangers, never the named friend, so ranked fights keep MK9's netcode. A session that stops on a failure ends the
 // engagement; MK9's netcode plays the rest of that match, and the rematch tries again.
 //
+// The hello also carries the build (HelloProto.h: the release stamp of version.txt and EnvFingerprint's content, DLL
+// and switches prints), and a game says ready only to the same build, game files, mode and switches. Any other pair
+// keeps MK9's netcode for the match and says why once, in the log (the launcher shows it) and in the status line: the
+// other player's mod is older (also a release from before this check, whose hello is 28 bytes, or an older protocol
+// version), this mod is older, a different build, other game files, other settings. Such a pair used to engage and
+// stop at the session's environment check, in mid-fight.
+//
 // 'online auto [delay]' (kAutoPeer): no named friend. During an online fight the opponent is read from the game's own
 // connection: a SteamID64-shaped value (high dword 0x01100001, not this account) in the connection object or the
 // online manager with which Steam reports an active P2P session. The hello and the one-on-one Player/Private check
@@ -47,9 +54,17 @@ bool SkipNative();                       // the native exchange is replaced righ
 int LocalPlayer();                       // 1 or 2: which fighter this game controls in the online fight (0 = unknown)
 bool Engaged();                          // armed through the online mode for the current fight
 void OnSessionStop(const char* why);     // a P2P session ended: idle-timer grace period; a timeline restart re-arms
-bool ScanRunning();                      // the auto mode's background memory pass is running (unload waits for it)
+// A background thread of the online mode is running (unload waits for it): the auto mode's memory pass, the Wi-Fi
+// look, EnvFingerprint's build prints.
+bool ScanRunning();
 void TestScan();                         // 'onlinescan': run that pass now (logs size and time)
 const char* StatusText();                // in an online fight on MK9's netcode: why (for the status line); else null
+// Connection facts for the status line; game thread, plain reads of values kept up to date elsewhere (the Wi-Fi look
+// runs on its own thread once per match, the opponent's side comes with its hellos, the relay state is read from Steam
+// with every hello sent, twice a second). All false while unknown.
+bool LocalOnWifi();                      // this PC's default route leaves through a wireless adapter
+bool PeerOnWifi();                       // the opponent's does (its mod says so; false for a mod that does not say)
+bool LinkRelayed();                      // Steam's P2P connection with the opponent goes through Steam's relay servers
 // MK9's online connection object (its gamepad data - 0x4C3C) and the size through the end of the gamepad data; 0 when
 // no online fight data was seen.
 uintptr_t ConnectionAddress(uint32_t* size);

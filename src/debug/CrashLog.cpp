@@ -959,6 +959,38 @@ DWORD WINAPI Watchdog(LPVOID) {
                 for (size_t i = 0; i < seen.size() && i < 16; ++i)
                     sn += snprintf(sum + sn, sizeof sum - sn, " %08lX x%d", seen[i].first, seen[i].second);
                 Logger::Info("HANG? game thread stack summary (64 KB):%s", sum);
+                // rc25 SyncTest soaks (b44/b45): two hangs in UE3's purge loop 0x00516E70 (IncrementalPurgeGarbage, called
+                // from 0x005F225E at a fight's end), which with no time limit retries the current object until its
+                // vt+0x2C (IsReadyForFinishDestroy) says yes. Name that object: the purge state is at 0x00E7C068 (array
+                // +0x0C, count +0x10, index +0x18).
+                if (c.Eip >= 0x00516E70 && c.Eip < 0x00516FA0) {
+                    uint32_t arr = 0, cnt = 0, idx = 0, obj = 0, vt = 0, ready = 0, cls = 0, outer = 0;
+                    SafeRead32(0x00E7C068 + 0x0C, &arr);
+                    SafeRead32(0x00E7C068 + 0x10, &cnt);
+                    SafeRead32(0x00E7C068 + 0x18, &idx);
+                    if (arr && idx < cnt) SafeRead32(arr + 4 * idx, &obj);
+                    if (obj) {
+                        SafeRead32(obj, &vt);
+                        if (vt) SafeRead32(vt + 0x2C, &ready);
+                        SafeRead32(obj + 0x30, &cls);
+                        SafeRead32(obj + 0x28, &outer);
+                    }
+                    char on[96] = "", cn[96] = "", oun[96] = "";
+                    if (obj) Ue3Names::NameOf(obj, on, sizeof on);
+                    if (cls) Ue3Names::NameOf(cls, cn, sizeof cn);
+                    if (outer) Ue3Names::NameOf(outer, oun, sizeof oun);
+                    Logger::Info("HANG? purge loop: object %u of %u, %08X '%s' class %08X '%s' outer %08X '%s', vtable %08X, "
+                                 "IsReadyForFinishDestroy %08X", idx, cnt, obj, on, cls, cn, outer, oun, vt, ready);
+                    if (obj) {  // its nonzero dwords (fence counters, flags), to compare with the class layout
+                        char dw[1100];
+                        int dn = 0;
+                        for (uint32_t o = 0; o < 0x200 && dn < (int)sizeof dw - 24; o += 4) {
+                            uint32_t v = 0;
+                            if (SafeRead32(obj + o, &v) && v) dn += snprintf(dw + dn, sizeof dw - dn, " +%X=%08X", o, v);
+                        }
+                        Logger::Info("HANG? purge object dwords:%s", dw);
+                    }
+                }
             }
             else if (shown)  // threads with game code on their stack
                 Logger::Info("HANG?   thread %lu eip=%08lX esp=%08lX stack:%s", tids[k], c.Eip, c.Esp, line);

@@ -164,6 +164,7 @@ constexpr uintptr_t kHwPads = 0x00E221A8;
 constexpr uint32_t kPadBytes = 0x60C;
 bool gCapture = false, gSamplerHooked = false;
 uint32_t gLocalHw = 0;
+int64_t gLocalHwQpc = 0;  // when gLocalHw was sampled (QueryPerformanceCounter)
 uint8_t gPadSave[6][kPadBytes];
 bool OriginalFlags(uintptr_t pad, int k, uint32_t* out) {
     for (const Override& o : gOverride)
@@ -180,12 +181,43 @@ bool OriginalFlags(uintptr_t pad, int k, uint32_t* out) {
 }  // namespace
 }  // namespace Input
 
+namespace Input {
+namespace {
+// Late sampling (rc21, 2026-11-09 latency audit): the main loop samples the controllers (0x00404E26) before
+// TimedEngineFrame's frame-limiter wait, so the mask the session's boundary (WorldTick entry, after that wait) sends is as
+// old as the wait: 3-11 ms. While a P2P session runs ('latesample 1', SetDeferSampling), the main loop's call is
+// deferred to the boundary's start (SampleDeferredNow), one sampler call per main-loop pass as before; a pass whose
+// boundary did not run (a paused tick) samples at the next pass's usual call instead.
+volatile bool gDefer = false;
+bool gPending = false;
+uint32_t gDeferredSamples = 0, gUndeferredSamples = 0;
+void SampleCapture();
+}  // namespace
+}  // namespace Input
+
 extern "C" void __cdecl MK9R_Sampler() {
     using namespace Input;
     if (!gCapture) {
+        gPending = false;
         reinterpret_cast<void(__cdecl*)()>(kSampler)();
         return;
     }
+    if (gDefer) {
+        if (!gPending) {  // sampled at this pass's boundary
+            gPending = true;
+            return;
+        }
+        ++gUndeferredSamples;  // the last pass's boundary did not run: sample now, at the usual time
+        gPending = false;
+    } else {
+        gPending = false;
+    }
+    SampleCapture();
+}
+
+namespace Input {
+namespace {
+void SampleCapture() {
     bool restore[6] = {};
     for (int k = 0; k < 6; ++k) {
         const uintptr_t pad = kHwPads + k * kPadBytes;
@@ -205,6 +237,9 @@ extern "C" void __cdecl MK9R_Sampler() {
         if (restore[k]) memcpy(reinterpret_cast<void*>(pad), gPadSave[k], kPadBytes);
     }
     gLocalHw = m & 0xFFFFu;
+    LARGE_INTEGER sampledAt;
+    QueryPerformanceCounter(&sampledAt);
+    gLocalHwQpc = sampledAt.QuadPart;
     static uint32_t sLoggedKey = ~0u, sNonZero = 0;
     uint32_t key = 0;
     for (int k = 0; k < 6; ++k) {
@@ -218,8 +253,29 @@ extern "C" void __cdecl MK9R_Sampler() {
     }
     if (gLocalHw && sNonZero++ < 5) Logger::Info("INPUT capture: local hardware mask %04X", gLocalHw);
 }
+}  // namespace
 
-namespace Input {
+void SetDeferSampling(bool on) {
+    if (on == gDefer) return;
+    gDefer = on;
+    if (!on && gPending) {  // a deferred sample not yet taken: take it now
+        gPending = false;
+        if (gCapture) SampleCapture();
+    }
+}
+void SampleDeferredNow() {
+    if (!gPending) return;
+    gPending = false;
+    ++gDeferredSamples;
+    if (gCapture) SampleCapture();
+}
+void LogSamplingCounts() {
+    if (gDeferredSamples || gUndeferredSamples)
+        Logger::Info("LATESAMPLE: %u controller samples taken at the boundary, %u at the main loop's usual call (the pass "
+                     "before had no boundary)", gDeferredSamples, gUndeferredSamples);
+    gDeferredSamples = gUndeferredSamples = 0;
+}
+
 bool InstallSamplerHook() {
     if (gSamplerHooked) return true;
     uint8_t expected[5] = {0xE8}, replacement[5] = {0xE8};
@@ -237,6 +293,7 @@ void SetLocalCapture(bool on) {
     gLocalHw = 0;
 }
 uint32_t LocalHardwareMask() { return gCapture ? gLocalHw : 0; }
+int64_t LocalSampleQpc() { return gCapture ? gLocalHwQpc : 0; }
 
 bool IsOverridden(int player) { return player >= 0 && player < 4 && gOverride[player].active; }
 

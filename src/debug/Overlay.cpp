@@ -4,6 +4,7 @@
 #include <d3d9.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 
 #include "../hook/CodePatch.h"
@@ -125,49 +126,137 @@ float Text(const char* s, float x, float y, float scale, DWORD c) {
     return x - x0;
 }
 
-// The line for the current stats; colour by state.
-void Format(const Overlay::Stats& s, int level, char* out, size_t n, DWORD* color) {
-    *color = 0xFFFFFFFF;
+constexpr DWORD kWhite = 0xFFF2F2F2, kGreen = 0xFF40E060, kYellow = 0xFFFFD040, kRed = 0xFFFF4040, kGrey = 0xFFC0C0C0, kDim = 0xFF505050;
+
+// Connection quality from the network inputs only (not the mode): 0 good, 1 so-so, 2 bad.
+int Quality(const Overlay::Stats& s) {
+    const int rtt = s.rttMs >= 0 ? s.rttMs : s.ping;  // GGPO's ping is quantized to frames: only a fallback
+    const bool stallRecent = s.netStallAgoS <= 5;
+    if ((rtt > 120) || s.maxDepth >= 5 || s.peerInterrupted || (stallRecent && s.netStallMs >= 500)) return 2;
+    if ((rtt > 60) || s.maxDepth >= 3 || s.loadsPerSec > 20 || (stallRecent && s.netStallMs >= 150)) return 1;
+    return 0;
+}
+
+// Short player text for a raw stop reason (GgpoStop / Disengage); anything unknown is shown as it is.
+const char* StopText(const char* why) {
+    struct Map {
+        const char* key;
+        const char* text;
+    };
+    static const Map kMap[] = {
+        {"peer disconnected", "Opponent disconnected"},
+        {"did not join", "Opponent's game did not start the session"},
+        {"not starting the session", "Opponent's game did not start the session"},
+        {"environment mismatch", "Different mod version or game files"},
+        {"frame 0 differs", "Games started out of sync"},
+        {"different states", "Games started out of sync"},
+        {"Safe/Rollback", "Different Safe/Rollback setting"},
+        {"script VM was busy", "Internal timing problem"},
+    };
+    for (const Map& m : kMap)
+        if (strstr(why, m.key)) return m.text;
+    return why;
+}
+
+// The main line for the current stats. a: state text in color ca; b: an explicit suffix (DESYNC), drawn red, else empty.
+// bars: connection quality marker (3 = good .. 1 = bad), -1 none.
+void Format(const Overlay::Stats& s, int level, char* a, char* b, size_t n, DWORD* ca, int* bars) {
+    *ca = kWhite;
+    a[0] = b[0] = 0;
+    *bars = -1;
     switch (s.mode) {
     case Overlay::kRollback:
     case Overlay::kLockstep: {
         const bool lock = s.mode == Overlay::kLockstep;
-        int k = snprintf(out, n, "%s  ping %d ms  delay %d", lock ? "LOCKSTEP" : "ROLLBACK", s.ping, s.delay);
-        if (!lock && k > 0 && (size_t)k < n)
-            k += snprintf(out + k, n - k, "  rolled back: last %u, max %u (1 s), %u/s", s.lastDepth, s.maxDepth, s.loadsPerSec);
-        if (k > 0 && (size_t)k < n) k += snprintf(out + k, n - k, "  behind %d", s.behindLocal);
-        if (level >= 2 && k > 0 && (size_t)k < n)
-            k += snprintf(out + k, n - k, "  | %d loads, %d replayed, %d kbps, queue %d, waits %d", s.loads, s.replayed, s.kbps, s.sendQueue,
-                          s.barrierWaits);
-        if (s.mismatched > 0 && k > 0 && (size_t)k < n) {
-            snprintf(out + k, n - k, "  DESYNC (%d frames)", s.mismatched);
-            *color = 0xFFFF4040;
+        const int rtt = s.rttMs >= 0 ? s.rttMs : s.ping;
+        int k = snprintf(a, n, "%s", lock ? "LOCKSTEP" : "ROLLBACK");
+        if (level >= 2) {
+            if (s.rttMs >= 0 && k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  rtt %d ms", s.rttMs);
+            if (s.ping >= 0 && k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  ping %d ms", s.ping);
+            if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  delay %d", s.delay);
+            if (!lock && k > 0 && (size_t)k < n)
+                k += snprintf(a + k, n - k, "  rolled back: last %u, max %u (1 s), %u/s", s.lastDepth, s.maxDepth, s.loadsPerSec);
+            if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  behind %d", s.behindLocal);
+            if (k > 0 && (size_t)k < n)
+                snprintf(a + k, n - k, "  | %d loads, %d replayed, %d kbps, queue %d, waits %d", s.loads, s.replayed, s.kbps, s.sendQueue,
+                         s.barrierWaits);
         } else {
-            *color = lock ? 0xFFFFE060 : 0xFF60FF60;
+            if (rtt >= 0 && k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  %d ms", rtt);
+            if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  delay %d", s.delay);
         }
+        // Wi-Fi is the first thing to fix in an uneven match (other fighting games show it per player for that reason).
+        static const char* const kWifi[4] = {"", "  Wi-Fi: you", "  Wi-Fi: opponent", "  Wi-Fi: both"};
+        if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "%s", kWifi[s.wifi & 3]);
+        if (level >= 2 && s.relayed && k > 0 && (size_t)k < n) snprintf(a + k, n - k, "  (Steam relay)");
+        *bars = 3 - Quality(s);
+        if (s.mismatched > 0) snprintf(b, n, "  DESYNC (%d frames)", s.mismatched);
         break;
     }
     case Overlay::kWaiting:
-        snprintf(out, n, "ROLLBACK: waiting for the other player");
-        *color = 0xFFFFE060;
+        snprintf(a, n, "ROLLBACK: waiting for the other player");
+        *ca = 0xFFFFE890;
         break;
     case Overlay::kSyncTest:
-        snprintf(out, n, "SYNCTEST  %d loads, %d replayed", s.loads, s.replayed);
+        snprintf(a, n, "SYNCTEST  %d loads, %d replayed", s.loads, s.replayed);
         break;
     case Overlay::kStopped:
-        snprintf(out, n, "ROLLBACK STOPPED: %s", s.stopWhy);
-        *color = 0xFFFF4040;
+        snprintf(a, n, "ROLLBACK STOPPED: %s", StopText(s.stopWhy));
+        *ca = kRed;
         break;
     case Overlay::kInfo:  // an online fight on MK9's own netcode, with the reason (Online::StatusText)
-        snprintf(out, n, "%s", s.stopWhy);
-        *color = 0xFFFFE060;
+        snprintf(a, n, "%s", s.stopWhy);
+        *ca = 0xFFFFE890;
         break;
     default:
-        snprintf(out, n, "ROLLBACK OFF");
-        *color = 0xFFC0C0C0;
+        snprintf(a, n, "ROLLBACK OFF");
+        *ca = kGrey;
         break;
     }
 }
+
+// F9 switches compact <-> detailed (level 1 <-> 2); level 0 (off) is left alone. Render thread; gLevel is also set by
+// the command channel, so the switch is a compare-exchange.
+bool gHintDone = false;
+bool gF9Prev = false;
+void PollToggle() {
+    const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    const bool edge = down && !gF9Prev;
+    gF9Prev = down;
+    if (!edge) return;
+    DWORD pid = 0;
+    const HWND fg = GetForegroundWindow();
+    if (!fg || !GetWindowThreadProcessId(fg, &pid) || pid != GetCurrentProcessId()) return;
+    if (InterlockedCompareExchange(&gLevel, 2, 1) != 1) InterlockedCompareExchange(&gLevel, 1, 2);
+    gHintDone = true;
+}
+
+float TextS(const char* s, float x, float y, float scale, DWORD c) {
+    Text(s, x + scale, y + scale, scale, 0xFF000000);  // shadow
+    return Text(s, x, y, scale, c);
+}
+
+// One boxed line, cut to end before `right`. a, b are cut in place. bars >= 0: quality marker after the text.
+void DrawLine(char* a, DWORD ca, char* b, int bars, float x, float y, float scale, float right) {
+    const float barW = bars >= 0 ? 22 * scale : 0;
+    const int maxChars = (int)((right - x - barW - 8 * scale) / (kCW * scale));
+    if (maxChars < 1) return;
+    int la = (int)strlen(a), lb = b ? (int)strlen(b) : 0;
+    if (la > maxChars) a[maxChars] = 0, la = maxChars, lb = 0;
+    else if (la + lb > maxChars) b[maxChars - la] = 0, lb = maxChars - la;
+    const float tw = (float)(la + lb) * kCW * scale;
+    Quad(x - 4 * scale, y - 2 * scale, x + tw + barW + 4 * scale, y + (kCH + 1) * scale, 0xA0000000);
+    TextS(a, x, y, scale, ca);
+    if (lb) TextS(b, x + (float)la * kCW * scale, y, scale, kRed);
+    if (bars >= 0) {
+        const DWORD c = bars >= 3 ? kGreen : bars == 2 ? kYellow : kRed;
+        const float bx = x + tw + 6 * scale, by = y + kCH * scale;
+        for (int i = 0; i < 3; ++i) {
+            const float h = (float)(5 + 4 * i) * scale, l = bx + (float)i * 6 * scale;
+            Quad(l, by - h, l + 4 * scale, by, i < bars ? c : kDim);
+        }
+    }
+}
+
 
 bool Executable(const void* p) {
     MEMORY_BASIC_INFORMATION mi{};
@@ -222,24 +311,91 @@ void FirstCall(IDirect3DDevice9* dev) {
     if (bb) bb->Release();
 }
 
+// How the picture reaches the screen (round 3; once at the first draw and at each session's start): the swap chain's
+// present parameters and the refresh rate of the monitor the window is on. A match that "stutters with a good
+// connection" is often this: vertical sync against a 59.94 or 75 Hz refresh, or a 144 Hz monitor in windowed mode.
+volatile LONG gDisplayLogWanted = 1;
+void LogDisplay(IDirect3DDevice9* dev) {
+    IDirect3DSwapChain9* chain = nullptr;
+    if (FAILED(dev->GetSwapChain(0, &chain)) || !chain) return;
+    D3DPRESENT_PARAMETERS pp{};
+    const HRESULT hr = chain->GetPresentParameters(&pp);
+    chain->Release();
+    if (FAILED(hr)) return;
+    unsigned hz = 0;
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof dm;
+    const HMONITOR mon = pp.hDeviceWindow ? MonitorFromWindow(pp.hDeviceWindow, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (mon && GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hz = dm.dmDisplayFrequency;
+    const bool vsync = pp.PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE;
+    const char* note = "";
+    if (vsync && hz && (hz < 60 || hz > 61))
+        note = hz == 59 ? "; note: vertical sync at 59.94 Hz shows one frame twice every ~17 s (set the monitor to 60 Hz)"
+                        : "; note: vertical sync on a monitor that is not at 60 Hz makes the 60 fps game uneven (set it to 60 Hz, or turn vertical sync off)";
+    Logger::Info("DISPLAY: %s %ux%u, vertical sync %s (presentation interval %08X), swap effect %d, %u back buffer(s), fullscreen "
+                 "refresh %u Hz; the window's monitor runs at %u Hz%s",
+                 pp.Windowed ? "windowed" : "fullscreen", pp.BackBufferWidth, pp.BackBufferHeight, vsync ? "on" : "off",
+                 (unsigned)pp.PresentationInterval, (int)pp.SwapEffect, pp.BackBufferCount, pp.FullScreen_RefreshRateInHz, hz, note);
+}
+
 void Draw(IDirect3DDevice9* dev) {
     LARGE_INTEGER t0, t1, fq;
     QueryPerformanceCounter(&t0);
+    PollToggle();
     Overlay::Stats s = gBuf[gFront & 1];
     s.stopWhy[sizeof s.stopWhy - 1] = 0;
     const int level = gLevel;
     if (level <= 0 || (level == 1 && s.mode == Overlay::kOff)) return;
-    char line[256];
+    static char la[256], lb[256], lw[96];  // render thread only (Format writes la and lb with the same size)
     DWORD color;
-    Format(s, level, line, sizeof line, &color);
+    int bars;
+    Format(s, level, la, lb, sizeof la, &color, &bars);
     D3DVIEWPORT9 vp{};
     if (FAILED(dev->GetViewport(&vp)) || vp.Width < 64 || vp.Height < 64) return;
-    const float scale = vp.Height >= 1000 ? 2.0f : 1.0f;
-    const float x = (float)vp.X + 8 * scale, y = (float)vp.Y + 6 * scale;
+    const float scale = (float)std::max(1, (int)((double)vp.Height / 540.0 + 0.5));
+    const float x = (float)vp.X + 8 * scale, y = (float)vp.Y + 6 * scale, right = (float)vp.X + (float)vp.Width - 8 * scale;
+    const float step = (kCH + 4) * scale;
+    const bool live = s.mode == Overlay::kRollback || s.mode == Overlay::kLockstep;
     gN = 0;
-    Quad(x - 4 * scale, y - 2 * scale, x + (float)strlen(line) * kCW * scale + 4 * scale, y + (kCH + 1) * scale, 0xA0000000);
-    Text(line, x + scale, y + scale, scale, 0xFF000000);  // shadow
-    Text(line, x, y, scale, color);
+    float ly = y;
+    DrawLine(la, color, lb, bars, x, ly, scale, right);
+    ly += step;
+    // Transient warnings (a few seconds after the event; the stats are published only while the game runs).
+    DWORD wc = kYellow;
+    lw[0] = 0;
+    if (live) {
+        if (s.peerInterrupted) {
+            snprintf(lw, sizeof lw, "Opponent not responding...");
+            wc = kRed;
+        } else {
+            const bool stall = s.netStallMs >= 150 && s.netStallAgoS <= 5;
+            const bool hitch = s.localHitchMs >= 100 && s.localHitchAgoS <= 5;
+            if (hitch && (!stall || s.localHitchMs >= s.netStallMs))
+                snprintf(lw, sizeof lw, "This PC hitched: %u ms frame", (unsigned)s.localHitchMs);
+            else if (stall)
+                snprintf(lw, sizeof lw, "Connection hiccup: waited %.1f s for the opponent", s.netStallMs / 1000.0);
+        }
+    } else if (s.mode == Overlay::kStopped) {
+        snprintf(lw, sizeof lw, "MK9 netcode plays the rest of this match");
+        wc = kWhite;
+    }
+    if (lw[0]) {
+        DrawLine(lw, wc, nullptr, -1, x, ly, scale, right);
+        ly += step;
+    }
+    // Hint for the first ~8 s of the first session after the DLL loaded.
+    static ULONGLONG hintStart = 0;
+    if (live && !hintStart) hintStart = GetTickCount64();
+    if (level == 1 && hintStart && !gHintDone) {
+        if (GetTickCount64() - hintStart < 8000) {
+            static char lh[] = "F9: network details";
+            DrawLine(lh, kGrey, nullptr, -1, x, ly, scale, right);
+        } else {
+            gHintDone = true;
+        }
+    }
     IDirect3DStateBlock9* sb = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
@@ -280,9 +436,93 @@ void Draw(IDirect3DDevice9* dev) {
 }
 }  // namespace
 
+namespace {
+// ---- render latency (Overlay::SetFrameLatency) ----
+// 2026-11-09: the player compared online MK9 with current games ("they feel offline"). Online adds the input delay;
+// the game's own pipeline adds what D3D9 queues ahead of the GPU (D3D9Ex default: up to 3 frames) on top of UE3's
+// render thread. The probe measures that queue; the cap trims it.
+volatile LONG gLatencyWanted = 0;   // 0: leave the game's value
+LONG gLatencyApplied = 0;           // render thread only
+int gLatencyDefault = -1;
+constexpr int kQueries = 8;
+IDirect3DQuery9* gQuery[kQueries] = {};
+bool gQueryPending[kQueries] = {};
+int gQueryNext = 0;
+bool gQueryFailed = false;
+volatile LONG gQueueFrames = 0, gQueueSum = 0, gQueueMax = 0, gQueueFull = 0;
+
+void ReleaseQueries() {
+    for (int i = 0; i < kQueries; ++i) {
+        if (gQuery[i]) gQuery[i]->Release();
+        gQuery[i] = nullptr;
+        gQueryPending[i] = false;
+    }
+}
+
+void LatencyProbe(IDirect3DDevice9* dev) {
+    const LONG want = gLatencyWanted;
+    if (want != gLatencyApplied || gLatencyDefault < 0) {
+        IDirect3DDevice9Ex* ex = nullptr;
+        if (SUCCEEDED(dev->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&ex))) && ex) {
+            UINT cur = 0;
+            ex->GetMaximumFrameLatency(&cur);
+            if (gLatencyDefault < 0) {
+                gLatencyDefault = (int)cur;
+                Logger::Info("GPULATENCY: the device's maximum frame latency is %u (D3D9Ex)", cur);
+            }
+            if (want != gLatencyApplied) {
+                const UINT set = want > 0 ? (UINT)want : (UINT)gLatencyDefault;
+                const HRESULT hr = ex->SetMaximumFrameLatency(set);
+                Logger::Info("GPULATENCY: maximum frame latency %u -> %u (%s)", cur, set, SUCCEEDED(hr) ? "ok" : "refused");
+                gLatencyApplied = want;
+            }
+            ex->Release();
+        } else if (gLatencyDefault < 0) {
+            gLatencyDefault = 0;
+            gLatencyApplied = want;
+            Logger::Info("GPULATENCY: the device is not a D3D9Ex device; no frame latency control");
+        }
+    }
+    if (gQueryFailed) return;
+    // Frames whose query has not signalled yet: still queued or being drawn by the GPU.
+    LONG queued = 0;
+    for (int i = 0; i < kQueries; ++i) {
+        if (!gQueryPending[i] || !gQuery[i]) continue;
+        const HRESULT hr = gQuery[i]->GetData(nullptr, 0, 0);
+        if (hr == S_OK) {
+            gQueryPending[i] = false;
+        } else if (hr == S_FALSE) {
+            ++queued;
+        } else {  // device lost / reset: start over
+            ReleaseQueries();
+            queued = 0;
+            break;
+        }
+    }
+    InterlockedIncrement(&gQueueFrames);
+    InterlockedExchangeAdd(&gQueueSum, queued);
+    if (queued > gQueueMax) InterlockedExchange(&gQueueMax, queued);
+    IDirect3DQuery9*& q = gQuery[gQueryNext];
+    if (gQueryPending[gQueryNext]) {  // all slots in flight: count it and reuse the oldest
+        InterlockedIncrement(&gQueueFull);
+        gQueryPending[gQueryNext] = false;
+    }
+    if (!q && FAILED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &q))) {
+        q = nullptr;
+        gQueryFailed = true;
+        Logger::Info("GPUQUEUE: event queries unavailable; no queue measurements");
+        return;
+    }
+    if (SUCCEEDED(q->Issue(D3DISSUE_END))) gQueryPending[gQueryNext] = true;
+    gQueryNext = (gQueryNext + 1) % kQueries;
+}
+}  // namespace
+
 extern "C" void __cdecl MK9R_OverlayDraw(IDirect3DDevice9* dev) {
     InterlockedIncrement(&gInFlight);
     FramePace::OnPresent();  // presented-frame intervals (PACE lines), drawn or not
+    if (dev && gWanted) LatencyProbe(dev);
+    if (dev && gWanted && InterlockedExchange(&gDisplayLogWanted, 0)) LogDisplay(dev);
     if (gEnabled && dev) {
         if (!InterlockedExchange(&gFirstLogged, 1)) FirstCall(dev);
         if (gEnabled) Draw(dev);
@@ -344,6 +584,7 @@ void Disable() {
 }
 
 long InFlight() { return gInFlight; }
+void RequestDisplayLog() { InterlockedExchange(&gDisplayLogWanted, 1); }
 
 void SetLevel(int level) { InterlockedExchange(&gLevel, level < 0 ? 0 : level > 2 ? 2 : level); }
 int Level() { return gLevel; }
@@ -357,6 +598,15 @@ void Publish(const Stats& s) {
 void LogCounters() {
     Logger::Info("OVERLAY draws %ld, while resimulating %ld, max draw time %ld us, level %ld%s", gDraws, gResimDraws, gMaxUs, gLevel,
                  gEnabled ? "" : " (disabled)");
+    const LONG n = InterlockedExchange(&gQueueFrames, 0), sum = InterlockedExchange(&gQueueSum, 0);
+    const LONG mx = InterlockedExchange(&gQueueMax, 0), full = InterlockedExchange(&gQueueFull, 0);
+    if (n)
+        Logger::Info("GPUQUEUE: frames not yet finished by the GPU at EndScene: avg %.2f max %ld over %ld frames, ring full %ld "
+                     "(maximum frame latency %ld, 0 = the game's %d)",
+                     (double)sum / n, mx, n, full, gLatencyWanted, gLatencyDefault);
 }
+
+void SetFrameLatency(int n) { InterlockedExchange(&gLatencyWanted, n < 0 ? 0 : n > 16 ? 16 : n); }
+int FrameLatencyWanted() { return (int)gLatencyWanted; }
 
 }  // namespace Overlay

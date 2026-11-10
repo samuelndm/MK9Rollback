@@ -1160,6 +1160,488 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       end-to-end test from an older install: found, downloaded, verified, installed, then "up to date". v20261108-1631
       (published first) has an updater that read an empty version ($Matches replaced by the asset match) and never
       offers an update: deleted from GitHub (user, 2026-11-08), together with its tag.
+    - **Field session 2 (2026-11-08 21:57-22:44, v20261108-1633 / rc18 on both PCs, Steam, 19 matches, ~39 min of
+      fights): 0 desyncs; hello round trip 33-50 ms, GGPO ping 33-50; delay 2 all night; 6 freezes of 0.7-0.8 s, every
+      one a wait for the other game.** The other player's log (`mk9r-logs-20261108-224400.zip`) explains all six:
+      - 4 (22:02:38, 22:04:16, 22:11:48, 22:19:07): its live save stopped 817-832 ms in MarkKeep's SafeRead32 of a pointer
+        target (every STALL sample eip MK9R_SafeReadInsn; SaveAB -> CandidateSpans -> MarkKeep); working set 663-752 MB
+        of 888-977 MB private (ours ~ all resident): trimmed pages read back from that PC's disk.
+      - 2 (21:59:03, 22:08:05, both at a round end): MKKE's own CreateFile (0x00511CEA, GENERIC_READ, sequential scan)
+        took 836-840 ms (engine tick): that PC's disk / antivirus. Advice given: antivirus exclusion for the game folder,
+        disk sleep off, or an SSD. Its game also threw C++ exceptions (E06D7363) from a non-MKKE thread every 9-17 s in
+        the menus (third-party software in the process; none in ours).
+      - Ours: one 264 ms pause, the game thread in USER32 message dispatch through gameoverlayrenderer (Steam overlay).
+      - The player: "still feeling input lag... not like the new games, which feel offline"; a Cyrax bomb combo dropped.
+        The bomb: both games matched every frame and in 4 of the 5 Cyrax matches the other game never rolled back, so it
+        was the game's own result from the inputs as delivered (combo timed by eye, 2 frames late). Input path: the
+        hardware sampler (0x00404E26) runs before the tick in the same main-loop pass, so online = offline + the delay.
+    - **rc19 (`build\clang_rc19` D8D192BC): MarkKeep asks QueryWorkingSetEx once per scan; a target on a page outside the
+      working set is kept live unread and the page handed to a warming thread** (`coldcheck 0|1`; `trimws N` test aid
+      empties the working set every N ms). The first build without the thread kept ~40 targets a save unread on every PC
+      (floats landing in untouched GMalloc pages, which the old read had committed); with it the unaffected game keeps
+      ~38 per 600 saves.
+    - **b34/b35 (two games on this PC, combo fights, stages 7/13/3, rc19): GGPO ping in the harness is ns15 ~50 ms
+      (the field link) and ns30 ~70-85 ms.** Frames >= 34 ms per minute A/B: ns30 d2 3.6/3.6; **ns15 d1 3.0/4.3** (as
+      smooth as d2, rollbacks 68/271 a minute, depth 1.0); ns30 d1 7.2/6.3 (depth 1.5-1.7); spinB3 d1 3.6/10.3; spinB6
+      d1 5.5/119; spinB6 d2 3.6/12.7; trimB (B emptied every 2 s) d2 3.6/32.8 (the trims themselves), 0 crashes, 0 real
+      desyncs. Desyncs only the harness ones (DeadPool intro frame 192, PitDay frame 0).
+    - **rc20 (`build\clang_rc20` 533FBA39) = rc19 + delay 1 up to a 50 ms hello round trip (DelayFromPing) and a per-PC
+      floor: a round at delay 1 with >= 3 live frames per 1000 of >= 25 ms with a replay makes this PC propose 2 from
+      then on (FramePace::TakeReplayHitches, gCpuFloor).** Only a real match exercises the online delay choice (the
+      harness uses fixed delays). Launcher, package README and README say "1 frame up to a 50 ms ping".
+    - **"Professional level" review (2026-11-09, the player: "like the latest games"): three subagents (industry research,
+      network-path latency audit, save/load cost audit).**
+      - Industry: SF6 adds 0 frames below a 100 ms ping (1 at 100-199), delay only rises within a match (Infil's SF6
+        review); GGPO's guide: more than 1 frame is noticed by intermediate players; KI/Injustice 2/MKX a fixed 3; NRS
+        GDC 2018: up to 8 frames simulated in 16 ms, parallel restore, speculative saves; GGRS sparse saving when a save
+        costs more than a tick. Our transport already matches (input resend in every packet, UnreliableNoDelay, Pump
+        right before ggpo_idle and after the input is added).
+      - Latency audit: the true round trip of the field link is ~22 ms (hello and GGPO pings are whole frames: 33 or 50).
+        The local input was added (and sent) at the end of the boundary, after the poll, any rollback and the live save:
+        3.5-4 ms late on a fast PC, 5-8 ms on the slower one, more on rollback frames. The controllers were sampled
+        before MK9's frame-limiter wait (0x00404E26 before TimedEngineFrame): 3-11 ms old at the boundary.
+        kDelay1UpToMs 50 sat on the 3-frame step (the field's second-highest round trip read 49-51).
+      - Save audit: ~2.55 ms a save on the fast PC, 3.7-5.2 on the slower (VirtualQuery ~9 us there, ~2 ms a save:
+        209-242 calls); loads 6.6 ms (LoadAB 3.7, quarantine requeue 1.8). Ranked: guarded reads for the whole save,
+        fuse the requeue scan into LoadAB, adaptive sparse live saves, skip live saves of already-confirmed frames.
+    - **GPU queue (b36, rc20 1FD4C9EF, GPUQUEUE probe): the game's D3D9Ex maximum frame latency is 3, but in fights the
+      GPU had finished every earlier frame at each EndScene (avg 0.00-0.04); queues only build in loading screens.** A cap
+      of 1 ('framelatency 1') changed nothing here; left off, the probe stays for field logs.
+    - **rc21 (`build\clang_rc21` 2014E1A1) = rc20 + early send (the input added and sent at the boundary's start,
+      'earlyinput'), late sampling (the main loop's sampler call deferred to the boundary's start, after the frame wait,
+      'latesample'), kDelay1UpToMs 55, guarded-read probing through Tier E and script ('fastprobe'), the SyncTest-only
+      VirtualQuery calls skipped in P2P saves.**
+      - **b37 (rc21; ns15 d1, ns30 d1, ns15 d0): smooth; hitches/min ns15 d1 3/4.9 (rollbacks 115/230 a minute), ns30
+        d1 3.6/4.9, ns15 d0 3.6/4.9 (P99 22-23 ms).** But two PitDay fights ran desynced from frame 1 (P2 z 0.250 vs 0.000
+        before any frame): **rc21 regression in the start check, not gameplay.** GGPO saves frame 0 inside the first
+        ggpo_add_local_input (Sync::AddLocalInput when its frame count is 0); the early send added it before the boundary
+        moved checksum frame 0 (gCsStartGf) to the first unpaused frame, so frame 0 was recorded as "frame 1" ("NETPLAY
+        STATE frame 1" twice, no "frame 0" in any rc21 log) and 'frame 0 differs' never fired. rc19/rc20 stopped the
+        same harness case at frame 0 (b35). Fixed in rc22: gCsStartGf set before the early add too.
+    - **rc22 (`build\clang_rc22`) = rc21 + the start-check fix + 'skiplive' (no live save for a frame whose remote input
+      is already in: rc21's early send makes that most frames at a short round trip) + launcher input-delay choice (Auto
+      / 1 / 2 / 3 frames, saved as delay=N, sent as `online auto N`).** Launcher later also got "0 frames" (applies only
+      when both players pick it; Safe mode always takes its delay from the ping).
+      - **b38 (rc22 FFBF16CB; 12 fights, 00:52-01:20): passes.** Start check works again (ns15 d0 PitDay stopped at
+        frame 0, "different states"). Desyncs only the DeadPool intro artifact (frame 192, the same checksum pair
+        B6434367/022B9CE4 as net8 on older builds; one recovered after 28 frames, one stayed). 0 crashes; 0 loads with no
+        saved frame (24 went back a frame). Early send and late sampling on every frame (1966/1966). Per-fight P99 (ms):
+        ns15 d0 16-21, ns15 d1 16-18, ns30 d1 18-22; hitches >= 34 ms 1-4 a fight on every game; spinB6 B at d1 70-92
+        a fight (the CPU floor moves such a PC to 2 in a real match; the harness fixes the delay). The live-save skip
+        fired 0-62 of 1966 frames: the harness's one-way latency (~25 ms at ns15) exceeds 1 frame of delay; the field
+        link's (~11 ms) does not.
+      - b38 cost picture (fast PC): in-fight HITCH lines are the known once-per-process GPU stall (~45 ms at the same
+        frame on both games, boundary ~4 ms); one rollback hitch in 12 fights. Loads 6.6-7.3 ms: LoadAB 3.2-3.6 (master
+        image 1.3), quarantine 2.0-2.2 (requeue scan 1.8-2.0), attach 0.8, cinema 0.5. Saves: master 1.24-1.28, ue3cells
+        0.75-0.83, skel 0.5, tierE 0.27-0.34, script 0.32. The periodic Tier E / module-section rebuilds never appear in a
+        HITCH line (b38 and both field logs of 2026-11-08: "jobs: none" or "stallhold"): not moved.
+    - **rc23 (`build\clang_rc23` 79C5580A) = rc22 + ParallelMem: the master image's copy in every save and load and the
+      load's requeue scan split in 128 KB chunks between the game thread and up to 3 helper threads (half the logical
+      processors minus one; 'memthreads N', 0 = rc22's single-threaded passes). Same passes over the same memory at the
+      same points; the game thread takes chunks too and waits for the last one.** Not done, with reasons: precise RTT
+      (SteamBridge has no thread to stamp arrivals; reading Steam from a second thread is not promised safe; it would only
+      move the 1/2-frame boundary, and the field link already gets 1); script module partial copy (0.3-0.6 ms a save,
+      finding the changed part costs about as much as copying it).
+    - **b39 (rc22 FFBF16CB; every stage: 28 fights x ns15 d1 and ns30 d1, scripted combos, fighters varied;
+      `results\scenarios\b39*`, 01:25-02:45): 0 crashes; smooth on every stage.** Per-fight frame P99 ns15 16-19 ms
+      (Courtyard 25 / CourtyardN 21, the process's first fights), ns30 18-26 (Courtyard / CourtyardN 29). HITCH lines
+      by cause, per game over 28 fights: ns15 1-2 in-fight (outside the boundary: the GPU stall), 0 rollback; ns30 5
+      rollback hitches (avg 42-44 ms; load 10-14 + replay + replaysave) and 0-1 outside; all others are the harness's
+      session start (gf <= 9: start barrier, first replay) or end (timeline restart, gf 0). Rollbacks/min ns15 122/232,
+      ns30 260/342, depth 1.0-1.6. Loads 6.5-7.5 ms (loadab 3.3-4.1, quarantine 2.0-2.2); saves' master 1.24-1.30 ms.
+      - Checksums: the start check stopped 3 fights at frame 0 (STThrone both latencies, Street ns30: P2 z 0.250 vs
+        0.219, the harness start). 14 (ns15) / 13 (ns30) others had mismatches; **at every first mismatch both fighters
+        were identical (life, positions, meter) and only RNG A differed**, frames 3-1455. The same RNG pairs recur at the
+        same frames across stages and latencies with the leading game swapped (DeadPool and Desert 192 F617ED01 /
+        41F4F8A0; RooftopDay and RooftopDawn 61 6CEDA14C / 569AF827, RooftopDay 61 also in stages2 on 11-04; BellTower
+        143; SKThrone / Armory 4): fixed demo-script draws a frame apart, the attract-demo start-phase artifact ("Intro
+        desyncs explained" below). Fighter states (every 300 frames, live) diverged later in 5 / 9 of them. Real starts
+        keep the scripts in phase: the 2026-11-08 field match matched every frame on both games.
+    - **b40 (rc23 79C5580A, helpers on vs `memthreads 0`; stages 7/13/3, `results\scenarios\b40*`, 02:50-03:22):
+      3 helper threads on this PC (32 logical).** Per save, the master image copy 1.25-1.33 -> 0.55-0.59 ms; per load,
+      total 7.2-7.4 -> 5.4-5.7 ms (quarantine 2.2-2.4 -> 0.9-1.1, requeue scan 2.0-2.1 -> 0.67-0.88, loadab 3.6 ->
+      2.9-3.3). 0 crashes. Checksums: every helper-on fight 0 mismatches (6 fights); PitDay stopped at frame 0 in all
+      five scenarios (harness start check); the one mid-fight mismatch is DeadPool 192 F617ED01/41F4F8A0 in a
+      helpers-off run (harness artifact). The "referenced from ... restored by the cinema restore after the requeue
+      scan" notes are as frequent with helpers off and in rc22 (b38/b39): not new. Hitches per game-minute too few
+      fights to rank; spinB6 B at d1 47-73 hitches a fight (rc22 b38: 70-92).
+    - **b41 (rc23, `rngtrace 1`, ns15 d1, the 15 stages with b39 mismatches; 03:23-03:46): every mismatch is the
+      demo-script phase artifact.** 0 crashes, P99 16-19 ms. CourtyardN stopped at frame 0 (start check, P2 z). At all 12
+      first mismatches both fighters were identical and the engine's per-frame draw (0x0080F6C5) was made on both games;
+      the only difference was the script native `random` (0x008B87C1, from a script executor) drawn on one game at that
+      frame and not on the other. No other RNG caller ever differed. With SyncTest clean of it and the 11-08 field match
+      0 mismatches: harness-only, as in "Intro desyncs explained".
+    - **SyncTest soak on rc23 (9201-9202, combos + damage, 2 x 13 min, `results\synctest_soak\seed920*`): 0 crash
+      lines, both alive, 2,762 loads; 16 sync errors, all the X-ray-start class** (KISMET *_XRAY_0, VMTRACE `original
+      gate ... ret 00455594 | resim none`, actors +0x8/+0x58/+0x144): SyncTest forces rollbacks across X-ray starts,
+      which P2P avoids with the X-ray lock (rc14). 0-4 per fight, as in soaks 19-21 on older builds. (The soak rewrote
+      `summary.csv`; earlier seeds' numbers are in their logs.)
+    - **b42 (rc23, harsh links, 27 fights, `results\scenarios\b42*`, 04:27-05:20): 0 crashes; no new desync.** All
+      completed fights 0 mismatches except the DeadPool intro artifact (frames 200-295, 4 fights); PitDay frame-0 start
+      stops in 5 of 9 scenarios (harness). Per-fight P99 (ms): ns60 d2 jittery (5% out of order, 3% loss) 18-19, ns60 d3
+      17-18, ns100 d4 18-23, ns30 d2 loss 5% 16, ns30 d2 stall 18, ns60 d3 X-ray 18, ns100 d4 KO 19-20, ns30 d2 dropB
+      18-24 (max 225-233 = the 300 ms drops), ns220 d6 46-48. **Against older builds, hitches >= 34 ms per game-minute:
+      ns220 d6 66/95 (combo1 146/167, net10 125/158); ns30 d2 dropB 10.2/9.6 (drop1a/b, final1: 10-12 / 19-23);
+      ns60 d2 jittery 4.9/3.6 (net6b-net9: 3.6-14).** Three B logs have one "HANG? game thread stalled >3s" each, at gf 0
+      ~6 s after "Hook initialized" (the game's own startup load, crumb idle; 46 of 506 older logs have the same).
+    - **rc24 (`build\clang_rc24` ECE5CB4E) = rc23 + hybrid-CPU diagnostics + no Windows power throttling.** b39's ns30
+      rollback hitches ran every part ~2.5x slower than average at once (load 14-20 ms, replay saves 5-9 ms each), as on
+      a slower core (this PC: 8 performance + 16 efficiency cores; the harness's windows are hidden behind the lock
+      screen). FramePace samples the game thread's core class (GetSystemCpuSetInformation EfficiencyClass,
+      GetCurrentProcessorNumberEx) at each live boundary and after each load / replay save: HITCH lines end in
+      "; cores P|E|P+E", the session end logs "CORES session: N of M live frame intervals ... efficiency core". dllmain
+      turns Windows power throttling off for the process (SetProcessInformation ProcessPowerThrottling, EXECUTION_SPEED
+      + IGNORE_TIMER_RESOLUTION, state 0; Windows 10 before 11: execution speed only): a match keeps its pace when the
+      window is not in front. `ecoqos 1` gives the choice back to Windows.
+      - **b43 (rc24, 6 stages at ns30 d1, throttling off `b43qos0` vs Windows' choice `b43qos1`; 05:24-05:47): the
+        efficiency-core idea is not borne out here.** The game thread was on an efficiency core in 1-16 of 1966 frame
+        intervals per fight either way (PC locked, on AC power); loads 5.7-6.3 ms, master 0.56-0.58 ms either way. 0
+        rollback hitches in 12 fights per game (b39 rc22 at ns30 d1: 5 per 28; rc23's faster loads, small sample); the
+        in-fight HITCH lines are the GPU stall (boundary ~5 ms, cores P) and one 50 ms live save (cores P). Checksums:
+        every first mismatch RNG-only with identical fighters (DD14CFE6/F66D0609 at 192 in both runs, ...), one frame-0
+        stop. 0 crashes. The opt-out stays (no cost; Windows applies EcoQoS to hidden / minimized windows, which the
+        harness's are not); the "cores" note in HITCH lines tells field logs whether a hybrid PC's hitches were on
+        efficiency cores.
+      - **Release gate on rc24 (user approved 2026-11-09 08:51; `results\gate_20261109_rc24.txt`, -Soak 0): pass, zip
+        `dist\MK9Rollback-netplay-20261109-0924.zip`** (DLL SHA-256 ECE5CB4E...D430E, zip 4ED4B307...4789). Online smoke;
+        plain, auto re-arm (3 re-arms each game) and delay-change (19 changes) regressions 0/6 mismatching each, 0
+        crashes, 0 failed saves; menu walk 305 presses, no hang. build\clang / clang2 hold rc24; the released rc18 files
+        are in build\clang_rc18_backup. Not published yet (needs the user's yes).
+      - Cost left on this PC (rc24, b43): a save ~2.6 ms (SaveAB 2.0: master 0.58, skel 0.36-0.39, tierE 0.23, script
+        0.23, ue3cells 0.14-0.27, extlists 0.11; extras 0.6: cinema+motion 0.31, records 0.19), a load 4.6-5.0 ms
+        (loadab 2.3-2.8, quarantine 0.8, attach 0.8, cinema 0.4-0.6). The rest is per-object walks (writable checks,
+        pointer-like offsets, identities), not bulk copies: splitting them across threads would need per-object work
+        lists and is not done. Next evidence: both players' logs from a match on rc24 (the slower PC's SAVE / LOAD
+        PROFILE and HITCH "cores").
+    - **"Professional level" round 2 (2026-11-09 afternoon; the player: "like the latest games in industry"): five
+      subagents (industry research; patched-GGPO audit; network/timing audit; save/load cost audit; player-experience
+      audit), then rc25 (`build\clang_rc25` 549D1AAC, GGPO `build\ggpo_rc25`).** Findings that changed code:
+      - Research: our design matches the industry where sources exist (delay 0-1 under ~100 ms in SF6, 3 fixed in NRS's
+        Injustice 2 / 2XKO; between-round delay changes; frame stretching rather than skips, as GGRS recommends; all
+        unacked inputs per packet). Missing: a continuous time-sync controller (GGRS / Unity: ~10% of the error per frame).
+      - GGPO audit: GGPO's own TIMESYNC fired 3-4 frames right after stall holds (76 sessions with holds: 2.95 events
+        each, 788 without: 0.36) and BALANCE paid on top: overshoot. Frame advantage used the whole latest round trip,
+        truncated (stock comment says one way). timeGetTime clock (15.6 ms steps, wraps after 49.7 days: false
+        disconnect). Uninitialized UdpProtocol members (first ping / advantage garbage, kbps divided by 0). Disconnect
+        rewind to a frame that may be a sparse skip. GGPO's own sends (quality replies, resends) waited for the boundary's
+        last Pump. Log formatting with logging off. Socket bound to every interface.
+      - Timing audit: **'skiplive' almost never fired at delay 1** (the test was F < safe frame, which needs F+1's input,
+        sampled by the other game at its own boundary F: b38 0-62 of 1966 frames); the replay's save of a confirmed live
+        frame was always taken; **sub-frame phase uncontrolled**: at delay 1 on a ~22 ms link both games get the inputs
+        in time only while their grids are within ~5.7 ms, and MK9's limiter keeps each grid's phase forever (lopsided
+        rollbacks 68/271, 115/230, 122/232 a minute; hello 33 or 50 ms by match); hellos read after a stall inflated the
+        round trip (delay 2 for the next round); gTimesyncFrames leaked into the next session.
+      - Cost audit: VirtualQuery still on per-frame paths (3-20 us a call in multi-MB regions); the load's pointer-safe
+        merge classified every dword of ~2,200 spans although most do not differ.
+      - UX audit: one long green line whatever the link; no "opponent not responding"; launcher silent when the opponent
+        has no mod, "friend"/"offline" wording wrong, delay box ignored while running, desync message swallowed, logs zip
+        could be empty while the game holds the files.
+      **rc25 changes** (each with a switch; defaults on):
+      - GGPO (tools\build_ggpo.ps1, 7 rc25 blocks): QPC clock (base 1000); members initialized, no divide by 0;
+        `ggpo_no_disconnect_rewind`; frame advantage from half the lowest of the last 5 round trips, rounded, 0 until known
+        (`ggpo_rtt_min_ms` exported); `ggpo_after_send` hook (SteamBridge::PumpOut forwards each datagram to Steam at once);
+        logging decided once; `ggpo_bind_loopback` for bridge sessions, SIO_UDP_CONNRESET off.
+      - Time sync: GGPO's TIMESYNC counted, not paid, while BALANCE is on ('ggposync 1' = rc24); BALANCE samples only once
+        a round trip is known; debts of up to 2 frames paid 1 ms a frame ('paysmooth N S'); StallHold uses the lowest round
+        trip and rounds the one-way trip up correctly.
+      - **Phase alignment ('phasesync', RollbackManager PhaseSample / PhaseDecide):** each game counts per 120-frame window
+        the boundaries whose first poll already had the other player's input (quiet frames only), sends the share on the
+        checksum link ('MK9P'); the game with the clearly smaller share (>150 per mille; its grid leads) moves its frame
+        deadline later 0.5 ms a frame, 1-6 ms per window pair, at most 150 ms a session. PHASE lines; TIMING line per session.
+      - Saves: live frame skipped from F <= safe frame (F < safe kept with 'sparselive'); the replay's save of a confirmed
+        live frame skipped too (LiveFrameConfirmed). Re-poll after a live save made before the frame's input ('repoll').
+      - Readability checks by guarded reads ('fastreadable'); cost agent (Snapshot / Ue3Refs / ParallelMem): guarded reads
+        in CollectCells, name maps, ExternalLists; non-temporal stores into save slots (ParallelMem::CopyToSlot); load
+        merge classifies only differing dwords ('diffmerge 1'; 2 = also run the full merge and log DIFFMERGE MISMATCH, the
+        full result used); CommittedHeap cache 1,024 sorted ranges (same 120-save clear); LoadAB name flags cached.
+      - Online: hellos read more than 25 ms after the previous tick take no round-trip sample and are not echoed; "ONLINE:
+        the opponent does not run the mod" logged 5 s into such a match (launcher message).
+      - Overlay / launcher (UX agent): compact line "ROLLBACK  22 ms  delay 1" + 3-bar quality marker (rtt, depth,
+        rollbacks/s, recent stalls), F9 = detailed line, warnings "Opponent not responding", "Connection hiccup: waited
+        0.6 s", "This PC hitched: N ms frame" (FramePace::Quality, not in a session's first second), readable stop
+        reasons for 12 s; launcher: Network display Compact/Detailed/Off ('overlay N'), opponent wording, live delay
+        change, "Having trouble?" help, shared-read log zip, version in the title.
+      - Not done (follow-ups): Safe mode delay 1-2 since early send (lockstep runs needed); keyboard read through
+        GetKeyState before the frame wait (late sampling may not help keyboard players; verify); input-to-present stamp;
+        log writer thread; MK9 limiter catch-up after >= 67 ms frames (K 2 -> 6); delay 0 automatic once phase alignment
+        is proven; RepairAttachBase over the actor set; quarantine candidates by frame index.
+      - Checks: b44 (rc24 baseline vs rc25: stages 1,3,7,13,15,23 at ns15 d1 and ns30 d1 combos; diffmerge 2 check; dropB,
+        freezeB, jittery ns60 on both builds; SyncTest soak 9301-9302 with diffmerge 2).
+      - **b44 results (`results\batch_b44.txt`, `results\scenarios\b44*`).** rc24 baseline (ran twice as tag 'b': a batch
+        loop flattened its argument array and used the default dirs, which hold the same rc24 DLL; the second run's files
+        renamed b44base): ns15 d1 rollbacks per minute A/B 106/229, ns30 d1 243/365, lopsided per fight (Graveyard 33/194,
+        PitDay 7/234, Subway 5/166). rc25: **live save per frame 3.0 -> 1.0-1.5 ms at ns15 (skipped 230/116 -> 5658/5949
+        per 6 fights), boundary 3.8/3.7 -> 1.8/1.3 ms; ns30 2.9 -> 2.0 ms and 3.8/4.7 -> 2.7/3.2 ms**; ns15 rollbacks
+        106/229 -> 109/81, ns30 unchanged (one way > a frame). Hitches >= 34 ms per minute 3-4 either way. Every first
+        mismatch RNG-only with identical fighters (DeadPool 192 E5E35C8B/41F4F8A0 and DD14CFE6/F66D0609, PitDay 217, frame-0
+        start stops): the demo-script artifact. diffmerge 2 check: 0 DIFFMERGE MISMATCH. 0 crashes (one startup HANG? 6 s
+        after injection, as rc24). Network (3 fights each): dropB rollbacks A 45 -> 15; freezeB, jittery ns60 as rc24.
+      - **Phase alignment oscillated in rc25** (PHASE lines): shares flipped ~50 <-> ~970 per mille each window, 7 corrections
+        and ~40 ms moved per fight: a step sized from the share difference jumped past the balance (both games are in time
+        only within ~2 ms of it at ns15). **rc26 (`build\clang_rc26` DFC1F678): step search** (3 ms, halved on every
+        overshoot, x1.5 while the same game keeps leading, 0.5-6 ms). **b46 (rc26): ns15 d1 rollbacks per minute 7/27 (rc24
+        106/229, rc25 109/81: -90%)**, 6-8 ms moved per fight, boundary 1.1/1.3 ms, hitches >= 34 ms/min 2.4/3.6, P99 16-17;
+        ns30 d1 as rc25. First mismatches all the RNG-only artifact; 0 crashes, 0 hangs.
+      - **SyncTest soak on rc25 (9301-9302, diffmerge 2): one game hang**, the first in 144 soak logs: seed 9302 gf 5587,
+        UE3's purge loop 0x00516E70 (IncrementalPurgeGarbage from 0x005F225E, no time limit: it retries an object until its
+        vt+0x2C IsReadyForFinishDestroy says yes; ecx ~2e9 iterations), right after the fight-end "MKHEAP large request:
+        heap #2 395 KB". Sync errors 22/29 (script/spawn classes of script_scheduling.md 4b; rc23's 9201-9202 had 16, other
+        seeds), SyncTest 2.4x faster than rc24 (loads 56 -> 7 ms: VirtualQuery dominated rc24's SyncTest loads).
+        **b45 same seeds: rc24 0 hangs in 7 fights; rc25 defaults (diffmerge 1) hung again (seed 9301, fight 2, crumb
+        'rollback:resim EngineTick(6401)', same purge loop, same heap #2 request just before).** diffmerge is not it (mode 2
+        uses the full merge's bytes and hung too); phase / skiplive / re-poll are P2P only. Suspects: the larger committed-
+        range cache (classification while fight-end memory is released) and the guarded Readable/Live. rc27 adds
+        'heapcache N' (64 = rc24), 'slotnt 0|1' and a HANG? line naming the purge loop's stuck object (class, outer,
+        nonzero dwords); b47 soaks it with defaults and with 'heapcache 64' + 'fastreadable 0'.
+      - **b47/b48 (rc27 `build\clang_rc27` 482A2B69 = rc26 + those switches + the purge diagnostic): 0 hangs in 47 fights
+        with defaults** (S1 seeds 9301-9302 18 fights, b48 seeds 9303-9305 29 fights; sync errors 0-12 a fight, the known
+        classes), 0 in 7 with 'heapcache 64' + 'fastreadable 0' (that pair restores rc24's VirtualQuery-bound SyncTest
+        speed: 3-4 fights a session). rc25-rc27 SyncTest hang rate so far 2 in 75 fight ends; rc24 and older 0 in ~500.
+        Caller: 0x007F7B94 -> UObject::CollectGarbage 0x005FD6F0(0x4000000, full purge) -> 0x005F2220 -> purge 0x00516E70
+        with no time limit: a map change. Real online sessions end at MK9's results screen (game state 9), before the map
+        is unloaded, so no P2P session rolls back across it; the two-instance runs (sessions end at the timeline restart)
+        had 0 hangs in 72 fights on rc25/rc26. Working hypothesis (not confirmed): a render-thread fence counter
+        (FRenderCommandFence::NumPendingFences in a component or resource) restored as pending after the render thread
+        cleared it; rc24's SyncTest loads took 56 ms (VirtualQuery: prerestore 18.9, motion 12.4, dangling 19.5), rc25's 7,
+        so the render thread had always caught up before a load. The HANG? purge line names the object next time.
+      - **Candidate: rc27** (482A2B69; GGPO build\ggpo_rc25, now also build\clang\libggpo.a).
+      - **Gate 2026-11-09 21:51-22:23 PASSED on rc27** (user's yes; `results\gate_20261109_rc27.txt`): online smoke, the three
+        regressions (3 fights each, 6 checksum reports each, 0 mismatching, 0 failed saves, 0 crashes, 0 cut sessions; both
+        games re-armed themselves 3 times; 20 delay changes) and the 8-minute menu walk (305 key presses, no hang or crash).
+        Zip `dist\MK9Rollback-netplay-20261109-2223.zip` (DLL 482A2B69, version 20261109-2223). **Published 2026-11-09
+        23:37 as v20261109-2223 (Latest)** on the user's yes; the downloaded asset matches the gated zip (D7FB0141).
+        Next evidence: both players' logs from a field match on it (TIMING line, 'OVERLAY draws ... max draw time',
+        rollbacks a minute at delay 1). Seen in the gate's logs, neither a failure: (1) game A's overlay had one 53.9 ms draw in ~26,000 in the
+        auto re-arm run (22:05:58-22:06:08, fight 3; no HITCH on A's game thread then; the other runs' maximum 2.4-3.9 ms,
+        rc24's gate 0.9-2.6 ms): unexplained, look for it in the field logs ('OVERLAY draws ... max draw time');
+        (2) game B's boot-time 'HANG? ... crumb=idle(0)' report at gf 0, the same one older B logs have (10-29, 11-04).
+        Phase alignment in the gate (loopback, B slowed): 3-7 corrections and 4.6-26.4 ms moved a fight.
+    - **"Professional level" round 3 (2026-11-10, 00:00-06:45; the player: "like the latest games in industry, find any
+      algorithm, library, they use... launch subagents to check what we are doing wrong"): seven read-only subagents
+      (industry research; rollback presentation; input and frame pacing; time-sync controllers; session lifecycle;
+      launcher / updater / packaging; mining of the b44 / b46 / rc27-gate logs) and four implementers with disjoint files
+      (GGPO patches; log writer; hello protocol; launcher), the rest by the orchestrator. Candidate `build\clang_r3`
+      and `build\clang_r3b` (DLL 832DC235; GGPO `build\ggpo_r3\libggpo.a` 961C14E5) = rc28. **Gate passed 09:38 (the
+      player: "Run the gate"; below): build\clang / build\clang2 hold rc28, rc27 is kept in build\clang_rc27 +
+      build\ggpo_rc25. Published 11:18 as v20261110-1118 (the player: "Publish it").**
+      Findings that changed code:
+      - Log mining + presentation audit: **every replayed frame was drawn and presented** (presented = session frames +
+        replayed frames: 64-74 presents a second at ns30 d1; with vertical sync a rollback shows a stale intermediate
+        picture and can hold a refresh). Sounds: the exact-frame match doubled a sound whose frame moved by one in the
+        replay, and the P2P counters were thrown away. The first live frame of a session took 34-65 ms in 11 of 22
+        sessions, followed by a 1-frame BALANCE payment at +0.68 s in 7.
+      - Timing audit (verified in all 10 complete b46 fights): the game that waited at the start barrier sprints back onto
+        its old grid (MK9's limiter catches up every frame under 50 ms late) and plays 1-2 frames ahead: every ns15
+        rollback fell in the first 10 s. Frame advantage rounded at 16.7 / 50 / 83.3 ms, the very values a round trip read
+        at polls takes (+-1 between the games); BALANCE and the phase search paid for the same lead (20 ms for under 6);
+        'MK9P' reports of an earlier session could hide a rematch's; the CPU floor (delay 2 for the rest of the process)
+        counted deep rollbacks the other PC caused; the delay rule's limits (100/133/200/250 ms) sat on whole-frame hello
+        readings. Its harness finding: the netsim releases packets at the sender's polls only, so ns15 is exactly one
+        frame and the in-time window has no width: b46's -90% proved re-poll plus rough alignment, not convergence.
+      - Input / pacing audit: nothing measured what the player feels (controller sample to picture); Logger::Info wrote
+        and flushed the file on the game thread, plus a Flush every 60 ticks; MK9's limiter spins a core in Sleep(0);
+        the display mode was not in the logs.
+      - Lifecycle audit: a game that stops mid-fight just goes silent (the other stands 3 s at its prediction limit); a
+        build or settings difference was found 24 frames into the fight, and another online version shown as "no mod";
+        an out-of-sync match was only counted; the checksum socket listened on every interface; hello values from the
+        peer unclamped; stock GGPO asserts (= the game closes) on a malformed packet and on any sendto error, and runs
+        on without a socket after a failed bind; channel 78 was not drained at a session's start.
+      - Launcher audit (12 findings): update not transactional (a failed copy left a mixed install), SteamIDs / user
+        names / IPs in the logs zip, injector result misread, silent start failures, lost commands, no single instance.
+        **Bug in the released updater:** it cuts relative paths with the length of %TEMP% as given (often the 8.3 short
+        form) against Get-ChildItem's long names: with a user name whose two forms differ by more than one character the
+        files land in a junk folder and nothing is updated (release notes: "if the update does not take, extract the
+        zip again"; the new updater is fixed, the old one installs the new zip the old way).
+      - Research (Skullgirls, NRS, Slippi, GGRS, SF6, Steam): at parity on delay policy, time sync, packets, disconnect
+        warning and desync detection. Taken from it: replayed frames are never shown, sounds matched within a frame or
+        two, Wi-Fi / relay shown to the player, build agreement before the fight, bye packet.
+      **Changes** (each with a switch; defaults on unless said):
+      - **RenderTag (new src\rollback\RenderTag.*; 'replayskip 0|1').** The begin-drawing render command (vtable
+        0x00D59D08, queued at 0x00756C0E / 0x00757A47) gets one of two vtable copies by Rollback::gIsResimulating; the
+        replayed copy's Execute sets a mark that RHIBeginDrawingViewport's late-flag read (0x00666DF9) ORs in, so the
+        game's own late-frame path leaves out the draws and the Present (render thread only: the game thread's work in a
+        replay is unchanged, so determinism is as rc27). At most 16 in a row. REPLAYSKIP line per session. The same tag
+        carries a time stamp per frame: **LATENCY line** (FramePace): controller sample (Input::SampleCapture) to the
+        Present call of the first frame that input changes, delay frames included, p50/p95/p99/max per window and session.
+      - **WaitShift ('waitshift 0|1').** A boundary that waited for the peer (start barrier; prediction limit + stall
+        hold) moves the limiter's deadline 0x00E0AB10 by the wait in whole frames instead of letting the limiter take it
+        back. At the start barrier the one-way trip is taken off first: half of (the handshake's round trip - one frame;
+        new export `ggpo_sync_rtt_ms`, measured against the last 8 requests' send times so a retry does not stretch it):
+        the round trip is read at both games' frame polls, 0-2 frames over the wire's (r3smoke: 50-53 ms on the
+        one-frame harness link; half of that moved 1 frame where 2 were needed). WAITSHIFT lines, count in TIMING.
+      - **Handshake polls ('handshakepoll 0|1', off).** With 1 the paused wait for the session polls every millisecond
+        for 12 ms of each frame: the handshake is two frames shorter and its round trip is the wire's (27-31 ms where
+        the frame polls read 29-39), the estimate then being half of it as read. Not the default: on the timed netsim
+        (below) the frame-0 wait no longer told which game was ahead (26-28 ms on every start: a round trip, because
+        the game that ran second sends its first input one trip after the first one ran). Its one-frame shift was given
+        back by a BALANCE frame 1.2 s later in 3 of 5 starts, against 0 of 6 with frame polls; on the stock netsim 3 of
+        6 fights began with 23-58 rollbacks (batch r3c) against 0-3 (batch r3). To use the exact round trip the start
+        has to be timed some other way (follow-up 1).
+      - **First input ('firstretry N', default 3; GGPO `ggpo_first_input_retry_ms`).** Found with the handshake polls
+        (batch r3b, 82F32EC8): GGPO's two handshakes are independent and a side drops every input packet until its own
+        is done. The game that ran first (by 13-17 ms in 4 of 6 starts) sent its frame-0 input into that; the copy came
+        34 ms later ('netretry'), so the later game waited 29-32 ms at frame 0 and its WaitShift took the wait for a
+        lead: both games moved a frame, the real 14 ms lead stayed (2 of 6 fights: 32 and 17 rollbacks, a BALANCE give,
+        22.0 ms of phase moves). Until the peer's first input is in, pending inputs are sent again every 4 ms (batch
+        r3c: no start with both games waiting any more). The fast resend has no bound of its own: it ends with the
+        peer's first input or the disconnect timeout (a peer that never answers gets ~250 small packets a second for
+        those seconds; a bound was left out on purpose, the start barrier holds the game meanwhile anyway).
+      - **Timed netsim ('netsimtimed 1', test only; GGPO `ggpo.network.timed`).** The stock simulator keeps a packet
+        in the sender's queue and looks at it only when the sender polls: once a frame in a session, so 'netsim 15'
+        was exactly one frame of trip on the sender's frame grid and nothing under a frame could be measured (the
+        timing audit's harness finding). Timed, the packet leaves at once with its due time (8 bytes more; the
+        system-wide performance counter, both test games being on one PC) and the receiver holds it until then: read
+        at the receiver's first poll after the due time, as on a real link; delay drawn once per packet, 2/3..1 x,
+        order kept. **First faithful measure of delay 1 at a ~28 ms round trip (batch r3d, 'netsim 15', 12 fights):
+        0-3 rollbacks a fight; in 10 fights every 2 s window had each game's input in at the other's first poll in
+        990-1000 of 1000 frames, in the first fight of each run from the third window on (6 ms of phase moves; the
+        alignment then carries over to the next fights, which whole-frame shifts keep); LATENCY p50 19-21, p99 20-26
+        ms.** The stock mode stays the default of the scenario sets (comparable with every batch before).
+      - Phase search ('phasegrow N', default 2; 1 = rc27): the step grows only from the third decision in a row with the
+        same leader (r3smoke: it grew right after each halving, 3.0 4.5 | 2.2 3.4 | 1.7 2.5 ..., swinging all fight).
+        Reports for windows this session cannot have reached are dropped; a BALANCE give cancels the phase move still
+        due and quiets the phase measure 60 frames; so does a delay change (and restarts the BALANCE samples).
+      - GGPO (tools\build_ggpo.ps1, blocks marked round 3; subagent + two of mine): `ggpo_bye_on_close` (three input
+        packets with stock's disconnect_requested at the close: the receiver, an older build too, raises DISCONNECTED in
+        ~2 ms); every length / count / index the peer sends is validated and a bad packet dropped (16 of 16 malformed
+        cases survive; stock asserted); `ggpo_bind_failed`; sendto errors logged, not asserted; frame advantage rounded
+        with edges at 25 / 58 / 92 ms. DLL side: the bye is sent for stops that are not a normal end (not "match over",
+        "restart", "timeline restart"); a session whose port cannot be bound is refused with the Windows error; a peer's
+        bye that arrives while this game's own out-of-sync count is past half its limit is reported as out of sync.
+      - **Out-of-sync stop ('desyncstop N', default 120; 0 = rc27):** in an engaged online match the session stops after
+        120 compared frames in a row differ ("NETPLAY: the two games went out of sync"); harness sessions keep running.
+      - Checksum / phase socket: bound to 127.0.0.1 and connect()ed to the peer for bridge and one-PC sessions.
+      - **Hello (subagent; new src\net\HelloProto.*, OnlineMode, SteamBridge, EnvFingerprint):** 52 bytes, the first 28 as
+        before (version 4): release stamp, content and DLL prints, switch print, Wi-Fi flag. `ready` stays 0 unless both
+        prints match, so two different builds (this one against rc27 too) never start a rollback session: MK9's netcode
+        plays, and the log says which side is older ("ONLINE: the other player's mod is older" / "this mod is older than
+        the other player's" / "is a different build" / "game files differ" / "runs with other settings"). Delay values
+        clamped to 8, player index to 1-2; channel 78 drained at Start (77 kept: GGPO's first sync request may wait
+        there); `SteamBridge::UsingRelay`, default route on Wi-Fi; overlay detail line: "Wi-Fi: you / opponent / both",
+        "(Steam relay)". Host test: 85 checks. Delay limits 108 / 142 / 208 / 258 ms (off the whole-frame readings).
+      - **Log writer thread (subagent; Logger.cpp/.h):** Info / Frame format on the caller and append to memory under a
+        short lock; a below-normal thread writes (Info wakes it, Frame within 100 ms); Flush is a bounded synchronous
+        drain for the crash / exit paths; exit-time lock orphans handled (HEAD lost its last lines in 58 of 60 heavy
+        exits, new 0 of 360); same bytes in the files. Info on the caller 12.1 -> 0.7 us median, worst 435-822 -> 0.9-2.1
+        ms in a 4-thread burst. The Flush every 60 ticks is gone (GameLoopHook). LOGIO line per session.
+      - FramePace: the CPU floor counts only frames >= 25 ms with a load of depth 1 after frame 300; DISPLAY line once per
+        device (windowed / fullscreen, size, vertical sync, refresh rate, a note for vertical sync on a monitor that is
+        not at 60 Hz); **'limiterwait 0|1' (default 0)**: MK9's limiter Sleep(0) loop (0x004026FF) waits on a
+        high-resolution timer until 4.7 ms before the deadline, the final spin unchanged.
+      - Sounds ('soundnear N', default 2): a replayed sound matches the original within N frames inside the replayed
+        span (kept, not doubled); SOUND line per session. Commands are taken by renaming the command file (a command
+        written while the DLL read the file was lost).
+      - **Launcher (subagent; tools\netplay_gui.ps1, updater.ps1, launcher_lib.ps1, launcher_selftest.ps1, package.ps1,
+        Play Online.bat, injector):** allow-listed extraction and a transactional file swap with rollback and a "Go back
+        to the previous version" button; installed-files check before Play; logs zip without SteamIDs, user names, IPs
+        (stable pseudonyms); injector exit codes 0-7 with retries; one message table (the new ONLINE / NETPLAY lines
+        included); background update / zip / Wi-Fi check; commands acknowledged; single instance; DPI; "Last match"
+        line. Selftest: 57 checks with no game open (the two restore checks run only then; with one open the refusal
+        is checked instead).
+      **Checks** (one PC, two instances, PC locked; `results\batch_r3.txt`, `results\scenarios\r3*`; baseline b46 = rc26):
+      - Host tests, now in the repo (`tests\host\run.ps1 [-GgpoLib ...] [-Only hello,ggpo,logger]`, no game needed):
+        hello 85 checks; GGPO against a hand-made remote that sends malformed datagrams of 14 kinds into a valid 60 Hz
+        session (16 with the pre-handshake and never-acknowledging cases; stock asserted); log writer stand-alone
+        (240,000 lines, 360 exits). Launcher selftest 57 (`tools\launcher_selftest.ps1`). None of the hello /
+        engagement path or the launcher's game-attached paths runs in the one-PC harness: the gate and a field match
+        cover them.
+      - r3smoke (C7633F01, before the estimate fix and 'phasegrow'): LOGIO longest write 0-1 ms; DISPLAY line
+        (fullscreen 1920x1200, vertical sync on, 165 Hz: the note fires on this PC); rollbacks worse than b46
+        (32-45 a fight) = the two faults fixed above.
+      - **Batch r3 (F7F5AC2F = all but the handshake polls; 02:16-03:56). Stages ns15 d1, 6 fights: rollbacks per fight
+        0/0, 0/3, 0/0, 0/0, 0/0 (one fight = the known frame-0 start stop): 0 / 1 a minute (b46 7 / 27, rc24 106 /
+        229)**; every waiting start moved 2 frames; 0 BALANCE gives; phase moved 6.0-6.8 ms a fight; presented 9828 of
+        9830 frames; LATENCY p50 20-23, p95 22-25, p99 22-27 ms (max 75-101 = the frame at the fight's end).
+        **Stages ns30 d1: presented 9822 of 9830 (b46: 64-74 a second)**, 652 / 1796 replayed frames not drawn, 0 forced;
+        rollbacks 98-159 / 201-254 a fight as b46 (the trip is longer than the delay); LATENCY p50 21-24, p99 26-35.
+        ns30_d2: 34 / 4 rollbacks a minute (fight 1: the 3-frame start above), LATENCY p50 37-39, p99 40-44.
+        ns60_d2_jittery: all three fights in sync, 117-126 loads a fight, LATENCY p50 39-40, p99 45-48.
+        Stalls (780 ms freezes, packet drops on B): 0 crashes, sessions recover, WAITSHIFT 46-47 / 11-14 frames at the
+        prediction limit. Checksums: b46's pattern fight for fight (the RNG-only intro mismatches and start stops of
+        the harness), nothing new; 0 crash lines anywhere.
+      - A/B on the same build (3 fights each): **'replayskip 0' -> 64.8 presents a second, on 59.7**; **'waitshift 0'
+        -> 57 / 12 rollbacks a minute at ns15 with BALANCE gives and 21.5 ms phase moves, on 0-2**; 'phasegrow 1' ->
+        35 a minute and 20.0 ms moved in fight 1 against 25 and 12.1 (one bad start each: small sample); 'soundnear 0'
+        -> no replayed sound was a frame or two off in either run (the case needs a longer or rougher link);
+        **'limiterwait 1' -> 10,000+ timer waits a session, at most 0.6 ms late, frame p99 16-17 ms, rollbacks and
+        latency as the base run: no regression and no gain measured here, so it stays off** (its gain is a core not
+        spun, which matters on 2-4 core PCs: try it in the field).
+      - Batches r3b (82F32EC8, handshake polls on) and r3c (68CFA19E, + first-input retry), stock netsim, stages ns15
+        d1: rollbacks per fight A 0/0/0/32/0/17, B 0/0/11/0/0/0, then A 2/0/0/4/0/36, B 58/0/3/0/23/0. r3b's two bad
+        fights had both games waiting at frame 0 (the dropped first input, fixed in r3c); r3c's three had one game
+        1.3 frames ahead by the wait and moved one. Both stopped early once understood.
+      - **Batch r3d (2E489D5E), timed netsim, stages ns15 d1, 6 fights each: 'handshakepoll 1': rollbacks 0/2, 0/0,
+        0/0, 0/0, 0/0, 0/0 but a BALANCE frame at 1.2 s in 3 of 5 starts (the start shift undone, or a second frame
+        needed; no input changes that early in the scripted fights, so no rollbacks came of it); 'handshakepoll 0':
+        3/0, 0/0, 0/0, 0/0, 0/0, 0/0, no BALANCE frame, every waiting start moved 1 or 2 frames and stayed.**
+      - **Batch r3f (832DC235 = the candidate: handshake polls off, first-input retry 3, GGPO 961C14E5; 04:58-05:59,
+        `results\batch_r3f.txt`, `results\scenarios\r3f*`, 30 fights). Timed netsim, stages ns15 d1: 0 rollbacks in all
+        6 fights on both games**, no BALANCE give, every 2 s window 1000/1000 from the first in 5 of 6 fights (3 ms of
+        phase moves in fight 1), presented 11795 of 11796 frames, LATENCY p50 19-20, p99 20-26 ms. Timed ns30 d1 (a
+        ~55 ms round trip held at delay 1): 103-222 rollbacks a fight, presented 59.7 a second, 843 / 1130 replayed
+        frames not drawn, 0 forced, LATENCY p50 21-24, p99 26-32. Timed ns30 d2: rollbacks 0/4, 0/0, 0/0, LATENCY p50
+        36-38, p99 37-40. Timed ns60 d2 jittery: 105-126 rollbacks a full fight, presented 59.4-59.6 a second, LATENCY
+        p50 38-39, p99 39-48; one 273.5 ms start wait moved 13 frames. Stock netsim, stages ns15 d1: rollbacks A
+        0/2/1/15/1/0, B 0/0/17/1/0/10 (b46: 2/0/2/10/0/10 and 41/23/0/0/5/20; the one-frame link has no in-time
+        window, so this run only says "no regression"), LATENCY p50 20-22, p99 22-27. Stalls on B (stock ns30 d2):
+        780 ms freezes -> 9 stall holds, 9 prediction-limit shifts, all three fights in sync; packet drops -> recovered,
+        in sync. No stop, out-of-sync or disconnect line, 0 crash lines; the only hang line is the boot-time report on
+        game B that every batch has. A timed run is the stock scenario plus one setup command: `tools\scenario_matrix.ps1
+        -Set stages -Only stages_ns15_d1_combo -StageList 1,3,7,13,15,23 -Setup 'netsimtimed 1' -Dirs build\clang_r3,
+        build\clang_r3b -Tag <tag>`.
+      - **Checksums, classified (new `tools\desync_digest.ps1 [-Filter 'r3f*']`: per fight, which fields of the two
+        games' first mismatch differ and how their 300-frame state samples compare; exit code = fights with life or
+        meter apart).** r3f: 17 of 30 fights without a mismatch, 3 frame-0 start stops, 8 with RNG A only first
+        (Courtyard and RooftopDay as in every batch; Graveyard / PitDay at 192 like b46's PitDay and the DeadPool 192 of
+        batch r3), and 2 with positions first: Graveyard frame 157 (timed run, 0 loads on either game: P2 123.021
+        against 122.031, to the digit the walk step of net4's DeadPool with the same fighters) and PitDay frame 180
+        (both fighters 0.001 apart, then a constant 0.010 for the whole fight with life, meter and RNG A equal at every
+        sample). **0 fights with life or meter apart.** Over every scenario log kept (1082 fights): 19 position-first
+        mismatches after frame 9 since net1, 11 of them a constant offset under 0.5 for the rest of the fight; such an
+        offset also follows an RNG-only start in a fight without a single load (r3f timed PitDay: 0.004). So both are
+        the attract-demo start-phase class (the two games reach their first fight frame at different points of the
+        intro), not the rollback: still unproven until a two-PC match (the 11-03 field test had 0 mismatches). Life or
+        meter apart: 12 fights in all, in net2 ... xray6b and b44base, none in b46 or any r3 batch.
+      - **SyncTest soak on the candidate (06:10-06:38, `results\synctest_soak_r3`; seed 9311 random input, 9312
+        scripted combos): 18 fights, 6,366 loads, 25,464 replayed frames, 0 crash or hang lines, both games alive.**
+        Sync errors 20 + 22, the classes of the rc27 soak (9301 / 9302: 22 + 29): 8 end-of-fight groups of 4 ("replay
+        ended at gf=4"), and in the combo session 10 errors at frames 48-108 with the same actor signature as rc27's
+        at 40-156 (+8 00104010>00104000, +58 7>0: the start class of the poked-meter combo sessions). No new class.
+      - Final runs on the candidate (06:08): `tests\host\run.ps1 -GgpoLib build\ggpo_r3\libggpo.a`: hello 85 / 85, GGPO
+        14 / 14 cases, log writer all checks; launcher selftest 57 / 57 with no game open (both restore checks ran).
+        Released files untouched (build\clang DLL 482A2B69, libggpo 5C505AEF).
+      - **Gate on rc28 (09:05-09:38, PC unlocked, `tools\queued_checks.ps1 -Now -Soak 0`, `results\
+        gate_20261110_rc28.txt`): PASS.** Online smoke (hooks installed, armed, disarmed); plain, auto re-arm and
+        delay-change regressions each 3 fights, 6 checksum reports, 0 mismatching, 0 failed saves, 0 crashes, 0 cut
+        sessions (both games re-armed themselves 3 times; 21 delay changes applied); menu walk 305 key presses, no
+        hang or crash, game responding. OVERLAY "while resimulating" 0 in all three runs (rc27: 61 / 47 / 21: the
+        replayed frames are no longer drawn), max overlay draw 4.5-5.6 ms (rc27 had one of 54 ms). The only hang
+        lines are one boot-time report on game B (delay-change run, 6 s after the process start, crumb idle).
+        **Zip: `dist\MK9Rollback-netplay-20261110-0938.zip`** (SHA-256 ABD30923...; DLL 832DC235 and injector 6456D98B
+        inside, version.txt 20261110-0938, 11 files, all on the updater's allow-list).
+      - **Published 11:18 (the player: "Publish it"): v20261110-1118, Latest** (`dist\MK9Rollback-netplay-20261110-
+        1118.zip`, SHA-256 1FD01499...; the downloaded asset matches). Not the 0938 zip: the scan before publishing
+        found the short form of this PC's Windows profile folder in a comment of tools\updater.ps1 (the short-path
+        example); replaced by a generic one, selftest 57 / 57, packaged again from the unchanged build\clang. Entry by
+        entry the two zips differ in updater.ps1 (that comment), README.txt and version.txt (the stamp) only. Notes:
+        rollbacks no longer shown, aligned starts, a leaving player noticed at once, go-back in the updater; both
+        players need this version; "if the update does not take, extract the zip again" (rc27's updater). Source
+        changes rc19-rc28 are not committed. Next evidence: both players' logs from a match on it (the hello /
+        build-agreement path, LATENCY and TIMING lines, the DISPLAY note).
+      - Not done (follow-ups, by expected value): (1) one PaceControl with a raw frame-gap exchange ('MK9T') replacing
+        BALANCE's whole-frame samples and the start barrier's wait-based guess (each game's frame-0 instant sent to
+        the other, or one agreed start instant: then 'handshakepoll 1' and its exact round trip can be the default),
+        and a faster phase search (40-frame windows, 4 ms first step), all measured on the timed netsim; (2) the
+        scenario sets on the timed netsim by default once a baseline batch exists (new numbers are not comparable with
+        b46 and before), plus sub-frame jitter and loss cases;
+        (3) a visible "waiting for the opponent" state (the wait blocks inside the boundary, so the overlay cannot say
+        it) and a coordinated stop frame; (4) delay from measured margins between rounds, delay 0 when both shares stay
+        >= 990; (5) stopping the sound of a mispredicted frame, late-start seek, announcer hold (game functions not
+        found yet; lead: "STOPSOUND" 0x58B8B7); (6) key messages pumped at the boundary for keyboard players (probe
+        first); (7) signed releases (needs the user's decision: an offline RSA key); (8) ISteamNetworkingMessages
+        (the legacy P2P interface is deprecated); desync recovery; input recording for offline desync replay; VERSIONINFO;
+        the phase target when the one-way trip exceeds the delay; clock-rate feed-forward and a rate cap instead of the
+        150 ms session total; "connection too slow" from a 330 ms hello; MatchMode check; auto-mode opponent memory.
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as

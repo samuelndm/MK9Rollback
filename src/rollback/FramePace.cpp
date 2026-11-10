@@ -6,11 +6,13 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <vector>
 
 #include "../debug/CrashLog.h"
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
 #include "../hook/ObjectHooks.h"
+#include "RenderTag.h"
 
 namespace FramePace {
 namespace {
@@ -32,6 +34,9 @@ double Ms(int64_t t) { return t * 1000.0 / (double)Freq(); }
 
 volatile LONG gPresent[kBuckets];  // cumulative present intervals (render thread)
 volatile LONG gPresentMaxUs = 0;   // since the last report
+// Controller sample -> present call of the first frame that sample changes (render thread; RenderTag carries the
+// sample's time with the frame): 1 ms buckets, cumulative. LATENCY lines.
+volatile LONG gLatency[kBuckets];
 
 struct Stats {
     uint32_t hist[kBuckets];
@@ -42,14 +47,31 @@ struct Stats {
     uint32_t skipped;
     int64_t t0;
     uint32_t present0[kBuckets];  // gPresent at the start
+    uint32_t latency0[kBuckets];  // gLatency at the start
     LONG presentMaxUs;
 };
 Stats gWin, gSes;
 int64_t gLast = 0;
+// The status line's connection-quality feed (rc25, Quality): the longest wait for the other game and the longest frame of
+// this PC's own (the interval minus that wait) in the last kQualityWindowMs, with when each was measured. Anything under
+// 50 ms is ordinary and not kept. Game thread only.
+constexpr ULONGLONG kQualityWindowMs = 10000;
+struct Peak {
+    uint32_t ms = 0;
+    ULONGLONG at = 0;  // GetTickCount64 when measured; 0 = none
+};
+Peak gNetWait, gLocalHitch;
+void KeepPeak(Peak& p, double ms) {
+    if (ms < 50.0) return;
+    const ULONGLONG now = GetTickCount64();
+    if (!p.at || now - p.at >= kQualityWindowMs || ms >= p.ms) p = {(uint32_t)ms, now};
+}
 int64_t gFramePart[kParts];  // the current frame's boundary parts (per-frame maxima)
+uint32_t gFrameDepth = 0;    // and its deepest rollback
 const char* gNotes[6];       // periodic jobs that ran in the current interval (Note)
 int gNoteN = 0;
 uint32_t gHitches = 0;       // intervals >= 40 ms this session
+volatile LONG gReplayHitches = 0, gTakeFrames = 0;  // TakeReplayHitches (game thread writes, reads at round locks)
 
 // Memory at long hitches (2026-11-08, field session): the friend's game stopped ~830 ms four times, twice inside the live
 // save, and the mod raises the game's private memory ~650 -> ~950 MB, so paging is a suspect. Each boundary reads the
@@ -74,6 +96,7 @@ void Begin(Stats& s) {
     memset(&s, 0, sizeof s);
     s.t0 = Now();
     for (int i = 0; i < kBuckets; ++i) s.present0[i] = (uint32_t)gPresent[i];
+    for (int i = 0; i < kBuckets; ++i) s.latency0[i] = (uint32_t)gLatency[i];
 }
 int Pct(const uint32_t* h, uint32_t n, double p) {
     if (!n) return 0;
@@ -108,8 +131,96 @@ void Print(const char* tag, uint32_t gf, const Stats& s) {
                  s.presentMaxUs / 1000.0, AtLeast(ph, 20), AtLeast(ph, 34), AtLeast(ph, 50), pf(kLiveSave), pf(kLoad), pf(kReplayTick),
                  pf(kReplaySave), pf(kWait), pf(kExtra), other, pf(kBoundary), Ms(s.partMax[kBoundary]), Ms(s.partMax[kReplayTick]),
                  Ms(s.partMax[kWait]), s.rollbacks, s.rollbacks ? (double)s.depthSum / s.rollbacks : 0.0, s.depthMax, dh, s.skipped);
+    // Its own line: the tools parse the PACE line's format.
+    uint32_t lh[kBuckets], ln = 0;
+    for (int i = 0; i < kBuckets; ++i) ln += lh[i] = (uint32_t)gLatency[i] - s.latency0[i];
+    if (ln)
+        Logger::Info("LATENCY %s gf=%u: controller sample to the present call of the first frame it changes (the input delay's "
+                     "frames included), %u frames: ms p50 %d p95 %d p99 %d max %d, >=67ms %u >=100ms %u",
+                     tag, gf, ln, Pct(lh, ln, 0.5), Pct(lh, ln, 0.95), Pct(lh, ln, 0.99), Pct(lh, ln, 1.0), AtLeast(lh, 67), AtLeast(lh, 100));
+}
+
+// Hybrid CPUs (2026-11-09, b39): the ns30 rollback hitches ran every part ~2.5x slower than average at once (load 14-20
+// ms, replay saves 5-9 ms each), as on a slower core. The game thread's core class is sampled at each live boundary and
+// after each load / replay save; HITCH lines say which class the interval saw and the session's end counts the frames.
+using GetCpuSetsFn = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
+using GetProcNumExFn = VOID(WINAPI*)(PPROCESSOR_NUMBER);
+int gHybrid = -1;              // -1 not checked yet, 0 one core class (or unknown), 1 hybrid
+uint8_t gCoreClass[4][64];     // [group][logical processor] -> SYSTEM_CPU_SET_INFORMATION EfficiencyClass (0xFF unknown)
+uint8_t gTopClass = 0;         // the fastest class (performance cores)
+GetProcNumExFn gProcNum = nullptr;
+uint32_t gFrameCores = 0;      // this interval's samples: 1 a performance core, 2 an efficiency core
+uint32_t gSesEFrames = 0, gSesCoreFrames = 0;
+void CoreInit() {
+    gHybrid = 0;
+    memset(gCoreClass, 0xFF, sizeof gCoreClass);
+    const HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    const auto sets = reinterpret_cast<GetCpuSetsFn>(reinterpret_cast<void*>(GetProcAddress(k, "GetSystemCpuSetInformation")));
+    gProcNum = reinterpret_cast<GetProcNumExFn>(reinterpret_cast<void*>(GetProcAddress(k, "GetCurrentProcessorNumberEx")));
+    if (!sets || !gProcNum) return;  // before Windows 10: no classes
+    ULONG len = 0;
+    sets(nullptr, 0, &len, GetCurrentProcess(), 0);
+    if (!len || len > (1u << 20)) return;
+    std::vector<uint8_t> buf(len);
+    if (!sets(buf.data(), len, &len, GetCurrentProcess(), 0)) return;
+    uint8_t lo = 0xFF, hi = 0;
+    // SYSTEM_CPU_SET_INFORMATION: Size +0, Type +4 (0 = CpuSetInformation), Id +8, Group +12, LogicalProcessorIndex +14,
+    // EfficiencyClass +18 (higher = faster); entries are Size bytes apart.
+    for (ULONG at = 0; at + 20 <= len;) {
+        DWORD size = 0, type = 0;
+        memcpy(&size, &buf[at], 4);
+        memcpy(&type, &buf[at + 4], 4);
+        if (size < 20 || at + size > len) break;
+        if (type == 0) {
+            WORD group = 0;
+            memcpy(&group, &buf[at + 12], 2);
+            const uint8_t lp = buf[at + 14], cls = buf[at + 18];
+            if (group < 4 && lp < 64) gCoreClass[group][lp] = cls;
+            if (cls < lo) lo = cls;
+            if (cls > hi) hi = cls;
+        }
+        at += size;
+    }
+    gTopClass = hi;
+    gHybrid = hi > lo ? 1 : 0;
+    if (gHybrid) {
+        int e = 0, n = 0;
+        for (auto& g : gCoreClass)
+            for (uint8_t c : g)
+                if (c != 0xFF) ++n, e += c < hi;
+        Logger::Info("CORES: hybrid CPU, %d of %d logical processors are efficiency cores (class < %u)", e, n, hi);
+    }
+}
+void SampleCore() {
+    if (gHybrid < 0) CoreInit();
+    if (gHybrid != 1) return;
+    PROCESSOR_NUMBER pn{};
+    gProcNum(&pn);
+    if (pn.Group >= 4 || pn.Number >= 64 || gCoreClass[pn.Group][pn.Number] == 0xFF) return;
+    gFrameCores |= gCoreClass[pn.Group][pn.Number] < gTopClass ? 2u : 1u;
 }
 }  // namespace
+
+void SetPowerThrottling(bool allow) {
+    // PROCESS_POWER_THROTTLING_STATE {Version 1, ControlMask, StateMask}: a ControlMask bit with its StateMask bit clear
+    // turns that throttling off; ControlMask 0 lets Windows decide (stock). EXECUTION_SPEED 0x1 (EcoQoS: slower clocks,
+    // efficiency cores for a window it thinks is in the background), IGNORE_TIMER_RESOLUTION 0x4 (Windows 11: the
+    // game's timer resolution request dropped while its window is hidden).
+    using SetPiFn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    const auto fn = reinterpret_cast<SetPiFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation")));
+    struct {
+        ULONG Version, ControlMask, StateMask;
+    } st{1, allow ? 0u : 0x5u, 0};
+    BOOL ok = fn && fn(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof st);
+    if (!ok && !allow && fn) {  // Windows 10 before 11: no timer-resolution bit
+        st.ControlMask = 0x1;
+        ok = fn(GetCurrentProcess(), 4, &st, sizeof st);
+    }
+    Logger::Info("ECOQOS %d: %s (%s, error %lu)", allow ? 1 : 0,
+                 allow ? "Windows decides this process's power throttling" : "power throttling off for this process (execution speed, timer resolution)",
+                 ok ? (st.ControlMask == 0x1 ? "execution speed only" : "ok") : "not applied", ok ? 0ul : GetLastError());
+}
 
 int64_t Now() {
     LARGE_INTEGER t;
@@ -125,6 +236,8 @@ void SessionStart() {
     memset(gFramePart, 0, sizeof gFramePart);
     gNoteN = 0;
     gHitches = 0;
+    gFrameCores = 0;
+    gSesEFrames = gSesCoreFrames = 0;
 }
 
 void Note(const char* what) {
@@ -138,6 +251,7 @@ void LiveFrame(uint32_t gf) {
     DWORD faults = 0;
     SIZE_T workingSet = 0;
     const bool counters = ProcessCounters(&faults, &workingSet);
+    SampleCore();
     if (gLast) {
         const double ms = Ms(t - gLast);
         // One line per long interval (2026-11-04: LAN fights without a rollback had 2 frames >= 50 ms per 600 frames):
@@ -157,11 +271,27 @@ void LiveFrame(uint32_t gf) {
                          (unsigned long long)(ms2.ullTotalPhys >> 20), (unsigned long)ms2.dwMemoryLoad);
             }
             // The rest of the interval (ms - boundary - world - engine) is rendering, presenting and the limiter's wait.
+            static const char* const kCores[4] = {"", "; cores P", "; cores E", "; cores P+E"};
             Logger::Info("HITCH gf=%u (#%u): %.1f ms; boundary %.1f (livesave %.1f load %.1f replay %.1f replaysave %.1f wait %.1f "
-                         "extra %.1f); jobs:%s; world tick %.1f engine tick %.1f%s",
+                         "extra %.1f); jobs:%s; world tick %.1f engine tick %.1f%s%s",
                          gf - 1, gHitches, ms, Ms(gFramePart[kBoundary]), Ms(gFramePart[kLiveSave]), Ms(gFramePart[kLoad]),
                          Ms(gFramePart[kReplayTick]), Ms(gFramePart[kReplaySave]), Ms(gFramePart[kWait]), Ms(gFramePart[kExtra]),
-                         gNoteN ? notes : " none", Ms(gFramePart[kWorldTick]), Ms(gFramePart[kEngineTick]), mem);
+                         gNoteN ? notes : " none", Ms(gFramePart[kWorldTick]), Ms(gFramePart[kEngineTick]), mem, kCores[gFrameCores & 3]);
+        }
+        if (gFrameCores) {
+            ++gSesCoreFrames;
+            if (gFrameCores & 2) ++gSesEFrames;
+        }
+        InterlockedIncrement(&gTakeFrames);
+        // The CPU check for a 1-frame delay: only a correction of ONE frame says something about this PC (timing audit,
+        // round 3). Deeper ones come from the connection or the other game's hitches, and the session's first seconds
+        // from the start itself; counted, they raised the delay for the rest of the evening on a PC that was fine.
+        if (ms >= 25.0 && gFramePart[kLoad] > 0 && gFrameDepth == 1 && gSes.frames >= 300) InterlockedIncrement(&gReplayHitches);
+        // Status line (rc25): the interval's wait for the other game's input, and the rest of it (this PC's own time). Not
+        // in the session's first second: the start barrier waits for the other game by design.
+        if (gSes.frames >= 60) {
+            KeepPeak(gNetWait, Ms(gFramePart[kWait]));
+            KeepPeak(gLocalHitch, ms - Ms(gFramePart[kWait]));
         }
         const int b = ms < kBuckets - 1 ? (int)ms : kBuckets - 1;
         for (Stats* s : {&gWin, &gSes}) {
@@ -174,12 +304,26 @@ void LiveFrame(uint32_t gf) {
         }
     }
     memset(gFramePart, 0, sizeof gFramePart);
+    gFrameDepth = 0;
     gNoteN = 0;
+    gFrameCores = 0;
+    SampleCore();  // the new interval starts where this boundary runs
     gLast = t;
     gFaultsAt = faults;
     gFaultsValid = counters;
     gLiveGf = (LONG)gf;
     SetLiveAt(t);
+}
+
+void Quality(uint16_t* waitMs, uint16_t* waitAgoS, uint16_t* hitchMs, uint16_t* hitchAgoS) {
+    const ULONGLONG now = GetTickCount64();
+    auto get = [now](const Peak& p, uint16_t* ms, uint16_t* ago) {
+        const bool fresh = p.at && now - p.at < kQualityWindowMs;
+        *ms = fresh ? (uint16_t)(p.ms < 65535 ? p.ms : 65535) : 0;
+        *ago = fresh ? (uint16_t)((now - p.at) / 1000) : 0;
+    };
+    get(gNetWait, waitMs, waitAgoS);
+    get(gLocalHitch, hitchMs, hitchAgoS);
 }
 
 void Gap() {
@@ -190,12 +334,19 @@ void Gap() {
 }
 
 void Add(Part p, int64_t ticks) {
+    if (p == kLoad || p == kReplaySave) SampleCore();
     gFramePart[p] += ticks;
     gWin.part[p] += ticks;
     gSes.part[p] += ticks;
 }
 
+uint32_t TakeReplayHitches(uint32_t* frames) {
+    if (frames) *frames = (uint32_t)InterlockedExchange(&gTakeFrames, 0);
+    return (uint32_t)InterlockedExchange(&gReplayHitches, 0);
+}
+
 void Rollback(uint32_t depth) {
+    if (depth > gFrameDepth) gFrameDepth = depth;
     for (Stats* s : {&gWin, &gSes}) {
         ++s->rollbacks;
         s->depthSum += depth;
@@ -222,7 +373,80 @@ void SessionReport(const char* why) {
     const LONG mx = InterlockedExchange(&gPresentMaxUs, 0);
     if (mx > gSes.presentMaxUs) gSes.presentMaxUs = mx;
     if (gSes.frames) Print(why, 0, gSes);
+    LimiterReport(why);
+    if (gSesCoreFrames)
+        Logger::Info("CORES %s: %u of %u live frame intervals had the game thread on an efficiency core at a sample", why, gSesEFrames,
+                     gSesCoreFrames);
 }
+
+}  // namespace FramePace
+
+// ---- limiter wait ----
+// MK9's frame limiter (TimedEngineFrame 0x004025A0) waits for its deadline (double 0x00E0AB10, in seconds of
+// QueryPerformanceCounter x [0x00E42FF0]) by calling Sleep(0) in a loop until 4 ms before it ([0x00C5A6B0]), then
+// spinning: a whole core at 100% for the 8-12 ms a frame has to spare (heat and clock throttling on laptops, and the
+// thread competes with the render thread on small CPUs). 'limiterwait 1' gives the first loop a real wait: the Sleep it
+// loads at 0x004026FF (mov edi, [0x00C550AC]) becomes MK9R_LimiterSleep, which waits on a high-resolution timer until
+// kLimiterEarlyMs before that 4 ms point. The game's own spin still makes the last 4 ms exact; a wake-up that comes late
+// eats into it and only past it delays the frame (counted: LIMITER line at the session's end). Without the timer
+// (before Windows 10 1803) it is Sleep(0) as before. Off by default until the two-PC A/B says otherwise.
+namespace {
+constexpr uintptr_t kLimiterSleepLoad = 0x004026FF;
+constexpr uint8_t kLimiterSleepBytes[6] = {0x8B, 0x3D, 0xAC, 0x50, 0xC5, 0x00};
+constexpr double kLimiterSpinMs = 4.0, kLimiterEarlyMs = 0.7;
+bool gLimiterWait = false;
+volatile LONG gLimiterWaits = 0, gLimiterLate = 0, gLimiterLateMaxUs = 0;
+}  // namespace
+
+extern "C" void __stdcall MK9R_LimiterSleep(DWORD ms) {
+    static const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                                       TIMER_MODIFY_STATE | SYNCHRONIZE);
+    const double perTick = *reinterpret_cast<const double*>(0x00E42FF0);
+    const double deadline = *reinterpret_cast<const volatile double*>(0x00E0AB10);
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    const double waitMs = (deadline - q.QuadPart * perTick) * 1000.0 - kLimiterSpinMs - kLimiterEarlyMs;
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)(waitMs * 10000.0);  // relative, 100 ns units
+    if (!timer || waitMs < 0.5 || waitMs > 50.0 || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        Sleep(ms);
+        return;
+    }
+    WaitForSingleObject(timer, 60);
+    QueryPerformanceCounter(&q);
+    const double lateMs = (q.QuadPart * perTick - deadline) * 1000.0;  // > 0: woke after the frame should have started
+    InterlockedIncrement(&gLimiterWaits);
+    if (lateMs > 0) {
+        InterlockedIncrement(&gLimiterLate);
+        const LONG us = lateMs < 2000.0 ? (LONG)(lateMs * 1000.0) : 2000000;
+        if (us > gLimiterLateMaxUs) InterlockedExchange(&gLimiterLateMaxUs, us);
+    }
+}
+
+namespace FramePace {
+void SetLimiterWait(bool on) {
+    if (on != gLimiterWait) {
+        uint8_t code[6] = {0xBF, 0, 0, 0, 0, 0x90};  // mov edi, &MK9R_LimiterSleep; nop
+        const uint32_t fn = (uint32_t)reinterpret_cast<uintptr_t>(&MK9R_LimiterSleep);
+        memcpy(code + 1, &fn, 4);
+        const bool ok = on ? CodePatch::Write(kLimiterSleepLoad, kLimiterSleepBytes, code, 6, "frame limiter Sleep 0x004026FF (limiterwait)")
+                           : CodePatch::Restore(kLimiterSleepLoad);
+        if (ok) gLimiterWait = on;
+        else Logger::Info("LIMITERWAIT: 0x004026FF could not be %s", on ? "patched (not as expected)" : "restored");
+    }
+    Logger::Info("LIMITERWAIT %s", gLimiterWait ? "on: the frame limiter waits on a timer until 4.7 ms before its deadline, then spins as before"
+                                                : "off: the frame limiter spins the whole wait (stock)");
+}
+void LimiterReport(const char* why) {
+    const LONG waits = InterlockedExchange(&gLimiterWaits, 0), late = InterlockedExchange(&gLimiterLate, 0);
+    const LONG maxUs = InterlockedExchange(&gLimiterLateMaxUs, 0);
+    if (gLimiterWait || waits)
+        Logger::Info("LIMITER %s: %ld timer waits, %ld woke after the frame's start (the latest by %.1f ms); limiterwait %d", why, waits,
+                     late, maxUs / 1000.0, (int)gLimiterWait);
+}
+}  // namespace FramePace
+
+namespace FramePace {
 
 // ---- stall sampler ----
 namespace {
@@ -395,6 +619,11 @@ void OnPresent() {
         if (us > gPresentMaxUs) InterlockedExchange(&gPresentMaxUs, (LONG)(us < 0x7FFFFFFF ? us : 0x7FFFFFFF));
     }
     last = t;
+    const int64_t sampled = RenderTag::TakeStamp();
+    if (sampled && t >= sampled) {
+        const int64_t ms = (t - sampled) * 1000 / Freq();
+        InterlockedIncrement(&gLatency[ms < kBuckets - 1 ? (int)ms : kBuckets - 1]);
+    }
 }
 
 }  // namespace FramePace

@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <cmath>
 #include <cstdio>
 
 #include <cstring>
@@ -36,6 +37,7 @@
 #include "HandleGuard.h"
 #include "ActorGuard.h"
 #include "ScriptLinkGuard.h"
+#include "RenderTag.h"
 #include "SoundDedupe.h"
 #include "StateHash.h"
 #include "ggponet.h"
@@ -68,6 +70,19 @@ extern "C" int (*ggpo_frame_loadable)(unsigned char* buf, int len);
 extern "C" int ggpo_fallback_loads, ggpo_fallback_misses;
 extern "C" int ggpo_quality_report_interval;  // patched GGPO: quality report period in ms ('qualityms N', stock 1000)
 extern "C" int ggpo_running_retry_interval;   // patched GGPO: unacked inputs resent after N ms without a new frame ('netretry N', stock 200)
+// Patched GGPO (round 3): a side drops input packets until its own handshake is done, so the frame-0 input of the game
+// that ran first was lost and came again after 'netretry' (34 ms): the later game waited for it at frame 0 and the
+// start barrier's WaitShift took that wait for a lead. Until the peer's first input arrives the inputs are sent again
+// every N+1 ms ('firstretry N', 0 = rc27).
+extern "C" int ggpo_first_input_retry_ms;
+// Patched GGPO (rc25, tools/build_ggpo.ps1):
+extern "C" int ggpo_no_disconnect_rewind;     // 1: no load + replay to the peer's last frame at a disconnect (the session stops anyway)
+extern "C" int ggpo_bind_loopback;            // 1: GGPO's socket binds 127.0.0.1 only (Steam bridge sessions)
+extern "C" int ggpo_rtt_min_ms;               // the lowest of the last 5 quality-report round trips (ms; -1 none yet)
+extern "C" int ggpo_sync_rtt_ms;              // the handshake's round trip (ms; -1 none): the only one known at frame 0
+extern "C" int ggpo_bye_on_close;             // 1: ggpo_close_session tells the peer the session is over (GgpoStop)
+extern "C" int ggpo_bind_failed;              // the WSA error of the session socket's bind, 0 when it worked
+extern "C" void (*ggpo_after_send)(void);     // called after each datagram GGPO sends (the bridge forwards it at once)
 
 namespace Rollback {
 void LogEventListeners(const char* tag);
@@ -227,16 +242,30 @@ GameplayState CaptureGameplay() {
 // +0x30 base skeletal component}. Soak 26/27 crashes 0x007795AF, 0x007892AB and 0x0043E117 all
 // read such a record whose actor is dead or a Base whose list lacks the actor. Logs each new
 // inconsistency once (frame, record, actor identity) so it can be tied to a load or a tick.
+// rc25 (save/load cost audit): one guarded read per page of the range instead of a VirtualQuery, as the saves' 'fastprobe'
+// since rc21. VirtualQuery walks the region forward to report its size: in the multi-MB GMalloc regions that hold the
+// fighters, actors and anim nodes it took 3-20 us a call (9 us on the slower field PC), and these helpers run on every
+// live and replayed frame (FighterActor, WorldTickedBit, ForceFighterLod, render fields) and many times per load
+// (AnimTagAudit per anim node, attach repair, motion controllers, pending releases). Same answer: a page that reads is
+// committed and accessible; a guard page fails the read (CrashLog's handler). 'fastreadable 0': VirtualQuery as before.
+bool gFastReadable = true;
 bool Readable(uint32_t a, uint32_t n) {
+    if (a < 0x10000) return false;
+    if (gFastReadable && CrashLog::SafeReadAvailable()) {
+        const uint32_t last = a + (n ? n - 1 : 0);
+        if (last < a) return false;
+        uint32_t v;
+        for (uint32_t p = a;; p = (p | 0xFFFu) + 1) {  // the first address of each page of the range
+            if (!CrashLog::SafeRead32(p & ~3u, &v)) return false;
+            if ((p >> 12) == (last >> 12)) return true;
+        }
+    }
     MEMORY_BASIC_INFORMATION mbi;
-    return a >= 0x10000 && VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+    return VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && a + n <= reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 }
 bool Live(uint32_t a) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (a < 0x10000 || !VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
-        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || a + 0x84 > reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize)
-        return false;
+    if (!Readable(a, 0x84)) return false;
     const uint32_t idx = *reinterpret_cast<const uint32_t*>(a + 4);
     const uint32_t objs = *reinterpret_cast<const uint32_t*>(0x00E7C0EC), cnt = *reinterpret_cast<const uint32_t*>(0x00E7C0F0);
     return idx < cnt && *reinterpret_cast<const uint32_t*>(objs + 4 * idx) == a;
@@ -1737,7 +1766,7 @@ bool DoRollback(void* engine, float dt, int k, bool loadOnly = false) {
         return true;
     }
 
-    SoundDedupe::BeginResim();
+    SoundDedupe::BeginResim(S, F);
     Rollback::gIsResimulating = true;
     LARGE_INTEGER tLoaded;
     QueryPerformanceCounter(&tLoaded);
@@ -1990,12 +2019,56 @@ int gSparseLiveSkips = 0;
 int gLivePendingGgpo = -1;              // the GGPO frame number of the deferred live save's request...
 uint32_t gLivePendingGgpoGf = 0xFFFFFFFF;  // ...made at this gf
 bool gStartBarrier = true;  // 'startbarrier 0': rollback frame 0 runs without waiting for the peer's first input
+bool gEarlyInput = true;    // 'earlyinput 0': the local input is added after the poll and the live save (before rc21)
+bool gLateSample = true;    // 'latesample 0': controllers sampled at the main loop's call, before MK9's frame wait
+bool gSkipLive = true;      // 'skiplive 0': save every live frame, even one whose remote input is already in
+uint32_t gConfirmedLiveSkips = 0;  // this session's live saves not taken (frame already confirmed)
+uint32_t gEarlyAdds = 0;    // boundaries whose input was added (and sent) at their start
 bool gCanonClock = false;   // 'canonclock 1': the world clocks get the same value on both peers at the netplay start
 bool gBalance = true;       // 'balance 0': only GGPO's own time-sync events make this game wait for the peer
 // 'balancecfg <settle> <samples> <max give>'. 24 4 3 since net4 (2026-11-04, with 'qualityms 200'): against 45 6 3 over the
 // network matrix frames >= 34 ms -22%, presents >= 34 ms -19%, rollbacks/min 144 -> 129, depth 1.60 -> 1.49.
 int gBalanceSettle = 24, gBalanceSamples = 4, gBalanceMaxGive = 3;
 int gBalanceEvents = 0, gBalanceFrames = 0;  // this session's frame-advantage corrections and frames given
+// GGPO's own time sync ('ggposync 0|1', default 0 since rc25 while 'balance' is on). GGPO averages 40 frames of its
+// estimated advantage and asks for a wait at >= 3 frames, rechecked every poll until it fires and then every 240 frames.
+// Its window is not reset after a stall hold or an X-ray lock, so right after a hold had evened the games it still saw
+// the run-up and asked for 3-4 more frames (2026-11-09 audit of every results\ log: 76 sessions with holds averaged 2.95
+// TIMESYNC events, the 788 without 0.36); BALANCE paid its own give on top, the leader overshot and the other game rolled
+// back deeper for about a second. BALANCE samples the same estimate and restarts after holds, so with it on GGPO's events
+// are only counted (logged as TIMESYNC ... not paid).
+bool gGgpoTimesync = false;
+int gTimesyncIgnored = 0;  // this session's GGPO time-sync events left to BALANCE
+// Re-poll ('repoll 0|1', rc25, timing audit): when the boundary's first poll lacked the other player's input for this
+// frame, the live save (2.6-5 ms) runs before the frame is synchronized; an input that arrived during it was used only a
+// frame later, through a one-frame rollback. One more poll after the save picks it up.
+bool gRepoll = true;
+uint32_t gRepolls = 0, gRepollHits = 0;  // this session's re-polls, and those that brought the frame's input
+// Sub-frame phase alignment ('phasesync 0|1', rc25, timing audit). With the input sent at the boundary's start, the
+// other game's input for frame G leaves at its boundary G-1 and is in at this game's first poll of G only when the
+// one-way trip is shorter than a frame plus how far this game's frame grid trails the other's; the same holds the other
+// way with the sign flipped. MK9's limiter keeps each game's grid phase forever (its fmod only drops whole periods) and
+// BALANCE / GGPO see whole frames only, so the phase came from each process's history: at delay 1 on a ~22 ms link both
+// games get the inputs in time only while the grids are within ~5.7 ms, and otherwise one game rolled back on nearly
+// every input change of the other (harness splits 68/271, 115/230, 122/232 rollbacks a minute; the field hello read 33
+// or 50 ms by match). Each game counts, per 120-frame window, the boundaries whose first poll already had the other
+// player's input (frames paying a debt, holding, X-ray-locked or right after a wait are not counted), sends the share
+// to the other game on the checksum link, and the game with the clearly smaller share (its grid leads) moves its frame
+// deadline later 0.5 ms per frame, by a step that halves on each overshoot (PhaseDecide), the actuator 'paysmooth' uses. Only the leader slows down,
+// so the two never pull against each other; at most kPhaseMaxMs per session (clock drift between PCs is ~0.1 ms/s).
+bool gPhaseSync = true;
+constexpr int kPhaseWindow = 120, kPhaseMinSamples = 60, kPhaseDeadband = 150;  // frames, frames, per mille
+constexpr double kPhasePerFrameMs = 0.5, kPhaseMaxMs = 150.0;
+constexpr uint32_t kPhaseMagic = 0x50394B4D;  // 'MK9P': {magic, window, on-time per mille, samples}
+int gPhaseOnTime = 0, gPhaseSamples = 0, gPhaseWindowAt = -1;
+int gPhaseMyWindow = -1, gPhaseMyQ = -1, gPhasePeerWindow = -1, gPhasePeerQ = -1, gPhaseDecided = -1;
+int gPhaseLastWaits = 0, gPhaseQuietUntil = 0;  // barrier waits seen at the last sample; no samples before this frame
+double gPhaseDueMs = 0, gPhaseShiftedMs = 0;
+int gPhaseCorrections = 0, gPhaseLogs = 0;
+// Small debts paid more gently (rc25): 'paysmooth N S' pays debts of up to 2 frames S ms per frame (default 1).
+int gPaySmoothSmallMs = 1;
+// Status line (rc25): GGPO reported the other game stopped responding (until it responds again or the session stops).
+bool gOvPeerInterrupted = false;
 // Stall hold (StallHold, below BarrierWait): 'stallhold 0' off, 'stallhold <min ms> <max ms>' its thresholds.
 bool gStallHold = true;
 // Min 60 since rc18 (batch 32): with GGPO's 34 ms resend (rc17) the game whose packets were lost waited 82-117 ms after a
@@ -2004,6 +2077,20 @@ bool gStallHold = true;
 int gStallHoldMinMs = 60, gStallHoldMaxMs = 150;
 int gStallHolds = 0;          // this session's holds
 double gStallHeldMs = 0;      // and the time they added
+// Wait shift (WaitShift, below StallHold): 'waitshift 0' leaves the limiter's catch-up after a wait as it was (rc27).
+bool gWaitShift = true;
+int gWaitShifts = 0, gWaitShiftFrames = 0;  // this session
+// Handshake polls ('handshakepoll 0|1', round 3; off). Until GGPO runs the game is paused and the boundary polls once a
+// frame: each game answers the other's sync packets up to a frame late and reads the answers up to a frame late, so the
+// handshake's round trip (ggpo_sync_rtt_ms, from which the start barrier's WaitShift takes the one-way trip) reads 0-2
+// frames more than the wire's (the start barrier takes a frame off: its comment). With 'handshakepoll 1' the paused wait
+// polls every millisecond for kHandshakePollMs of each frame and the round trip is the wire's (27-31 ms where the frame
+// polls read 29-39). Measured on the timed netsim (batch r3d, 6 fights each, 'netsim 15' at delay 1): the handshake is
+// two frames shorter, but the frame-0 wait then no longer tells which game is ahead (26-28 ms on every start; the shift
+// of one frame was given back by a BALANCE frame 1.2 s later in 3 of 5 starts, against 0 of 6 with frame polls), so it
+// stays off until the start is timed some other way (docs/todo.md, round 3 follow-ups).
+bool gHandshakePoll = false;
+constexpr double kHandshakePollMs = 12.0;
 bool gBalanceRestart = false;  // the frame-advantage sampler starts over (its samples predate the hold)
 int gFreezeMs = 0, gFreezeEveryMs = 0;  // 'freezeevery MS EVERY' (test): this game stops MS ms every EVERY ms in a session
 ULONGLONG gFreezeNext = 0;
@@ -2044,6 +2131,17 @@ bool SaveLiveNow(uint32_t gf) {
     gLiveSavedGf = ok ? gf : 0xFFFFFFFF;
     return ok;
 }
+// The live frame's remote input is in, so no rollback can load it ('skiplive'). ggpo_rollback_safe_frame is the last
+// frame received from the other player (the local queue is always further on), and a rollback loads the first
+// mispredicted frame, which follows it: the live frame F is safe from F <= safe on. Until rc25 the test was F < safe,
+// which at delay 1 also needs the input for F+1, sampled by the other game at its own boundary F: it could not have
+// arrived, so the skip almost never fired (b38: 0-62 of 1966 frames; 2026-11-09 timing audit). With 'sparselive' an odd
+// F+1 is not saved and a rollback to it loads F, so F < safe stays the rule there. A disconnect's rewind to the peer's
+// last frame is turned off (ggpo_no_disconnect_rewind): the session stops at the disconnect anyway.
+bool LiveFrameConfirmed(int ggpoFrame) {
+    if (!gSkipLive || gLockstep || ggpoFrame < 0) return false;
+    return gSparseLive ? ggpoFrame < ggpo_rollback_safe_frame : ggpoFrame <= ggpo_rollback_safe_frame;
+}
 
 bool __cdecl GgpoBeginGame(const char*) { return true; }
 void CsRecord(uint32_t gf, uint32_t cs, const GameplayState& g);
@@ -2065,6 +2163,17 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
     } else if (gGgpoIsP2P && gSkipConfirmed && ggpoFrame < ggpo_rollback_safe_frame && gf != gGgpoLiveF) {
         gHave[gf % kRing] = false;  // the slot holds this frame's mispredicted state: not loadable
         FramePace::SkippedSave();
+        gGgpoSaveOk = true;
+    } else if (gGgpoIsP2P && gSkipConfirmed && gf == gGgpoLiveF && LiveFrameConfirmed(ggpoFrame)) {
+        // rc25 (save audit): a replay's save of the live frame F whose remote input is already in, the frames the live
+        // save skips too ('skiplive', below). It was always taken: one whole save (2.6-5 ms) on the frames that had a
+        // rollback, the longest ones. A deferred live save of F is left pending: the boundary's test (same safe frame)
+        // skips and counts it; without one (a replay inside a later poll), the stale live save is made unloadable here.
+        gHave[gf % kRing] = false;
+        if (gf != gLivePending) {
+            FramePace::SkippedSave();
+            ++gConfirmedLiveSkips;
+        }
         gGgpoSaveOk = true;
     } else if (gGgpoIsP2P && gSparseSave && ggpo_frame_loadable && (ggpoFrame & 1) && ggpoFrame > ggpo_rollback_safe_frame &&
                (gf != gGgpoLiveF || (gSparseLive && !gLockstep))) {
@@ -2097,8 +2206,9 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
     const GameplayState gp = CaptureGameplay();
     // Fighter actor bytes (0x300 each) per frame, diffed on a desync to name the fields that differ.
     static uint8_t liveActor[64][2][0x300];
+    // Read only by the SyncTest reports below: P2P skips their six VirtualQuery calls a save (rc21, save audit).
     uint32_t actors[2] = {0, 0};
-    for (int p = 0; p < 2; ++p) {
+    for (int p = 0; p < 2 && !gGgpoIsP2P; ++p) {
         const uintptr_t info = 0x00E89D7C + p * 0xC8C;
         const uint32_t obj = *reinterpret_cast<const uint32_t*>(info + 0x1C);
         if (obj && obj != 0xDEADBEEF && Readable(obj + 8, 4)) actors[p] = *reinterpret_cast<const uint32_t*>(obj + 8);
@@ -2107,7 +2217,7 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
     // MK character objects (0xC580 bytes; restored with the master image): which MK fields differ first.
     static uint8_t liveChar[16][2][0xC580];
     uint32_t chars[2] = {0, 0};
-    for (int p = 0; p < 2; ++p) {
+    for (int p = 0; p < 2 && !gGgpoIsP2P; ++p) {
         const uintptr_t info = 0x00E89D7C + p * 0xC8C;
         const uint32_t obj = *reinterpret_cast<const uint32_t*>(info + 0x1C);
         if (obj && obj != 0xDEADBEEF && Readable(obj, 0xC580)) chars[p] = obj;
@@ -2224,10 +2334,8 @@ bool __cdecl GgpoLoadState(unsigned char* buffer, int) {
     if (Lab::On() && (!ObjectHooks::CanLoadTo(S, why, sizeof why) || Ue3Refs::TornDownSince(S, why, sizeof why) ||
                       (gRefSnap = snap, PhysWatch::EventsSince(S, why, sizeof why, &SnapshotReferences))))  // log only
         Logger::Info("GGPO load gf=%u would be refused by the local engine (%s); loading anyway", S, why);
-    if (gGgpoLoadedS == 0xFFFFFFFF) {
-        SoundDedupe::BeginResim();
-        Rollback::gIsResimulating = true;
-    }
+    SoundDedupe::BeginResim(S, gGgpoLiveF);  // at every load: a second one in this boundary replays its frames again
+    if (gGgpoLoadedS == 0xFFFFFFFF) Rollback::gIsResimulating = true;
     if (gAbToggle) {
         gAbParity = gGgpoLoads & 1;
         *gAbToggle = gAbParity == 0;
@@ -2355,6 +2463,12 @@ constexpr uint32_t kCsLag = 24;
 constexpr uint32_t kEnvMagic = 0x45394B4D;  // 'MK9E': environment fingerprint
 bool gEnvChecked = false, gEnvMismatch = false;
 bool gStartMismatch = false;  // frame 0 differs: the fights did not start from the same state; the session stops
+// Out of sync for good (round 3): the checksums were only counted and logged, so two players went on playing two
+// different fights until the round ended. In a real online match (Online::Engaged; test sessions keep running for the
+// diagnosis) the session now stops once gDesyncStopFrames compared frames in a row differed ('desyncstop N', 0 = never):
+// the status line says why and MK9's own netcode takes over. A simulation that differs for 2 s does not come back.
+int gDesyncStopFrames = 120, gCsMismatchRun = 0;
+bool gDesyncStop = false;
 uint32_t CsStartGf() { return gCsStartGf; }
 void CsRecord(uint32_t gf, uint32_t cs, const GameplayState& g) {
     if (gCsSock == INVALID_SOCKET || gf < gCsStartGf) return;
@@ -2367,7 +2481,12 @@ void CsOpen(const char* ip, unsigned short localPort, unsigned short remotePort)
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_port = htons((unsigned short)(localPort + 100));
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    // A session over the Steam bridge (and two games on one PC) talks to 127.0.0.1 only: bound there the socket cannot be
+    // reached from the network, and connected to the peer's port it takes datagrams from nowhere else (round 3: it bound
+    // every interface and acted on whatever arrived: checksums, the environment print, phase reports). A direct-IP session
+    // keeps the open bind: its peer's packets may come from a translated port.
+    const bool loopback = inet_addr(ip) == htonl(INADDR_LOOPBACK);
+    local.sin_addr.s_addr = htonl(loopback ? INADDR_LOOPBACK : INADDR_ANY);
     u_long nb = 1;
     if (bind(gCsSock, reinterpret_cast<sockaddr*>(&local), sizeof local) || ioctlsocket(gCsSock, FIONBIO, &nb)) {
         closesocket(gCsSock);
@@ -2379,6 +2498,10 @@ void CsOpen(const char* ip, unsigned short localPort, unsigned short remotePort)
     gCsPeer.sin_family = AF_INET;
     gCsPeer.sin_port = htons((unsigned short)(remotePort + 100));
     gCsPeer.sin_addr.s_addr = inet_addr(ip);
+    if (loopback && connect(gCsSock, reinterpret_cast<const sockaddr*>(&gCsPeer), sizeof gCsPeer))
+        Logger::Info("NETPLAY checksum channel: connect failed (%d); datagrams from other local ports are not filtered", WSAGetLastError());
+    gCsMismatchRun = 0;
+    gDesyncStop = false;
     gCsStartGf = GameFrame();
     for (CsRec& r : gCs) r = {};
     gCsMatched = gCsMismatched = gCsLogged = 0;
@@ -2391,6 +2514,99 @@ void CsClose() {
     gCsSock = INVALID_SOCKET;
     Logger::Info("NETPLAY checksums: %d frames matched the peer, %d did not", gCsMatched, gCsMismatched);
 }
+
+// Sub-frame phase alignment (gPhaseSync, with the settings): once both games' input-in-time shares of the same window are
+// known, the game whose share is clearly the smaller one (its frame grid leads) moves its deadline later.
+// Step search (b44, rc25 first build): a share is close to all-or-nothing in the phase (at ns15 d1 both games get the
+// inputs in time only within ~2 ms of balance), so a step sized from the share difference (1-6 ms) jumped past the balance
+// every time: the shares flipped between ~50 and ~970 per mille window after window and each game corrected 7 times a
+// fight. Now the step halves whenever the leading game changes from one decision to the next (it overshot) and grows by
+// half while the same game keeps leading (not there yet): a bisection on the balance point. Both games see the same pair
+// of shares, so their steps shrink and grow together.
+// Round 3 (r3smoke): the step grew at the very next decision after a halving, so each change of leader shrank the swing
+// by a quarter only (3.0 4.5 | 2.2 3.4 | 1.7 2.5 | 1.3 ... over 30 s, 13-27 ms moved a fight, rollbacks on both games
+// while it swung). It now grows only from the third decision in a row with the same leader (gPhaseGrowAfter): after an
+// overshoot the same step is tried once more, then the search is taken to be behind (a drift, a changed route).
+constexpr double kPhaseStepStartMs = 3.0, kPhaseStepMinMs = 0.5, kPhaseStepMaxMs = 6.0;
+int gPhaseGrowAfter = 2;  // decisions with the same leader after which the step grows ('phasegrow N'; 1 = rc27)
+double gPhaseStep = kPhaseStepStartMs;
+int gPhaseLastLeader = 0;  // 1 this game, -1 the other, 0 none yet
+int gPhaseLeaderRun = 0;   // decisions in a row that repeated gPhaseLastLeader
+void PhaseDecide() {
+    if (gPhaseMyWindow < 0 || gPhaseMyWindow != gPhasePeerWindow || gPhaseDecided == gPhaseMyWindow) return;
+    gPhaseDecided = gPhaseMyWindow;
+    const int lead = gPhasePeerQ - gPhaseMyQ;  // > 0: this game's inputs reach the other in time more often than the reverse
+    const int leader = lead > kPhaseDeadband ? 1 : lead < -kPhaseDeadband ? -1 : 0;
+    if (leader && gPhaseLastLeader && leader != gPhaseLastLeader) {
+        gPhaseStep = gPhaseStep / 2 < kPhaseStepMinMs ? kPhaseStepMinMs : gPhaseStep / 2;  // overshot: halve
+        gPhaseLeaderRun = 0;
+    } else if (leader && leader == gPhaseLastLeader && ++gPhaseLeaderRun >= gPhaseGrowAfter) {
+        gPhaseStep = gPhaseStep * 1.5 > kPhaseStepMaxMs ? kPhaseStepMaxMs : gPhaseStep * 1.5;  // short of it: grow
+    }
+    if (leader) gPhaseLastLeader = leader;
+    double ms = 0;
+    if (leader == 1 && gPhaseShiftedMs + gPhaseDueMs < kPhaseMaxMs) {
+        ms = gPhaseStep;
+        gPhaseDueMs += ms;
+        ++gPhaseCorrections;
+    }
+    if (gPhaseLogs < 40 && (ms > 0 || gPhaseLogs < 12)) {
+        ++gPhaseLogs;
+        Logger::Info("PHASE window %d (gf=%u): the other player's input was in at this game's first poll %d/1000, this game's at "
+                     "theirs %d/1000%s", gPhaseMyWindow, GameFrame(), gPhaseMyQ, gPhasePeerQ,
+                     ms > 0 ? " -> this game's frames start later" : "");
+        if (ms > 0) Logger::Info("PHASE   moving the frame deadline %.1f ms (%.1f ms this session)", ms, gPhaseShiftedMs + gPhaseDueMs);
+    }
+}
+void PhaseOnPeer(int window, int q, int samples) {
+    if (!gPhaseSync || samples < kPhaseMinSamples || q < 0 || q > 1000 || window < gPhasePeerWindow) return;
+    // A report for a window this session cannot have reached is an earlier session's (online sessions share Steam's
+    // connection, which is not closed between fights): taken, it would hide every real report below its number.
+    if (window > (gP2PFrames + 16) / kPhaseWindow) return;
+    gPhasePeerWindow = window;
+    gPhasePeerQ = q;
+    PhaseDecide();
+}
+// At the boundary's first poll of a live frame: was the other player's input for it already in? Counted only on quiet
+// frames: no debt being paid, no phase shift under way, no X-ray lock, no wait for the peer in the previous boundary and
+// not within 60 frames of a stall hold. At each window's end this game's share goes to the other game.
+void PhaseSample(bool onTime) {
+    if (!gPhaseSync || gLockstep || !gGgpoRunning || gP2PFrames <= 0) return;
+    static int lastFrame = -1;
+    if (gP2PFrames == lastFrame) return;  // a boundary that advanced no frame (paused)
+    lastFrame = gP2PFrames;
+    const int window = gP2PFrames / kPhaseWindow;
+    if (window != gPhaseWindowAt) {
+        if (gPhaseWindowAt >= 0 && gPhaseSamples >= kPhaseMinSamples) {
+            gPhaseMyWindow = gPhaseWindowAt;
+            gPhaseMyQ = gPhaseOnTime * 1000 / gPhaseSamples;
+            if (gCsSock != INVALID_SOCKET) {
+                const uint32_t pkt[4] = {kPhaseMagic, (uint32_t)gPhaseMyWindow, (uint32_t)gPhaseMyQ, (uint32_t)gPhaseSamples};
+                sendto(gCsSock, reinterpret_cast<const char*>(pkt), sizeof pkt, 0, reinterpret_cast<const sockaddr*>(&gCsPeer), sizeof gCsPeer);
+            }
+            PhaseDecide();
+        }
+        gPhaseWindowAt = window;
+        gPhaseOnTime = gPhaseSamples = 0;
+    }
+    const bool quiet = gTimesyncDebt == 0 && gPhaseDueMs <= 0 && !gXrayLockOn && gBarrierWaits == gPhaseLastWaits &&
+                       gP2PFrames >= gPhaseQuietUntil;
+    gPhaseLastWaits = gBarrierWaits;
+    if (!quiet) return;
+    ++gPhaseSamples;
+    if (onTime) ++gPhaseOnTime;
+}
+void PhaseReset() {
+    gPhaseOnTime = gPhaseSamples = 0;
+    gPhaseWindowAt = gPhaseMyWindow = gPhaseMyQ = gPhasePeerWindow = gPhasePeerQ = gPhaseDecided = -1;
+    gPhaseLastWaits = 0;
+    gPhaseQuietUntil = 60;  // the start's waits and catch-up are not the steady phase
+    gPhaseDueMs = gPhaseShiftedMs = 0;
+    gPhaseCorrections = gPhaseLogs = 0;
+    gPhaseStep = kPhaseStepStartMs;
+    gPhaseLastLeader = gPhaseLeaderRun = 0;
+}
+
 void CsPump(uint32_t liveGf) {
     if (gCsSock == INVALID_SOCKET || liveGf < gCsStartGf + kCsLag) return;
     const uint32_t rel = liveGf - gCsStartGf - kCsLag;
@@ -2438,13 +2654,23 @@ void CsPump(uint32_t liveGf) {
             }
             continue;
         }
+        if (got == 16 && in[0] == kPhaseMagic) {  // the other game's input-in-time share for a window (phase alignment)
+            PhaseOnPeer((int)in[1], (int)in[2], (int)in[3]);
+            continue;
+        }
         if (got != 12 || in[0] != kCsMagic) break;
         const CsRec& own = gCs[in[1] % 128];
         if (own.rel != in[1]) continue;  // not (or no longer) recorded here
         if (own.cs == in[2]) {
             ++gCsMatched;
+            gCsMismatchRun = 0;
         } else {
             ++gCsMismatched;
+            if (++gCsMismatchRun == gDesyncStopFrames && gDesyncStopFrames > 0 && Online::Engaged()) {
+                Logger::Info("NETPLAY: the two games went out of sync (%d compared frames in a row differ, the last one frame %u): "
+                             "the rollback session is stopped", gCsMismatchRun, in[1]);
+                gDesyncStop = true;
+            }
             if (gCsLogged++ < 10)
                 Logger::Info("NETPLAY DESYNC: frame %u (gf %u) local checksum %08X, peer %08X", in[1], in[1] + gCsStartGf, own.cs, in[2]);
             if (gCsLogged == 1) {  // the first one: what this peer had (the peer logs its side); compare the two logs
@@ -2480,8 +2706,14 @@ bool __cdecl GgpoOnEvent(GGPOEvent* e) {
             break;
         case GGPO_EVENTCODE_CONNECTED_TO_PEER: Logger::Info("GGPO connected to peer"); break;
         case GGPO_EVENTCODE_SYNCHRONIZED_WITH_PEER: Logger::Info("GGPO synchronized with peer"); break;
-        case GGPO_EVENTCODE_CONNECTION_INTERRUPTED: Logger::Info("GGPO: the peer stopped responding"); break;
-        case GGPO_EVENTCODE_CONNECTION_RESUMED: Logger::Info("GGPO: the peer responds again"); break;
+        case GGPO_EVENTCODE_CONNECTION_INTERRUPTED:
+            Logger::Info("GGPO: the peer stopped responding");
+            gOvPeerInterrupted = true;
+            break;
+        case GGPO_EVENTCODE_CONNECTION_RESUMED:
+            Logger::Info("GGPO: the peer responds again");
+            gOvPeerInterrupted = false;
+            break;
         case GGPO_EVENTCODE_DISCONNECTED_FROM_PEER:
             // GGPO would go on with a neutral input for the lost player: end the session instead (at the boundary,
             // outside this callback).
@@ -2489,8 +2721,14 @@ bool __cdecl GgpoOnEvent(GGPOEvent* e) {
             gPeerLost = true;
             break;
         case GGPO_EVENTCODE_TIMESYNC:
-            gTimesyncFrames = e->u.timesync.frames_ahead;
             ++gTimesyncEvents;
+            if (gBalance && !gGgpoTimesync && !gLockstep) {  // BALANCE decides (gGgpoTimesync)
+                if (gTimesyncIgnored++ < 4)
+                    Logger::Info("GGPO TIMESYNC gf=%u: %d frame(s) ahead by GGPO's 40-frame average; not paid (BALANCE decides)",
+                                 GameFrame(), e->u.timesync.frames_ahead);
+            } else {
+                gTimesyncFrames = e->u.timesync.frames_ahead;
+            }
             break;
         default: Logger::Frame("GGPO event %d", (int)e->code); break;
     }
@@ -2508,11 +2746,16 @@ int gOvPing = -1, gOvBehindL = 0, gOvBehindR = 0, gOvKbps = 0, gOvQueue = 0;
 void GgpoStop(const char* why) {
     if (!gGgpo) return;
     // Not the fight's normal end ("match over": the online mode at MK9's results screen).
-    if (gGgpoIsP2P && strcmp(why, "timeline restart") && strcmp(why, "restart") && strcmp(why, "match over")) {
+    const bool abnormal = gGgpoIsP2P && strcmp(why, "timeline restart") && strcmp(why, "restart") && strcmp(why, "match over");
+    if (abnormal) {
         strncpy(gOvStopWhy, why, sizeof gOvStopWhy - 1);
         gOvStopWhy[sizeof gOvStopWhy - 1] = 0;
         gOvStopAt = GetTickCount();
     }
+    // A session that stops mid-fight says so (round 3): the other game stops with it within a frame or two instead of
+    // standing at its prediction limit until the 3 s disconnect timeout. Not at a normal end, where both games stop by
+    // themselves: the one a few frames behind would take the flag for a lost opponent and disarm.
+    ggpo_bye_on_close = abnormal ? 1 : 0;
     ggpo_close_session(gGgpo);
     gGgpo = nullptr;
     gGgpoFrameOpen = false;
@@ -2521,8 +2764,10 @@ void GgpoStop(const char* why) {
         Input::SetLocalCapture(false);
         Input::ReleaseAll();  // the fighters' pads go back to the local controllers (they held the last network input)
         CsClose();
+        ggpo_after_send = nullptr;  // the closed session's last sends are through (ggpo_close_session flushes)
         SteamBridge::Stop();
         gGgpoIsP2P = gGgpoRunning = gSyncValid = false;
+        gOvPeerInterrupted = false;
         // A mode chosen during the session, before the online mode re-arms the next fight with it (it compares the peer's).
         if (gLockstepDeferred) {
             Rollback::SetLockstep(gLockstepNext);
@@ -2556,6 +2801,27 @@ void GgpoStop(const char* why) {
                      gXrayLockWaits, gXrayLockWaitMs, gXrayCines, gXrayFrozenFrames,
                      ActorGuard::Hits(), ScriptLinkGuard::Skips(), HandleGuard::NullHits(), Snapshot::gCompListScrubbed,
                      HandleGuard::IkNodeSkips(), HandleGuard::RenderDataKept(), FreeQuarantine::LateProtected());
+        Logger::Info("EARLYINPUT this session: %u of %d frames' local inputs added and sent at the boundary's start; %u live "
+                     "saves not taken (the other player's input for the frame was already in)",
+                     (unsigned)gEarlyAdds, gP2PFrames, (unsigned)gConfirmedLiveSkips);
+        Logger::Info("TIMING this session: phase alignment %d correction(s), frame deadline moved %.1f ms (last shares: this game "
+                     "%d/1000, the other %d/1000); %u re-poll(s) after a live save, %u brought the frame's input; GGPO time-sync "
+                     "events left to BALANCE %d; lowest round trip %d ms; %d wait(s) for the peer moved the deadline %d frame(s) "
+                     "(waitshift %d)",
+                     gPhaseCorrections, gPhaseShiftedMs, gPhaseMyQ, gPhasePeerQ, (unsigned)gRepolls, (unsigned)gRepollHits,
+                     gTimesyncIgnored, ggpo_rtt_min_ms, gWaitShifts, gWaitShiftFrames, (int)gWaitShift);
+        SoundDedupe::LogSession();
+        RenderTag::LogSession();
+        {
+            unsigned maxMs = 0, slow = 0;
+            Logger::IoStats(&maxMs, &slow);
+            Logger::Info("LOGIO since the last session: the log files' longest write took %u ms, %u took 5 ms or more (on the "
+                         "logger's own thread: the game thread no longer waits for them)", maxMs, slow);
+        }
+        gEarlyAdds = 0;
+        gConfirmedLiveSkips = 0;
+        Input::SetDeferSampling(false);
+        Input::LogSamplingCounts();
         gTimesyncDebt = 0;
         return;
     }
@@ -2576,7 +2842,10 @@ bool GgpoStartP2P(const P2PConfig& c) {
     WSADATA wd;
     WSAStartup(MAKEWORD(2, 2), &wd);
     if (c.steamPeer) {  // GGPO's remote is the local bridge (c.ip 127.0.0.1, c.remotePort); checksums on a second link
-        const SteamBridge::LinkSpec links[2] = {{c.remotePort, c.localPort, 77},
+        // Channel 77 is not drained at the start: GGPO checks its own session numbers, and the other game's first sync
+        // request may already be waiting there (dropping it costs a retry). 78 carries checksums and phase reports with
+        // no session number: packets a session that stopped early left there are dropped.
+        const SteamBridge::LinkSpec links[2] = {{c.remotePort, c.localPort, 77, true},
                                                 {(unsigned short)(c.remotePort + 100), (unsigned short)(c.localPort + 100), 78}};
         if (!SteamBridge::Start(c.steamPeer, links, 2)) return false;
     }
@@ -2595,9 +2864,28 @@ bool GgpoStartP2P(const P2PConfig& c) {
     ggpo_fallback_loads = ggpo_fallback_misses = 0;
     gSparseSkips = gSparseLiveSkips = 0;
     gLivePendingGgpoGf = 0xFFFFFFFF;
-    if (ggpo_start_session(&gGgpo, &cb, name, 2, sizeof(uint32_t), c.localPort) != GGPO_OK) {
-        Logger::Info("GGPO p2p: session could not start on port %u", c.localPort);
+    // rc25 GGPO switches (globals that persist: set for every session). Over the Steam bridge GGPO talks to 127.0.0.1 only,
+    // so its socket is not exposed on the network (no firewall prompt); a direct-IP session binds every interface as before.
+    // Each datagram GGPO sends is forwarded to Steam at once instead of at the boundary's next Pump (quality replies and
+    // resends made inside a poll waited behind its rollback and the live save: 3-60 ms added to the measured round trip).
+    ggpo_bind_loopback = c.steamPeer ? 1 : 0;
+    ggpo_no_disconnect_rewind = 1;
+    ggpo_after_send = c.steamPeer ? &SteamBridge::PumpOut : nullptr;
+    ggpo_bind_failed = 0;
+    const bool started = ggpo_start_session(&gGgpo, &cb, name, 2, sizeof(uint32_t), c.localPort) == GGPO_OK;
+    if (!started || ggpo_bind_failed) {
+        // GGPO itself goes on without a socket when the port could not be bound (another program holds it): every
+        // packet would be lost and the fight would wait 15 s for a peer that cannot be heard.
+        if (started) {
+            Logger::Info("GGPO p2p: UDP port %u could not be opened (Windows error %d: in use by another program?); the "
+                         "session is not started", c.localPort, ggpo_bind_failed);
+            ggpo_bye_on_close = 0;
+            ggpo_close_session(gGgpo);
+        } else {
+            Logger::Info("GGPO p2p: session could not start on port %u", c.localPort);
+        }
         gGgpo = nullptr;
+        ggpo_after_send = nullptr;
         if (c.steamPeer) SteamBridge::Stop();
         return false;
     }
@@ -2622,9 +2910,16 @@ bool GgpoStartP2P(const P2PConfig& c) {
     gGgpoLocal = c.player - 1;
     gGgpoDelay = delay > 0 ? delay : 0;
     gTimesyncDebt = gTimesyncEvents = gBalanceEvents = gBalanceFrames = 0;
+    gTimesyncFrames = gTimesyncIgnored = 0;  // an event raised by the last session's final polls is not this one's debt
+    gRepolls = gRepollHits = 0;
+    gOvPeerInterrupted = false;
+    PhaseReset();
+    SoundDedupe::SessionReset();
+    RenderTag::SessionReset();
     gPaidMs = gShiftedMs = 0;
     gStallHolds = 0;
     gStallHeldMs = 0;
+    gWaitShifts = gWaitShiftFrames = 0;
     gXrayLockUntil = -1;
     gXrayLockOn = false;
     gXrayLocks = gXrayLockFrames = gXrayLockCineFrames = gXrayLockWaits = 0;
@@ -2636,6 +2931,7 @@ bool GgpoStartP2P(const P2PConfig& c) {
     gFreezeNext = 0;
     gGgpoIsP2P = true;
     FramePace::DefaultStallSample(250);  // where a >= 250 ms frame sat, and whether the whole process had stopped
+    Overlay::RequestDisplayLog();
     // Sessions without the netplay renumber ('netplaygf 0', plain 'ggpo p2p|steam') get the shared virtual clock here; the
     // players' netplay start already switched to it (AnchorCanonical in OnTickEntry).
     if (!ScriptClock::Active()) ScriptClock::AnchorCanonical(GameFrame());
@@ -2657,6 +2953,10 @@ bool SetSessionDelayImpl(int delay) {
     if (!GGPO_SUCCEEDED(ggpo_set_frame_delay(gGgpo, gGgpoPlayer[gGgpoLocal], delay))) return false;
     Logger::Info("GGPO p2p frame delay %d -> %d at gf=%u", gGgpoDelay, delay, GameFrame());
     gGgpoDelay = gP2P.delay = delay;
+    // Both timing controllers measured the old delay: the frame-advantage samples and the share of inputs in time
+    // describe frames that were sent a different number of frames ahead.
+    gBalanceRestart = true;
+    if (gPhaseQuietUntil < gP2PFrames + 60) gPhaseQuietUntil = gP2PFrames + 60;
     return true;
 }
 
@@ -2695,9 +2995,12 @@ void StallHold(double waitedMs) {
     int ping = 0;
     if (gP2P.player >= 1 && gP2P.player <= 2 && GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns)))
         ping = ns.network.ping;
-    const int oneWay = (int)((ping / 2.0 + (1000.0 / 60) - 1) / (1000.0 / 60));  // frames, rounded up
+    // rc25: the lowest recent round trip (GGPO's latest sample right after a stall can hold the stall itself).
+    if (ggpo_rtt_min_ms >= 0) ping = ggpo_rtt_min_ms;
+    const int oneWay = (int)std::ceil(ping / 2.0 / (1000.0 / 60));  // frames, rounded up (rc24 subtracted 1 ms, not a frame)
     const int target = (oneWay > gGgpoDelay ? oneWay - gGgpoDelay : 0) + 1;
     const int gap0 = gP2PFrames - ggpo_last_confirmed_frame;
+    gPhaseQuietUntil = gP2PFrames + 60;  // the phase measure skips the frames around a stall
     if (gap0 <= target) return;
     FramePace::Note("stallhold");
     const int64_t t0 = FramePace::Now();
@@ -2714,6 +3017,30 @@ void StallHold(double waitedMs) {
         Logger::Info("STALLHOLD gf=%u: waited %.0f ms for the peer; frame gap %d (target %d at ping %d ms, delay %d): held %.0f ms "
                      "more, gap now %d", GameFrame(), waitedMs, gap0, target, ping, gGgpoDelay, held,
                      gP2PFrames - ggpo_last_confirmed_frame);
+}
+
+// Wait shift (round 3, 2026-11-10 timing audit). MK9's limiter keeps a fixed 1/60 s grid (the comment at 'paysmooth'
+// in GgpoBoundaryP2P): the frames after a late one start without a wait until the grid is caught up, whole for a frame
+// up to 50 ms late, the remainder of 33 ms beyond. So the time a boundary spent waiting for the peer was taken back
+// within a few frames. At the start barrier that undid the barrier: in all 10 fights of the ns15 stage batch (b46) the
+// game that waited at frame 0 (38-52 ms) ran its next frames 4-5 ms apart and was 1-2 frames ahead again 50 ms later
+// ("BALANCE ... 1.50 frames ahead" at 0.7 s, every rollback of the fight's first 10 s on the other game). After a
+// prediction-limit wait or a stall hold the same sprint took back part of what the hold had evened. A boundary that
+// waited now moves the limiter's deadline (0x00E0AB10) by the wait in whole frames, so the grid itself starts later
+// and nothing is caught up; whole frames keep the sub-frame phase the phase alignment works on. At the start barrier
+// the wait ends one network trip after the other game's frame 0 began, so that trip is not part of the offset between
+// the games and is taken off first (the caller's estimate). Timing only: both games simulate the same frames.
+void WaitShift(double waitedMs, double oneWayMs, const char* what) {
+    if (!gWaitShift || gLockstep) return;
+    const int frames = (int)std::floor((waitedMs - oneWayMs) * 60 / 1000 + 0.5);
+    if (frames <= 0) return;
+    *reinterpret_cast<volatile double*>(0x00E0AB10) += frames / 60.0;
+    ++gWaitShifts;
+    gWaitShiftFrames += frames;
+    gBalanceRestart = true;  // the frame-advantage samples describe the games before the shift
+    if (gWaitShifts <= 12)
+        Logger::Info("WAITSHIFT gf=%u (%s): this boundary waited %.1f ms for the peer (one-way trip %.1f ms); the frame "
+                     "deadline moves %d frame(s) later, nothing is caught up", GameFrame(), what, waitedMs, oneWayMs, frames);
 }
 
 // X-ray lock (2026-11-08, rc14). The X-ray desyncs of the online matrix (batch 22: all four, one-frame shifts with the
@@ -2843,6 +3170,7 @@ void XrayLockWaited(double ms) {
 // WorldTick entry of live frame F (P2P): close F-1, let GGPO poll (rollbacks happen here), then add this
 // frame's local input and synchronize; the masks are applied at EngineTick entry (RecordInputs).
 void GgpoBoundaryP2P(void* engine, float dt) {
+    const int64_t boundaryT0 = FramePace::Now();
     gGgpoEngine = engine;
     gGgpoDt = dt;
     gGgpoLiveF = GameFrame();
@@ -2866,9 +3194,40 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         gGgpoFrameOpen = false;
         ++gP2PFrames;
     }
+    // Early send (rc21, 2026-11-09 latency audit): GGPO sends a local input the moment it is added. Added after the poll,
+    // the rollback and the live save (as before), it left 3.5-4 ms after the boundary's start on a fast PC, 5-8 ms on a
+    // slower one, plus a rollback's load and replay on the frames that had one: the other game received it that much
+    // later and rolled back more at delay 1. Added here, before anything else of the boundary, it leaves at once; the
+    // loop below then finds it added. The pause test and the X-ray hold are evaluated as they are below.
+    Input::SampleDeferredNow();  // late sampling: this pass's controller sample, taken after MK9's frame wait
+    // LATENCY: the input sampled for GGPO frame gP2PFrames is applied `delay` frames later; that frame's picture gets
+    // this sample's time at the end of its own boundary (below).
+    static int64_t sampledAt[64];
+    sampledAt[gP2PFrames & 63] = Input::LocalSampleQpc();  // scripted runs too: the pad is sampled at the same point
+    bool earlyAdded = false;
+    if (gEarlyInput && gGgpoRunning && *reinterpret_cast<const uint32_t*>(0x00E43054) == 0) {
+        // GGPO saves frame 0 inside the first add (Sync::AddLocalInput): checksum frame 0 must start here, as at the
+        // later add below, or that save is recorded as frame 1 and the start check (frame 0 differs) never runs
+        // (rc21 two-instance batch b37: PitDay fights started from different states ran desynced).
+        if (gP2PFrames == 0 && !gGgpoFrameOpen) gCsStartGf = GameFrame();
+        if (!gLocalScripted) gLocalRaw = Input::LocalHardwareMask() & ~0x0F00u;
+        XrayLockPre();
+        earlyAdded = GGPO_SUCCEEDED(ggpo_add_local_input(gGgpo, gGgpoPlayer[gP2P.player - 1], &gLocalRaw, sizeof gLocalRaw));
+        if (earlyAdded) {
+            SteamBridge::Pump();
+            ++gEarlyAdds;
+        }
+    }
     SteamBridge::Pump();
     ggpo_idle(gGgpo, 0);
+    // The paused wait for the session (gHandshakePoll): the handshake's packets answered and read within a millisecond.
+    while (gHandshakePoll && gNetplayWaitRunning && !gGgpoRunning && QpcMs(FramePace::Now() - boundaryT0) < kHandshakePollMs) {
+        BarrierWait();
+        SteamBridge::Pump();
+        ggpo_idle(gGgpo, 0);
+    }
     gDeferLive = false;
+    PhaseSample(ggpo_last_confirmed_frame >= gP2PFrames);  // the other player's input for this frame already in?
     if (gLivePending == gGgpoLiveF && !gGgpoLoadFailed && gSparseLive && gSparseSave && ggpo_frame_loadable && !gLockstep &&
         gLivePendingGgpoGf == gGgpoLiveF && (gLivePendingGgpo & 1)) {
         gHave[gGgpoLiveF % kRing] = false;  // odd live frame (sparselive): a rollback to it loads the frame before
@@ -2877,7 +3236,30 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         FramePace::SkippedSave();
         ++gSparseLiveSkips;
     }
-    if (gLivePending == gGgpoLiveF && !gGgpoLoadFailed && !SaveLiveNow(gGgpoLiveF) && !gSaveRefusedTeardown) ++gGgpoSaveFails;
+    // Confirmed live frame (rc21, save audit): once this poll has the other player's input for F, no rollback can load F,
+    // as for the replayed frames above (LiveFrameConfirmed: F <= ggpo_rollback_safe_frame since rc25). With the input
+    // sent at the boundary's start that is most frames at a short round trip: their save (2.5-5 ms) is not taken, which
+    // also takes it off the time between the controller sample and this frame's picture. 'skiplive 0': save every one.
+    if (gLivePending == gGgpoLiveF && !gGgpoLoadFailed && gSkipConfirmed && gGgpoIsP2P && gLivePendingGgpoGf == gGgpoLiveF &&
+        LiveFrameConfirmed(gLivePendingGgpo)) {
+        gHave[gGgpoLiveF % kRing] = false;
+        gLivePending = 0xFFFFFFFF;
+        gLiveSavedGf = 0xFFFFFFFF;
+        FramePace::SkippedSave();
+        ++gConfirmedLiveSkips;
+    }
+    bool savedLive = false;
+    if (gLivePending == gGgpoLiveF && !gGgpoLoadFailed) {
+        savedLive = true;
+        if (!SaveLiveNow(gGgpoLiveF) && !gSaveRefusedTeardown) ++gGgpoSaveFails;
+    }
+    // Re-poll (gRepoll): the save took 2.6-5 ms; the other player's input for this frame may have come in meanwhile.
+    if (gRepoll && savedLive && gGgpoRunning && !gLockstep && !gGgpoLoadFailed && ggpo_last_confirmed_frame < gP2PFrames) {
+        SteamBridge::Pump();
+        ggpo_idle(gGgpo, 0);
+        ++gRepolls;
+        if (ggpo_last_confirmed_frame >= gP2PFrames) ++gRepollHits;
+    }
     if (gTimesyncFrames > 0) {  // the remote is behind: give it time (simple time sync)
         // Not in lockstep: the barrier below already waits for the remote's input every frame.
         if (!gLockstep) gTimesyncDebt += gTimesyncFrames > 4 ? 4 : gTimesyncFrames;
@@ -2908,7 +3290,7 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         } else if (gTimesyncDebt > 0) {
             settleUntil = gP2PFrames + gBalanceSettle;
             samples = sumDiff = 0;
-        } else if (gP2PFrames >= settleUntil && gP2P.player >= 1 && gP2P.player <= 2 &&
+        } else if (gP2PFrames >= settleUntil && gP2P.player >= 1 && gP2P.player <= 2 && ggpo_rtt_min_ms >= 0 &&
                    GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns))) {
             sumDiff += ns.timesync.remote_frames_behind - ns.timesync.local_frames_behind;  // 2x frames ahead
             if (++samples >= gBalanceSamples) {
@@ -2916,6 +3298,11 @@ void GgpoBoundaryP2P(void* engine, float dt) {
                 if (ahead >= 1.0f) {
                     const int give = ahead >= (float)gBalanceMaxGive ? gBalanceMaxGive : (int)ahead;
                     gTimesyncDebt += give;
+                    // One actuator at a time (timing audit, b46 fight 2: a frame given and a 3 ms phase step within 18 ms
+                    // for a lead under 6 ms, then the other game gave a frame back): a whole frame replaces the phase
+                    // step that was under way; the phase measure starts again once the frame is paid.
+                    gPhaseDueMs = 0;
+                    if (gPhaseQuietUntil < gP2PFrames + 60) gPhaseQuietUntil = gP2PFrames + 60;
                     ++gBalanceEvents;
                     gBalanceFrames += give;
                     if (gBalanceEvents <= 8)
@@ -2936,11 +3323,23 @@ void GgpoBoundaryP2P(void* engine, float dt) {
     // grid slots lost in 33 s, A ahead all fight). 'paysmooth N' moves the deadline itself N ms per frame instead: each
     // frame starts N ms later, with no long frame, until 1/60 s has been paid per frame owed.
     static int paidAt = -1;  // a boundary that advanced no frame (paused) must not pay again
+    // Sub-frame phase alignment (PhaseDecide): the same actuator, kPhasePerFrameMs a frame until the decided shift is made.
+    static int phaseAt = -1;
+    if (gPhaseDueMs > 0 && gP2PFrames != phaseAt && !gLockstep) {
+        phaseAt = gP2PFrames;
+        const double step = gPhaseDueMs < kPhasePerFrameMs ? gPhaseDueMs : kPhasePerFrameMs;
+        *reinterpret_cast<volatile double*>(0x00E0AB10) += step / 1000.0;
+        gPhaseDueMs -= step;
+        gPhaseShiftedMs += step;
+    }
     if (gTimesyncDebt > 0 && gPaySmoothMs > 0 && gP2PFrames != paidAt) {
         paidAt = gP2PFrames;
-        *reinterpret_cast<volatile double*>(0x00E0AB10) += gPaySmoothMs / 1000.0;
-        gPaidMs += gPaySmoothMs;
-        gShiftedMs += gPaySmoothMs;
+        // rc25: debts of up to 2 frames (most BALANCE gives) are paid gPaySmoothSmallMs a frame: a 6% longer frame instead
+        // of 12%, the same total.
+        const int payMs = gTimesyncDebt <= 2 && gPaySmoothSmallMs > 0 && gPaySmoothSmallMs < gPaySmoothMs ? gPaySmoothSmallMs : gPaySmoothMs;
+        *reinterpret_cast<volatile double*>(0x00E0AB10) += payMs / 1000.0;
+        gPaidMs += payMs;
+        gShiftedMs += payMs;
         if (gPaidMs >= 1000.0 / 60) {
             gPaidMs -= 1000.0 / 60;
             --gTimesyncDebt;
@@ -2963,7 +3362,10 @@ void GgpoBoundaryP2P(void* engine, float dt) {
     // A paused tick runs no fight update (the unpause after GGPO's 'running' takes effect at the end of the tick): it
     // must not become a GGPO frame. A replay of it would run a full frame (two-instance test: 3 RNG draws in the replay
     // of frame 0, 0 live). GGPO's frame 0 is the first unpaused frame, which is also checksum frame 0.
-    const bool paused = *reinterpret_cast<const uint32_t*>(0x00E43054) != 0;
+    // An input added early belongs to this frame: GGPO asserts on a second add for the same frame, so the frame must be
+    // synchronized now even if the pause flag changed since (the netplay pause guard refuses pauses in a session).
+    const bool earlyDone = earlyAdded;
+    const bool paused = !earlyDone && *reinterpret_cast<const uint32_t*>(0x00E43054) != 0;
     if (gGgpoRunning && !paused && gP2PFrames == 0 && !gGgpoFrameOpen) gCsStartGf = GameFrame();
     if (gGgpoRunning && !paused) {
         const int local = gP2P.player - 1;
@@ -2976,13 +3378,21 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         // The player's controllers as sampled in this main-loop pass (the sampler call 0x404E26 runs right before this
         // boundary). Read at EngineTick entry instead (RecordInputs), the input reached GGPO one pass later: a frame of
         // input latency for nothing. A scripted mask (harness) still comes from RecordInputs.
-        if (!gLocalScripted) gLocalRaw = Input::LocalHardwareMask() & ~0x0F00u;
-        XrayLockPre();  // in an X-ray cinematic: the input held from before it
+        if (!earlyAdded) {
+            if (!gLocalScripted) gLocalRaw = Input::LocalHardwareMask() & ~0x0F00u;
+            XrayLockPre();  // in an X-ray cinematic: the input held from before it
+        }
         int64_t thresholdSince = 0;  // the first prediction-limit wait of this boundary (stall hold)
         while (GetTickCount64() < deadline) {
-            const GGPOErrorCode r = ggpo_add_local_input(gGgpo, gGgpoPlayer[local], &gLocalRaw, sizeof gLocalRaw);
+            // Added at the boundary's start (early send): accepted then, so not again.
+            const GGPOErrorCode r =
+                earlyAdded ? GGPO_OK : ggpo_add_local_input(gGgpo, gGgpoPlayer[local], &gLocalRaw, sizeof gLocalRaw);
+            earlyAdded = false;
             if (GGPO_SUCCEEDED(r)) {
-                if (thresholdSince) StallHold(QpcMs(FramePace::Now() - thresholdSince));
+                if (thresholdSince) {
+                    StallHold(QpcMs(FramePace::Now() - thresholdSince));
+                    WaitShift(QpcMs(FramePace::Now() - thresholdSince), 0, "prediction limit");
+                }
                 // Rollback: frame 0 too (start barrier, 2026-11-04). The two games reach GGPO's 'running' up to ~0.8 s
                 // apart (sync retries); the first one ran its frames 0-7 on predicted inputs, stopped at the prediction
                 // limit until the other started, then rolled back to frame 0 and paid time-sync debt (every two-instance
@@ -3004,6 +3414,18 @@ void GgpoBoundaryP2P(void* engine, float dt) {
                     }
                     if (xrayLock && waited) XrayLockWaited(QpcMs(FramePace::Now() - tw));
                     if (ggpo_last_confirmed_frame < gP2PFrames) break;  // stopped below (gSyncValid stays false)
+                    if (waited && !gLockstep && !xrayLock && gP2PFrames == 0) {
+                        // The handshake's round trip (no quality report yet at frame 0, and those are read at one
+                        // poll a frame). Polled once a frame it is 0-2 frames more than the wire's, a frame on
+                        // average (r3smoke: 50 and 53 ms on the harness link whose trip is one frame; half of that
+                        // left a frame of lead, which the phase alignment took 8 s to remove): less that frame, half
+                        // of it is within half a frame of the trip. Polled every millisecond on both games
+                        // ('handshakepoll 1'; the two games of a session are the same build) it is the wire's.
+                        const int rtt = ggpo_sync_rtt_ms >= 0 ? ggpo_sync_rtt_ms : ggpo_rtt_min_ms;
+                        const double pollMs = gHandshakePoll && ggpo_sync_rtt_ms >= 0 ? 0 : 1000.0 / 60;
+                        const double oneWay = rtt > pollMs ? (rtt - pollMs) / 2 : 0;
+                        WaitShift(QpcMs(FramePace::Now() - boundaryT0), oneWay, "start barrier");
+                    }
                 }
                 int disconnected = 0;
                 if (GGPO_SUCCEEDED(ggpo_synchronize_input(gGgpo, gSyncMasks, sizeof gSyncMasks, &disconnected))) {
@@ -3052,18 +3474,30 @@ void GgpoBoundaryP2P(void* engine, float dt) {
     }
     CsPump(gGgpoLiveF);
     SteamBridge::Pump();
+    Input::SetDeferSampling(gLateSample && gGgpoRunning);  // the next pass samples at its boundary
+    RenderTag::SetStamp(gSyncValid && gGgpoFrameOpen && gP2PFrames >= gGgpoDelay ? sampledAt[(gP2PFrames - gGgpoDelay) & 63] : 0);
     if (gEnvMismatch) {
         gEnvMismatch = false;
         GgpoStop("environment mismatch with the peer (see NETPLAY ENVIRONMENT MISMATCH)");
     } else if (gStartMismatch) {
         gStartMismatch = false;
         GgpoStop("the peers started the fight from different states (frame 0 differs)");
+    } else if (gDesyncStop) {
+        gDesyncStop = false;
+        GgpoStop("the two games went out of sync");
     } else if (gPeerLost) {
         gPeerLost = false;
         gNetplayArmed = false;  // the next fight would wait for a peer that is gone
-        Logger::Info("NETPLAY: the other player disconnected at gf=%u; the session is stopped and netplay disarmed "
-                     "(the fight continues locally)", GameFrame());
-        GgpoStop("the peer disconnected");
+        // The other game counts the same differing frames and may reach the limit a few frames earlier: its bye
+        // (GgpoStop) then arrives before this game's own stop. Both screens give the same reason.
+        const bool desync = gDesyncStopFrames > 0 && gCsMismatchRun >= gDesyncStopFrames / 2 && Online::Engaged();
+        if (desync)
+            Logger::Info("NETPLAY: the two games went out of sync (%d compared frames in a row differ; the other game "
+                         "stopped its session first): the rollback session is stopped", gCsMismatchRun);
+        else
+            Logger::Info("NETPLAY: the other player disconnected at gf=%u; the session is stopped and netplay disarmed "
+                         "(the fight continues locally)", GameFrame());
+        GgpoStop(desync ? "the two games went out of sync" : "the peer disconnected");
     }
 }
 
@@ -3212,6 +3646,25 @@ void SetPaySmooth(int ms) {
                  gPaySmoothMs ? "frames owed to the peer are paid by moving the frame limiter's deadline (ms per frame)"
                               : "frames owed to the peer are paid by 16 ms waits");
 }
+void SetPaySmoothSmall(int ms) {
+    gPaySmoothSmallMs = ms < 0 ? 0 : ms > 8 ? 8 : ms;
+    Logger::Info("PAYSMOOTH small debts (up to 2 frames): %d ms per frame (0: as larger ones)", gPaySmoothSmallMs);
+}
+void SetGgpoTimesync(bool on) {
+    gGgpoTimesync = on;
+    Logger::Info("GGPOSYNC %d: GGPO's own time-sync requests are %s", on ? 1 : 0,
+                 on ? "paid (as before rc25)" : "only counted while BALANCE is on");
+}
+void SetRepoll(bool on) {
+    gRepoll = on;
+    Logger::Info("REPOLL %d: %s", on ? 1 : 0,
+                 on ? "a live save made before the frame's remote input was in is followed by one more poll" : "no extra poll");
+}
+void SetPhaseSync(bool on) {
+    gPhaseSync = on;
+    if (!on) gPhaseDueMs = 0;
+    Logger::Info("PHASESYNC %d: sub-frame phase alignment with the other game %s", on ? 1 : 0, on ? "on" : "off");
+}
 void SetQualityInterval(int ms) {
     ggpo_quality_report_interval = ms < 50 ? 50 : ms > 1000 ? 1000 : ms;
     Logger::Info("QUALITYMS %d: GGPO sends its frame advantage and ping every %d ms", ggpo_quality_report_interval,
@@ -3222,9 +3675,58 @@ void SetRunningRetry(int ms) {
     Logger::Info("NETRETRY %d: GGPO resends the unacknowledged inputs after %d ms without a new input frame from the peer (stock 200)",
                  ggpo_running_retry_interval, ggpo_running_retry_interval);
 }
+void SetFirstInputRetry(int ms) {
+    ggpo_first_input_retry_ms = ms < 0 ? 0 : ms > 34 ? 34 : ms;
+    if (ggpo_first_input_retry_ms) {
+        Logger::Info("FIRSTRETRY %d: until the other game's first input arrives, GGPO sends this game's inputs again every %d ms",
+                     ggpo_first_input_retry_ms, ggpo_first_input_retry_ms + 1);
+    } else {
+        Logger::Info("FIRSTRETRY 0: the first inputs are sent again only after 'netretry' (rc27)");
+    }
+}
 void SetCanonClock(bool on) {
     gCanonClock = on;
     Logger::Info("CANONCLOCK %d: the world clocks %s at the netplay start", on ? 1 : 0, on ? "are set to the same value" : "are left as they are");
+}
+void SetFastReadable(bool on) {
+    gFastReadable = on;
+    Logger::Info("FASTREADABLE %d: the rollback's readability checks use %s", on ? 1 : 0,
+                 on ? "guarded reads (one per page)" : "VirtualQuery");
+}
+void SetSkipLive(bool on) {
+    gSkipLive = on;
+    Logger::Info("SKIPLIVE %d: live saves of frames whose remote input is already in are %s", on ? 1 : 0, on ? "skipped" : "taken");
+}
+void SetLateSample(bool on) {
+    gLateSample = on;
+    if (!on) Input::SetDeferSampling(false);
+    Logger::Info("LATESAMPLE %d: controllers sampled %s", on ? 1 : 0,
+                 on ? "at the P2P boundary's start (after MK9's frame wait)" : "at the main loop's call (before MK9's frame wait)");
+}
+void SetEarlyInput(bool on) {
+    gEarlyInput = on;
+    Logger::Info("EARLYINPUT %d: the local input is added %s", on ? 1 : 0,
+                 on ? "at the boundary's start, before the poll and the live save" : "after the poll and the live save");
+}
+void SetDesyncStop(int frames) {
+    gDesyncStopFrames = frames < 0 ? 0 : frames;
+    if (gDesyncStopFrames) Logger::Info("DESYNCSTOP: an online match's rollback session stops after %d compared frames in a row differ", gDesyncStopFrames);
+    else Logger::Info("DESYNCSTOP off: checksum differences are only logged (rc27)");
+}
+void SetHandshakePoll(bool on) {
+    gHandshakePoll = on;
+    Logger::Info("HANDSHAKEPOLL %s", on ? "on: the paused wait for the session polls every millisecond"
+                                        : "off: one poll a frame until the session runs (rc27)");
+}
+void SetPhaseGrowAfter(int decisions) {
+    gPhaseGrowAfter = decisions < 1 ? 1 : decisions > 8 ? 8 : decisions;
+    Logger::Info("PHASEGROW %d: the phase search's step grows from decision %d in a row with the same leader%s", gPhaseGrowAfter,
+                 gPhaseGrowAfter + 1, gPhaseGrowAfter == 1 ? " (rc27)" : "");
+}
+void SetWaitShift(bool on) {
+    gWaitShift = on;
+    Logger::Info("WAITSHIFT %s", on ? "on: a boundary that waited for the peer moves the frame deadline by the wait (whole frames)"
+                                    : "off: the limiter catches up after a wait (rc27)");
 }
 void SetStartBarrier(bool on) {
     gStartBarrier = on;
@@ -3809,6 +4311,7 @@ bool InstallRollbackModules() {
     ActorGuard::Install();
     ScriptLinkGuard::Install();
     InstallRenderLate();
+    if (!RenderTag::Install()) Logger::Info("ROLLBACK: replayed frames stay drawn (replayskip unavailable)");
     // RayQueries: after RngTrace (chains to its lab tap). Uninstalled 2026-11-04 on a wrong premise (RayQueries.h); soak 14
     // (2026-11-06) showed every MK object line check answering one frame later through the report.
     if (!RayQueries::Install()) Logger::Info("ROLLBACK: MK object line-check tracking unavailable (rayqfix inactive)");
@@ -4033,8 +4536,9 @@ void PublishOverlay() {
         }
     } else if (gGgpo) {
         s.mode = Overlay::kSyncTest;
-    } else if (gOvStopAt && GetTickCount() - gOvStopAt < 5000) {
+    } else if (gOvStopAt && GetTickCount() - gOvStopAt < 12000) {  // 5 s until rc25: easy to miss mid-round
         s.mode = Overlay::kStopped;
+        s.stopAgeS = (uint8_t)((GetTickCount() - gOvStopAt) / 1000);
     } else if (gNetplayArmed || gNetplayWaitRunning || gP2PPending) {
         s.mode = Overlay::kWaiting;
     } else if (const char* why = Online::StatusText()) {  // an online fight on MK9's netcode: say why
@@ -4061,7 +4565,16 @@ void PublishOverlay() {
     s.replayed = gGgpoReplayed;
     s.mismatched = gCsMismatched;
     s.barrierWaits = gBarrierWaits;
+    // rc25 connection-quality inputs (the overlay picks the wording and the colour).
+    const bool running = gGgpo && gGgpoIsP2P && gGgpoRunning;
+    s.rttMs = (int16_t)(running && ggpo_rtt_min_ms >= 0 ? (ggpo_rtt_min_ms < 32767 ? ggpo_rtt_min_ms : 32767) : -1);
+    if (running) FramePace::Quality(&s.netStallMs, &s.netStallAgoS, &s.localHitchMs, &s.localHitchAgoS);
+    s.peerInterrupted = running && gOvPeerInterrupted ? 1 : 0;
     if (s.mode != Overlay::kInfo) memcpy(s.stopWhy, gOvStopWhy, sizeof s.stopWhy);
+    if (Online::Engaged()) {
+        s.wifi = (uint8_t)((Online::LocalOnWifi() ? 1 : 0) | (Online::PeerOnWifi() ? 2 : 0));
+        s.relayed = Online::LinkRelayed() ? 1 : 0;
+    }
     Overlay::Publish(s);
 }
 

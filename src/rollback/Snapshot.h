@@ -41,6 +41,10 @@ struct StateAB : State {
     std::vector<uint32_t> mapObjs;     // MK skeletal objects whose +0x138 name map was saved: {object, MK object id} pairs
 };
 extern bool gReflectData;  // UE3 spans: fields declared as data (reflection) are never kept live by the merge
+// LoadAB's pointer-safe merge (rc25): 0 whole-span (before rc25), 1 diff-first (default: only the dwords whose live and
+// saved values differ are classified; the same bytes), 2 diff-first checked against the whole-span merge on every span
+// (DIFFMERGE MISMATCH lines, the whole-span result used). Not wired to a command yet ('diffmerge N').
+extern int gDiffMerge;
 extern bool gPinFloats;  // SkelControlPinLimb +0x90..+0x98/+0xA8..+0xB0 always restored by value
 extern bool gCompFloats;  // fighter component float vectors (COMPKEEP) always restored by value ('abtest compfloats')
 extern bool gCompLiveData;  // fighter component kept dwords whose live value is data restored by value ('abtest complivedata')
@@ -105,8 +109,12 @@ extern bool gPropSkel, gPropSkelLoad;  // other MK skeletal objects' pose: save 
 extern bool gBoneRotation;  // fightercomp: restore the saved rotation of the triple-buffered bone matrices ('bonerot 0|1')
 extern bool gForeignVtables;  // strict rule also accepts vtables of other modules (PhysX objects) ('foreignvt 0|1')
 extern bool gStrictVtable;  // pointer rule above 0x30000000: target must start with a real vtable ('strictvt 0|1')
+extern bool gColdCheck;     // targets on pages outside the working set kept live unread ('coldcheck 0|1')
+extern int gTrimWsMs;       // test aid: empty the working set every N ms at a save ('trimws N', 0 off)
+void StopPageWarmer();      // MarkKeep's page-touching thread (MK9R_Unload)
 extern int gLearnFields;  // learned per-address pointer/data kind in the pointer merge ('learnfields 0|1')
 extern bool gPositiveCache;  // persistent committed-region cache in the pointer scan ('poscache 0|1')
+void SetCommittedCap(int n);  // 'heapcache N': that cache's capacity in ranges (rc25 default 1024; 64 = rc24)
 extern bool gFloatFields;  // actor Location never kept live by the pointer merge ('floatfields 0|1')
 extern bool gPawnComps;  // the fighters' non-mesh components (collision cylinder...) ('pawncomps 0|1')
 extern bool gTierECamera;  // Tier E also takes MKCamera / MKArenaConstrainPoint ('tierecam 0|1')

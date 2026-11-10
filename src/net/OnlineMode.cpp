@@ -11,8 +11,11 @@
 #include "../game/Input.h"
 #include "../game/MK9Game.h"
 #include "../hook/CodePatch.h"
+#include "../rollback/FramePace.h"
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
+#include "EnvFingerprint.h"
+#include "HelloProto.h"
 #include "SteamBridge.h"
 
 namespace {
@@ -22,10 +25,11 @@ constexpr uintptr_t kIdleMs = 0x004F5E10;  // thiscall(socket) -> ms since the l
 const uint8_t kIdleOrig[6] = {0x53, 0x56, 0x8B, 0xF1, 0x33, 0xDB};  // push ebx; push esi; mov esi,ecx; xor ebx,ebx
 constexpr uint32_t kConnToGamepads = 0x4C3C;  // MKOnlineGamepadData inside the connection (call at 0x008868EC)
 constexpr int kHelloChannel = 79;
-constexpr uint32_t kHelloMagic = 0x4F39524Bu;  // "KR9O"
+// The hello's bytes and the decisions taken from them: HelloProto.h (version 4, magic "KR9O").
 // 2: lockstep flag and input delay; 3: + the delay proposal's state and a ping echo; 4: + the live proposal and 'ready'
-// (a game engages only when the other one is ready too).
-constexpr uint32_t kHelloVersion = 4;
+// (a game engages only when the other one is ready too); still 4, 24 bytes longer (2026-11-10): + this build's
+// identity and the Wi-Fi flag. The releases up to rc27 read the first 28 bytes of it and never see 'ready' from a
+// build with an identity, so they keep MK9's netcode against it.
 constexpr ULONGLONG kHelloEveryMs = 500, kHelloFreshMs = 3000, kGraceMs = 15000;
 // GameInfo+0x4 after the last round: MK9's results and rematch screens (8 through the rounds; 11 was seen late in a
 // fight, so only 9 ends a session).
@@ -49,17 +53,6 @@ using IdleFn = uint32_t(__thiscall*)(void* self);
 uint8_t* gExchangeTramp = nullptr;
 uint8_t* gIdleTramp = nullptr;
 
-struct Hello {
-    uint32_t magic, version;
-    uint8_t localPlayer, engaged, lockstep, delay;  // delay: this game's proposal (the session uses the larger of the two)
-    uint8_t delayFinal;                             // the proposal will not change any more this match
-    uint8_t liveDelay;                              // the delay the current round trips allow (0: none; between rounds)
-    uint8_t ready;                                  // this game would engage now (fight's phase, delay final, not failed)
-    uint8_t pad[1];
-    uint32_t sentMs;                                // the sender's clock (NowMs) at the send
-    uint32_t echoMs, echoHeldMs;                    // the last sentMs read from the other game, and how long it was held
-};
-
 uint64_t gPeer = 0;
 bool gAuto = false;  // 'online auto': gPeer is found in the game's connection, per match
 ULONGLONG gLastScan = 0;
@@ -74,10 +67,13 @@ int gDelay = 1;  // the fixed input delay (unused with gPingDelay)
 bool gPingDelay = false;
 constexpr uint32_t kPingKeep = 16, kPingMin = 4, kPingFinal = 8;
 constexpr int kMaxRollbackDelay = 6;  // DelayFromPing's largest rollback delay (4 before 2026-11-06)
+// Everything this game proposes fits what a hello may carry (the other game's values are cut to it when read).
+static_assert(kMaxRollbackDelay <= HelloProto::kMaxDelay, "the ping's proposals must fit the hello's delay range");
 uint32_t gPing[kPingKeep] = {}, gPingCount = 0;  // round trips in ms (ring; gPingCount counts every sample)
 uint64_t gPingPeer = 0;                          // the opponent the samples belong to
 uint32_t gEchoMs = 0, gEchoReadAt = 0;           // the other game's last hello clock and when it was read (NowMs)
-int gOwnDelay = -1;                              // this game's proposal once final (-1: still measuring)
+uint32_t gLateHelloReads = 0;                    // hellos read late (ReadHellos), not used for the round trip
+int gOwnDelay = -1;                             // this game's proposal once final (-1: still measuring)
 int gPeerDelayFinal = 0;
 int gSessionDelay = 0;                           // the agreed delay of the current engagement
 // Between rounds the session's delay follows the round trips measured during the match: both fighters' input locked
@@ -113,6 +109,27 @@ uint32_t gRearms = 0;  // sessions re-armed at a fight end (this match)
 bool gMatchRefused = false;  // this match is not one-on-one Player/Private (logged once per match)
 bool gStateWaitLogged = false;  // "not in the fight's phase yet" (logged once per connection phase)
 constexpr uint32_t kFightState = 8;  // GameInfo+0x4 in online matches: 7 character select, 1 stage load, 8 fight
+
+// The other game's build, from its hellos (HelloProto.h). Two games with the same protocol version but different DLLs,
+// game files or switches used to engage and stop at the session's environment check (frame 24, in mid-fight, falling
+// back to MK9's netcode from a state the two games no longer shared): every match after one player updated. Now a game
+// says 'ready', and engages, only against the same build, files, mode and switches; anything else is said once per
+// match and MK9's netcode plays. Per opponent (gHelloPeer).
+HelloProto::Parsed gPeerHello;       // the opponent's latest hello with a meaning (kind kNone: none yet)
+uint64_t gHelloPeer = 0;             // whose gPeerHello, gAnyHelloRx and gPeerWifi are
+ULONGLONG gAnyHelloRx = 0;           // the last hello of any version or size from the opponent's mod (0: none this match)
+HelloProto::Identity gOwnId;         // this game's side (UpdateVerdict, every tick with an opponent)
+bool gOwnIdValid = false;            // false until EnvFingerprint's background pass is through
+HelloProto::Match gVerdict = HelloProto::Match::kUnknown;
+bool gBuildLineLogged = false, gContentLineLogged = false, gSwitchLineLogged = false;  // per match
+// Connection facts for the status line (read by the overlay through LocalOnWifi/PeerOnWifi/LinkRelayed every tick).
+volatile LONG gLocalWifi = -1;  // this PC's default route: 1 Wi-Fi, 0 not, -1 unknown (WifiProbe's thread)
+volatile LONG gWifiState = 0;   // 0 not looked at this match, 1 the look runs, 2 done
+int gPeerWifi = -1;             // the opponent's, from its hello (-1: not said)
+bool gLinkRelayed = false;      // Steam's P2P session with the opponent goes through a relay (read with every hello sent)
+bool gLinkLogged = false;       // per match
+ULONGLONG gPeerKnownAt = 0;     // the opponent of this connection phase has been known since (0: not known)
+bool gMatchModeLogged = false;  // per match
 
 uint32_t GameState() {
     const uint32_t gi = *reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().gameInfoPtr);
@@ -198,6 +215,98 @@ void ResetPing() {
     gPeerReady = gPeerEngaged = false;
 }
 
+// Another opponent, or another match: nothing heard from this one's mod yet, and its lines may be logged again.
+void ResetPeerHello() {
+    gPeerHello = HelloProto::Parsed{};
+    gAnyHelloRx = 0;
+    gVerdict = HelloProto::Match::kUnknown;
+    gPeerWifi = -1;
+    gBuildLineLogged = gContentLineLogged = gSwitchLineLogged = false;
+}
+
+// A hello of any version or size from the current opponent's mod arrived in this match.
+bool HeardPeer() { return gAnyHelloRx && gHelloPeer == gPeer; }
+
+// Another build of the mod or other game files: nothing a setting changes during this match.
+bool OtherBuild(HelloProto::Match m) {
+    return m == HelloProto::Match::kPeerOlder || m == HelloProto::Match::kThisOlder || m == HelloProto::Match::kDifferentBuild ||
+           m == HelloProto::Match::kContentDiffers;
+}
+
+// This game's identity and the comparison with the opponent's latest hello: once per tick, after the hellos were read.
+// The content and DLL prints come from EnvFingerprint's background pass (started when the mod is armed); the switches
+// print is computed here every time, so a hello always carries the switches of the moment it is sent and a command that
+// changes one (the launcher's Safe mode checkbox) shows in the next hello and the next comparison. The session's own
+// check at frame 24 still has the last word on the values the session really starts with.
+void UpdateOwnId() {
+    // Not while the background pass runs (Get would wait for it on the game thread). Without one (its thread could not
+    // be created) the pass runs here, once.
+    if (!EnvFingerprint::Ready() && EnvFingerprint::Busy()) {
+        gOwnIdValid = false;
+        return;
+    }
+    const EnvFingerprint::Print& p = EnvFingerprint::Get();
+    const EnvFingerprint::Stamp s = EnvFingerprint::ReleaseStamp();
+    gOwnId.stampDate = s.date;
+    gOwnId.stampTime = s.time;
+    gOwnId.content = p.v[EnvFingerprint::kContent];
+    gOwnId.dll = p.v[EnvFingerprint::kDll];
+    gOwnId.switches = p.v[EnvFingerprint::kSwitches];
+    gOwnIdValid = true;
+}
+
+void UpdateVerdict() {
+    UpdateOwnId();
+    const HelloProto::Match was = gVerdict;
+    gVerdict = HeardPeer() ? HelloProto::Compare(gOwnId, gOwnIdValid, Rollback::Lockstep(), gPeerHello) : HelloProto::Match::kUnknown;
+    // 'ready' depends on it: the other game hears at the next tick, not at the next hello period.
+    if (gVerdict == HelloProto::Match::kSame && was != gVerdict) gLastHelloTx = 0;
+}
+
+// The verdicts that keep MK9's netcode, each once per match (the launcher shows the three build lines).
+void ReportVerdict() {
+    bool* logged = nullptr;
+    switch (gVerdict) {
+    case HelloProto::Match::kPeerOlder:
+    case HelloProto::Match::kThisOlder:
+    case HelloProto::Match::kDifferentBuild:
+        logged = &gBuildLineLogged;
+        break;
+    case HelloProto::Match::kContentDiffers:
+        logged = &gContentLineLogged;
+        break;
+    case HelloProto::Match::kSwitchesDiffer:
+        logged = &gSwitchLineLogged;
+        break;
+    default:  // unknown, the same, or Safe mode on one side (the engage path's own line)
+        return;
+    }
+    if (*logged) return;
+    // The line names this build too: an older opponent is known before this game's own prints are (a moment after the
+    // mod was armed).
+    if (!gOwnIdValid && EnvFingerprint::Busy()) return;
+    char line[400];
+    if (!HelloProto::Describe(gVerdict, gOwnId, gPeerHello, line, sizeof line)) return;
+    *logged = true;
+    Logger::Info("%s", line);
+}
+
+// This PC's default route, looked up off the game thread (GetAdaptersAddresses can take tens of milliseconds).
+DWORD WINAPI WifiProbe(void*) {
+    InterlockedExchange(&gLocalWifi, SteamBridge::DefaultRouteOnWifi());
+    InterlockedExchange(&gWifiState, 2);
+    return 0;
+}
+
+void StartWifiProbe() {  // once per match (MatchReset), and when the mod is armed
+    if (gWifiState != 0) return;
+    InterlockedExchange(&gWifiState, 1);
+    if (HANDLE t = CreateThread(nullptr, 0, WifiProbe, nullptr, 0, nullptr)) CloseHandle(t);
+    else InterlockedExchange(&gWifiState, 2);  // stays unknown
+}
+
+const char* WifiText(int wifi) { return wifi > 0 ? "on Wi-Fi" : wifi == 0 ? "not on Wi-Fi" : "unknown"; }
+
 // The second-highest of the kept round trips: one late hello does not decide the delay. 0 without samples.
 uint32_t PingEstimate(uint32_t* median) {
     const uint32_t n = gPingCount < kPingKeep ? gPingCount : kPingKeep;
@@ -208,7 +317,8 @@ uint32_t PingEstimate(uint32_t* median) {
     return n >= 2 ? s[n - 2] : n ? s[0] : 0;
 }
 
-// The smallest delay (frames of 1000/60 ms) the round trip allows, from 2 up to 3 (Safe mode) or 6 (rollback).
+// The smallest delay (frames of 1000/60 ms) the round trip allows, from 2 up to 3 (Safe mode) or from 1 up to 6
+// (rollback; 1 since rc20, below).
 // - Lockstep (Safe mode) waits for each input: the two one-way trips together must fit in 2 x delay frames, so 2 frames
 //   up to a 56 ms round trip (10 ms kept for jitter), else 3 as before.
 // - Rollback guesses late inputs and replays: it keeps a replay to about one frame, so the delay is the one-way trip in
@@ -218,12 +328,29 @@ uint32_t PingEstimate(uint32_t* median) {
 //   4 had 2-3, as smooth as 60 ms; a 300-440 ms one had 118-146 at delay 4, 28-61 at 5, 5-46 at 6, where replays near
 //   GGPO's 8-frame prediction limit made frames wait; the cap was 4 until then).
 // Too few samples: the fixed delays used before (Safe 3, rollback 2). margin: added to the round trip.
+// Delay 1 (2026-11-08, rc19): the field test's link (hello round trip 33-50 ms, GGPO ping 33-50) ran at delay 2 all night
+// and the player still felt it ("not like the new fighting games, which feel offline"; a Cyrax bomb combo timed by eye
+// dropped). b34/b35 (two games on one PC): delay 1 at a 20-30 ms and a 40-60 ms simulated round trip had the hitches of
+// delay 2, but on a PC slowed by 6 ms a tick the replays it adds cost ~119 hitches a minute (delay 2: 5-40). So delay 1 up
+// to a 50 ms round trip, and only while this PC keeps up: gCpuFloor.
+// Hellos are sent and read at a fixed point of each game's tick, so a round trip reads as whole frames (33, 50, 67 ms;
+// the field log's second-highest was 49-51 in 14 of 19 matches): the limit is 3 frames plus a margin, not 50 exactly.
+constexpr uint32_t kDelay1UpToMs = 55;
+// The smallest rollback delay this PC runs without replay hitches: 1 until a round at delay 1 had kCpuHitchesPerK or more
+// live frames >= 25 ms with a replay per 1000 frames (FramePace::TakeReplayHitches), then 2 for the rest of the game's run
+// (a PC does not get faster; the next rounds and matches propose 2, and the larger proposal wins).
+int gCpuFloor = 1;
+constexpr uint32_t kCpuHitchesPerK = 3;
 int DelayFromPing(uint32_t margin = 0) {
     const bool lockstep = Rollback::Lockstep();
     if (gPingCount < kPingMin) return lockstep ? 3 : 2;
     const uint32_t est = PingEstimate(nullptr) + margin;
     if (lockstep) return est + 10 <= 2u * 2000 / 60 ? 2 : 3;
-    static constexpr uint32_t kRollbackUpTo[] = {3 * 2000 / 60, 4 * 2000 / 60, 200, 250};  // delays 2, 3, 4, 5
+    if (est <= kDelay1UpToMs) return gCpuFloor > 1 ? gCpuFloor : 1;
+    // Half a frame above the 6, 8, 12 and 15 frames the limits were (round 3, timing audit): a hello round trip reads as
+    // whole frames give or take a millisecond, so a link of exactly 8 frames read 133 or 134 ms and its delay flipped
+    // between 3 and 4 from match to match (the same for 100, 200 and 250 ms). kDelay1UpToMs got the same margin in rc20.
+    static constexpr uint32_t kRollbackUpTo[] = {108, 142, 208, 258};  // delays 2, 3, 4, 5
     for (int d = 2; d <= 5; ++d)
         if (est <= kRollbackUpTo[d - 2]) return d;
     return kMaxRollbackDelay;
@@ -250,9 +377,10 @@ void FinalizeDelay(const char* when) {
         Logger::Info("ONLINE: input delay %d proposed %s (only %u round trip(s) measured: the usual delay)", gOwnDelay, when,
                      (unsigned)gPingCount);
     else
-        Logger::Info("ONLINE: round trip to the other game %u ms (second-highest of %u hellos, median %u ms): input delay %d proposed "
-                     "%s (%s)",
-                     (unsigned)est, (unsigned)n, (unsigned)median, gOwnDelay, when, Rollback::Lockstep() ? "Safe mode" : "rollback");
+        Logger::Info("ONLINE: round trip to the other game %u ms (second-highest of %u hellos, median %u ms; %u read late and "
+                     "not counted): input delay %d proposed %s (%s)",
+                     (unsigned)est, (unsigned)n, (unsigned)median, (unsigned)gLateHelloReads, gOwnDelay, when,
+                     Rollback::Lockstep() ? "Safe mode" : "rollback");
 }
 
 bool FightActive() {
@@ -270,6 +398,13 @@ void AdaptDelay(ULONGLONG now) {
     if (gLockDone || ++gLockedTicks < kLockedTicksMin) return;
     gLockDone = true;
     ++gLockStretches;
+    uint32_t frames = 0;
+    const uint32_t replayHitches = FramePace::TakeReplayHitches(&frames);
+    if (gCpuFloor < 2 && Rollback::SessionDelay() == 1 && frames >= 600 && replayHitches * 1000 >= kCpuHitchesPerK * frames) {
+        gCpuFloor = 2;
+        Logger::Info("ONLINE: %u of %u live frames since the last round took >= 25 ms with a replay at delay 1: this PC proposes "
+                     "delay 2 or more from now on", (unsigned)replayHitches, (unsigned)frames);
+    }
     const int own = LiveProposal();
     if (!own || !gPeerLive || !gLastHelloRx || now - gLastHelloRx > kHelloFreshMs) return;
     const int agreed = std::max(own, gPeerLive);
@@ -383,72 +518,122 @@ bool OneOnOneMatch(uint32_t* type, uint32_t* matchType) {
     return (*type == 0 || *type == 2 || *type == 3) && *matchType == 0;  // None (invited room), Player or Private; DM
 }
 
+// The match mode, with the fields OneOnOneMatch decides on: logged once per match in the fight's phase. Nothing is
+// refused on it yet. docs\reverse_engineering.md puts MatchMode at GameContext +0x14 with the names 1V1, TAG, TAG_2P
+// (0x0081A660) but no values, and its layout of the fields before it (+0x08 GameType) is not the one read here at
+// runtime (+0x04 Type). The name function itself (static, 2026-11-10) returns "1V1" for 0, "TAG" for 1, "TAG_2P" for 2;
+// that the dword at +0x14 is its argument is not confirmed by a real tag match, and a wrong guess would refuse every
+// match. These lines from real 1 vs 1 and tag rooms settle it.
+void LogMatchMode() {
+    const uint32_t mgr = *reinterpret_cast<const volatile uint32_t*>(kOnlineManager);
+    if (!mgr || !Readable(reinterpret_cast<void*>(mgr + kGameContext), 0x18)) {
+        Logger::Info("ONLINE: match description (GameContext) not readable in this match");
+        return;
+    }
+    const volatile uint8_t* ctx = reinterpret_cast<const volatile uint8_t*>(mgr + kGameContext);
+    Logger::Info("ONLINE: match description (GameContext): match mode (+0x14) %u (the game's names: 0 1V1, 1 TAG, 2 TAG_2P; not "
+                 "checked yet); mode (+0x00) %u, type (+0x04) %u, +0x08 %u, +0x0C %u, match type (+0x10) %u",
+                 U32(ctx, 0x14), U32(ctx, 0x00), U32(ctx, 0x04), U32(ctx, 0x08), U32(ctx, 0x0C), U32(ctx, 0x10));
+}
+
 // This game's own conditions to engage (the engage path in Tick adds the other game's): the fight's connection phase,
 // a final delay proposal, no failure this match, a one-on-one Player/Private match.
-bool LocalReady() {
-    if (!FightActive() || gFailedThisMatch || GameState() != kFightState || !OwnDelayFinal()) return false;
+HelloProto::Local LocalState() {
+    HelloProto::Local l;
+    l.fightActive = FightActive();
+    l.fightState = GameState() == kFightState;
+    l.delayFinal = OwnDelayFinal();
+    l.failedThisMatch = gFailedThisMatch;
     uint32_t type = 0, matchType = 0;
-    return OneOnOneMatch(&type, &matchType);
+    l.oneOnOne = l.fightActive && l.fightState && OneOnOneMatch(&type, &matchType);
+    return l;
 }
+
+// The hello's 'ready': those, and the other game's build is known to be this one's (gVerdict).
+bool LocalReady() { return HelloProto::Ready(LocalState(), gVerdict); }
 
 void SendHello() {
-    Hello h{};
-    h.magic = kHelloMagic;
-    h.version = kHelloVersion;
-    h.localPlayer = (uint8_t)Online::LocalPlayer();
-    h.engaged = (uint8_t)gEngaged;
-    h.lockstep = (uint8_t)(Rollback::Lockstep() ? 1 : 0);
-    h.delay = (uint8_t)OwnDelay();
-    h.delayFinal = (uint8_t)OwnDelayFinal();
-    h.liveDelay = (uint8_t)LiveProposal();
-    h.ready = (uint8_t)LocalReady();
+    HelloProto::Fields f;
+    f.localPlayer = (uint8_t)Online::LocalPlayer();
+    f.engaged = gEngaged ? 1 : 0;
+    f.lockstep = Rollback::Lockstep() ? 1 : 0;
+    f.delay = (uint8_t)OwnDelay();
+    f.delayFinal = OwnDelayFinal() ? 1 : 0;
+    f.liveDelay = (uint8_t)LiveProposal();
+    f.ready = LocalReady() ? 1 : 0;
     const uint32_t now = NowMs();
-    h.sentMs = now ? now : 1;  // 0 means "nothing to echo"
+    f.sentMs = now ? now : 1;  // 0 means "nothing to echo"
     if (gEchoMs && gPingPeer == gPeer) {
-        h.echoMs = gEchoMs;
-        h.echoHeldMs = now - gEchoReadAt;
+        f.echoMs = gEchoMs;
+        f.echoHeldMs = now - gEchoReadAt;
     }
-    SteamBridge::SendRaw(gPeer, &h, sizeof h, kHelloChannel);
+    f.identityValid = gOwnIdValid;
+    f.id = gOwnId;
+    f.wifi = (int)gLocalWifi;
+    uint8_t pkt[HelloProto::kSize];
+    const size_t size = HelloProto::Build(f, pkt, sizeof pkt);
+    SteamBridge::SendRaw(gPeer, pkt, (uint32_t)size, kHelloChannel);
     gLastHelloTx = GetTickCount64();
+    gLinkRelayed = SteamBridge::UsingRelay(gPeer);  // one Steam call per hello, not per tick (LinkRelayed)
 }
 
+// Hellos are read once a tick. A tick that comes more than kLateReadMs after the previous one (a stall, a stall hold, an
+// X-ray lock wait, a long rollback frame, a loading screen) reads hellos that arrived some time before, unknown how long:
+// a round trip through that read held the stall (2026-11-09 timing audit: two such samples in 8 s turned 50 ms into 67,
+// delay 2, for the next round). Such a read takes no sample and is not echoed (the other game's sample would hold it).
+constexpr uint32_t kLateReadMs = 25;
 void ReadHellos() {
-    char buf[64];
+    char buf[256];  // a later build may send more than this one reads; Steam cuts what does not fit
     uint64_t from = 0;
     uint32_t echoMs = 0, echoHeldMs = 0;  // the newest hello's echo: older ones waited in Steam's queue meanwhile
+    static uint32_t prevCall = 0;
+    const uint32_t callAt = NowMs();
+    const bool lateRead = prevCall && callAt - prevCall > kLateReadMs;
+    prevCall = callAt;
+    bool readAny = false;
     for (int i = 0; i < 16; ++i) {
         const int got = SteamBridge::ReadRaw(kHelloChannel, buf, sizeof buf, &from);
         if (got < 0) break;
-        uint32_t magic = 0, version = 0;
-        if (from != gPeer || got < 8) continue;
-        memcpy(&magic, buf, 4);
-        memcpy(&version, buf + 4, 4);
-        if (magic != kHelloMagic) continue;
-        if (version != kHelloVersion || got < (int)sizeof(Hello)) {
-            static int warned = 0;
-            if (!warned++) Logger::Info("ONLINE: the other player's MK9Rollback speaks online version %u (this one %u); not engaging",
-                                        version, kHelloVersion);
-            continue;
+        if (from != gPeer) continue;
+        // Everything below is the opponent's to choose: Parse checks the lengths and brings every value into the range
+        // this mod sends (a delay of 255 went through AgreedDelay into GGPO, whose input queue asserts: the game closed).
+        const HelloProto::Parsed h = HelloProto::Parse(buf, (size_t)got);
+        if (h.kind == HelloProto::Kind::kNone) continue;
+        if (gHelloPeer != gPeer) {
+            ResetPeerHello();
+            gHelloPeer = gPeer;
         }
-        Hello h{};
-        memcpy(&h, buf, sizeof h);
+        // The opponent's mod is there, whatever it speaks: not "no mod" (a hello of another version used to be dropped
+        // here with one line per process, and 5 s later the log and the status line said the opponent had no mod).
+        gAnyHelloRx = GetTickCount64();
+        if (h.kind == HelloProto::Kind::kMalformed) continue;
+        gPeerHello = h;
+        gPeerWifi = h.f.wifi;
+        if (h.kind == HelloProto::Kind::kOtherVersion) continue;  // an older or newer protocol: UpdateVerdict says which
         if (gPingPeer != gPeer) {  // samples and proposals belong to one opponent
             ResetPing();
             gPingPeer = gPeer;
         }
-        echoMs = h.echoMs;
-        echoHeldMs = h.echoHeldMs;
-        gEchoMs = h.sentMs;
+        echoMs = h.f.echoMs;
+        echoHeldMs = h.f.echoHeldMs;
+        gEchoMs = lateRead ? 0 : h.f.sentMs;  // 0: the next hello carries no echo
         gEchoReadAt = NowMs();
-        if (!gLastHelloRx) Logger::Info("ONLINE: hello from the other player's MK9Rollback (their side %u)", h.localPlayer);
+        readAny = true;
+        // Not for another build (the launcher would say rollback can take over, after the line that says it cannot).
+        if (!gLastHelloRx && !OtherBuild(HelloProto::Compare(gOwnId, gOwnIdValid, Rollback::Lockstep(), h)))
+            Logger::Info("ONLINE: hello from the other player's MK9Rollback (their side %u)", h.f.localPlayer);
         gLastHelloRx = GetTickCount64();
-        gPeerPlayer = h.localPlayer;
-        gPeerLockstep = h.lockstep;
-        gPeerDelay = h.delay;
-        gPeerDelayFinal = h.delayFinal;
-        gPeerLive = h.liveDelay;
-        gPeerReady = h.ready != 0;
-        gPeerEngaged = h.engaged != 0;
+        gPeerPlayer = h.f.localPlayer;
+        gPeerLockstep = h.f.lockstep;
+        gPeerDelay = h.f.delay;
+        gPeerDelayFinal = h.f.delayFinal;
+        gPeerLive = h.f.liveDelay;
+        gPeerReady = h.f.ready != 0;
+        gPeerEngaged = h.f.engaged != 0;
+    }
+    if (readAny && lateRead) {
+        ++gLateHelloReads;
+        return;
     }
     if (echoMs && echoHeldMs < 10000) {
         const uint32_t rtt = NowMs() - echoMs - echoHeldMs;
@@ -625,6 +810,10 @@ void MatchReset(const char* why) {
     gLastHelloRx = 0;
     gInactiveSince = 0;
     ResetPing();  // also the delay proposals (gOwnDelay, the other game's)
+    ResetPeerHello();  // the next match hears, compares and reports again
+    gLinkLogged = gMatchModeLogged = false;
+    gLinkRelayed = false;
+    InterlockedCompareExchange(&gWifiState, 0, 2);  // looked at again in the next match (a look still running finishes first)
     if (gAuto) {  // the next match may be against someone else
         gPeer = 0;
         gPeerPlayer = 0;
@@ -658,20 +847,29 @@ void Command(uint64_t peer, int delay, bool pingDelay) {
         Disengage("online mode off");
         gPeer = 0;
         gAuto = false;
+        gLinkRelayed = false;
         // After a session MK9's idle timer would see the whole session as one gap: the usual grace (review 2026-11-01).
         gGraceUntil = wasEngaged ? GetTickCount64() + kGraceMs : 0;
         Logger::Info("ONLINE off: MK9's own netcode for every online fight");
         return;
     }
     if (!Install()) return;
-    gDelay = delay < 0 ? 0 : delay > 8 ? 8 : delay;
+    // What the hellos say about this build and this PC, each on a thread of its own and long before a fight: the game
+    // files listed and the DLL read (EnvFingerprint, once per run; it used to happen on the game thread at the first
+    // session's frame 24), and the default route's adapter.
+    EnvFingerprint::Prepare();
+    StartWifiProbe();
+    gDelay = delay < 0 ? 0 : delay > HelloProto::kMaxDelay ? HelloProto::kMaxDelay : delay;
     gPingDelay = pingDelay;
     gOwnDelay = -1;  // proposed again (the round trips measured with this opponent are kept)
     gFailedThisMatch = false;
     gLastHelloRx = 0;
+    // Re-armed while engaged and waiting (the launcher's checkbox): the wait for the other game's next hello starts over,
+    // or the forgotten hello above would read as a silent opponent at once (HelloProto::PeerAbsent).
+    if (gEngaged) gEngagedAt = GetTickCount64();
     gScanLogged = false;
     char delayText[48];
-    if (pingDelay) snprintf(delayText, sizeof delayText, "delay from the ping (%s)", Rollback::Lockstep() ? "2-3" : "2-6");
+    if (pingDelay) snprintf(delayText, sizeof delayText, "delay from the ping (%s)", Rollback::Lockstep() ? "2-3" : "1-6");
     else snprintf(delayText, sizeof delayText, "delay %d", gDelay);
     if (peer == kAutoPeer) {
         // Re-armed during a match (the launcher's Safe mode checkbox): keep its opponent. The opponent search's memory
@@ -688,6 +886,8 @@ void Command(uint64_t peer, int delay, bool pingDelay) {
         return;
     }
     gAuto = false;
+    // Never 'engaged' in a hello to someone this game did not engage with (their game could take it for the go-ahead).
+    if (gEngaged && peer != gPeer) Disengage("armed for another player");
     gPeer = peer;
     Logger::Info("ONLINE armed for %llu, %s: rollback replaces MK9's input exchange in online fights against this player "
                  "when their MK9Rollback answers; anyone else keeps MK9's netcode",
@@ -696,14 +896,23 @@ void Command(uint64_t peer, int delay, bool pingDelay) {
 
 bool Engaged() { return gEngaged; }
 
-bool ScanRunning() { return gWideState == 1; }
+// Every thread this file or EnvFingerprint starts: the auto mode's memory pass, the Wi-Fi look, the build prints.
+bool ScanRunning() { return gWideState == 1 || gWifiState == 1 || EnvFingerprint::Busy(); }
+
+bool LocalOnWifi() { return gLocalWifi == 1; }
+bool PeerOnWifi() { return gPeerWifi == 1 && HeardPeer(); }
+bool LinkRelayed() { return gLinkRelayed; }
 
 const char* StatusText() {  // game thread (overlay publish); null outside an online fight or while engaged
     if ((!gPeer && !gAuto) || gEngaged || !FightActive()) return nullptr;
     if (gMatchRefused) return "MK9 NETCODE  (rollback off: only 1 vs 1 Player Match / private rooms)";
     if (gFailedThisMatch) return "MK9 NETCODE  (rollback stopped for this match)";
     if (!gPeer) return "MK9 NETCODE  (looking for the opponent's mod...)";
-    if (!gLastHelloRx || GetTickCount64() - gLastHelloRx > kHelloFreshMs) return "MK9 NETCODE  (the opponent does not run the mod)";
+    // "No mod" only when no hello of any version or size came from the opponent in this match.
+    if (!HeardPeer()) return "MK9 NETCODE  (the opponent does not run the mod)";
+    // Another build, other game files or other settings (gVerdict: this tick's, Tick runs before the overlay's publish).
+    if (const char* why = HelloProto::StatusText(gVerdict)) return why;
+    if (GetTickCount64() - gAnyHelloRx > kHelloFreshMs) return "MK9 NETCODE  (the opponent's mod stopped answering)";
     return "MK9 NETCODE  (both run the mod: rollback starts at the next fight)";
 }
 
@@ -745,6 +954,12 @@ void OnSessionStop(const char* why) {
             Disengage("the two games no longer run the same mode (Safe/Rollback changed during the match)");
             return;
         }
+        // So does a switch a command changed during the session (gVerdict: the last tick's hellos, this tick's switches
+        // at the latest in the next hello): the next session's environment check would stop it in mid-fight.
+        if (HelloProto::Mismatch(gVerdict)) {
+            Disengage("the two games no longer run the same build and settings");
+            return;
+        }
         gSessionDelay = AgreedDelay();
         Rollback::GgpoSteamCommand(gPeer, 1, gSessionDelay, true);  // the side is taken from the game at the fight start
         ++gRearms;
@@ -778,9 +993,32 @@ int LocalPlayer() {
 void Tick() {
     if (!gPeer && !gAuto) return;
     const ULONGLONG now = GetTickCount64();
-    if (gPeer) ReadHellos();
+    if (gPeer) {
+        UpdateOwnId();  // ReadHellos compares a first hello with it
+        ReadHellos();
+        UpdateVerdict();
+        ReportVerdict();
+    }
     if (gPingDelay && gOwnDelay < 0 && gPingCount >= kPingFinal) FinalizeDelay("before the fight");
     const bool active = FightActive();
+    // For the launcher (rc25): the status line already says when the opponent has no mod; the log says it once per match,
+    // after the opponent has been known for 5 s without a hello from their MK9Rollback: none of any version or size (a
+    // mod of another version or build has its own line, ReportVerdict), and none earlier in this match either.
+    static bool noModLogged = false;
+    if (!active || !gPeer) {
+        gPeerKnownAt = 0;
+        if (!active) noModLogged = false;
+    } else if (!gPeerKnownAt) {
+        gPeerKnownAt = now;
+    } else if (!noModLogged && !gEngaged && !gMatchRefused && now - gPeerKnownAt >= 5000 && !HeardPeer()) {
+        noModLogged = true;
+        Logger::Info("ONLINE: the opponent does not run the mod (no hello from their MK9Rollback): MK9's own netcode plays this match");
+    }
+    // The fight's phase of a match: the match mode beside the fields the one-on-one check reads, once.
+    if (active && !gMatchModeLogged && GameState() == kFightState) {
+        gMatchModeLogged = true;
+        LogMatchMode();
+    }
     if (now - gIdleWindowAt >= 1000) {  // MK9's packet gaps, per second
         gIdleWindowAt = now;
         const uint32_t peak = gIdlePeak;
@@ -796,6 +1034,7 @@ void Tick() {
             gStateWaitLogged = false;
             gExZero = gExOne = gExOther = gIdleLogs = 0;
             LogLayout("online fight data active");
+            StartWifiProbe();  // the first phase of a match: Wi-Fi or not, on its own thread (nothing in later phases)
             if (Lab::On()) ArmConnectionWatch();  // debug registers on every thread: lab only
             // A new connection phase: an engagement from the previous one (its session ended after its data went
             // inactive) must pass this phase's checks (state 8, fresh hello, same mode) again.
@@ -883,12 +1122,25 @@ void Tick() {
         if (now - gLastScan < 500) return;
         gLastScan = now;
         if (!(gPeer = FindGamePeer())) return;
+        UpdateVerdict();  // for this opponent (nothing heard yet), before the hello below says 'ready'
     }
     if (!SteamBridge::SessionActive(gPeer)) {  // the game's own connection is with someone else
+        gLinkRelayed = false;
         if (gAuto && !gEngaged) gPeer = 0;     // auto: look again
         return;
     }
     if (now - gLastHelloTx >= kHelloEveryMs) SendHello();
+    // The connection, once per match: when the opponent's hello said its side, or 5 s after the opponent was known (no
+    // mod, or one that does not say). The overlay reads the same three facts every tick (LocalOnWifi, ...).
+    if (!gLinkLogged && gWifiState != 1 && gPeerKnownAt) {
+        const int peerWifi = HeardPeer() ? gPeerWifi : -1;
+        if (peerWifi >= 0 || now - gPeerKnownAt >= 5000) {
+            gLinkLogged = true;
+            Logger::Info("ONLINE: connection: this PC %s, the opponent's PC %s%s; Steam P2P %s", WifiText((int)gLocalWifi),
+                         WifiText(peerWifi), peerWifi >= 0 ? "" : HeardPeer() ? " (their mod does not say)" : " (no mod heard)",
+                         gLinkRelayed ? "through Steam's relay" : "direct");
+        }
+    }
     if (gEngaged) {
         if (Rollback::NetplayRunning()) {
             if (gPingDelay) AdaptDelay(now);
@@ -896,14 +1148,25 @@ void Tick() {
             // Armed (or waiting at the fight start) against a game that now runs the other mode: the session would start
             // lockstep against rollback. The engage path below reports the mismatch.
             Disengage("the other player's mode changed (Safe/Rollback)");
-        } else if (gLastHelloRx > gEngagedAt && !gPeerEngaged && !gPeerReady && now - gEngagedAt > kPeerAbsentMs) {
+        } else if (HelloProto::Mismatch(gVerdict) && gVerdict != HelloProto::Match::kModeDiffers) {
+            // The same for a switch a command changed after the engagement, on either side: the session's environment
+            // check would stop it at frame 24, in mid-fight. (The mode: the branch above, from the next hello.)
+            Disengage("the two games no longer run the same build and settings");
+        } else if (HelloProto::PeerAbsent(now, gEngagedAt, gLastHelloRx, gPeerEngaged, gPeerReady, kPeerAbsentMs)) {
             // Waiting (armed, or paused at the fight start) while the other game says it is neither engaged nor about to
-            // be: it will not join, and this game skips MK9's exchange meanwhile.
-            Disengage("the other player's game is not starting the session");
+            // be, or says nothing at all any more (its hellos stopped, also when that was just before this game engaged:
+            // the old test needed a hello from after the engagement and so never fired then). It will not join, and this
+            // game skips MK9's exchange meanwhile.
+            const bool saysNo = gLastHelloRx > gEngagedAt && !gPeerEngaged && !gPeerReady && now - gLastHelloRx <= kPeerAbsentMs;
+            Disengage(saysNo ? "the other player's game is not starting the session"
+                             : "the other player's mod stopped answering before the session started");
         }
         return;
     }
     if (gFailedThisMatch || !gLastHelloRx || now - gLastHelloRx > kHelloFreshMs) return;
+    // Another build of the mod, or other game files: no session in this match, whatever else holds (ReportVerdict said
+    // which, once; the status line says it too).
+    if (OtherBuild(gVerdict)) return;
     // Only in the fight's own connection phase (after the stage load), never in the character select's. 2026-10-31: in
     // all four failed matches both mods met and armed during the character select (10:59, 11:02, 11:38, and 20:46 even
     // though the 12:35 change stood down again before the load), and one game's load script then stopped before natives
@@ -932,6 +1195,9 @@ void Tick() {
         }
         return;
     }
+    // The other game's build, files and switches are known and the same as this game's: not yet known in the first
+    // moments (this game's prints still being computed, or the other's), other switches reported by ReportVerdict.
+    if (gVerdict != HelloProto::Match::kSame) return;
     // Both proposals final, so both games take the same larger one. A game decides at the latest here, at the fight's
     // connection, and sends its hello at the next tick; the fight intro leaves seconds for that.
     if (!OwnDelayFinal()) FinalizeDelay("at the fight's connection");
@@ -947,8 +1213,11 @@ void Tick() {
         return;
     }
     // The other game must be ready too (its own checks passed): a game engaged alone skips MK9's exchange while the
-    // other's MK9 waits for its pads. Its hello says so within kHelloEveryMs, or at once after its delay is final.
-    if (!gPeerReady && !gPeerEngaged) return;
+    // other's MK9 waits for its pads. Its hello says so within kHelloEveryMs, or at once after its delay is final. One
+    // function decides (HelloProto, tested on the host): this game's own conditions and the same build once more, the
+    // other game's final delay, and its 'ready' or 'engaged'. A release without the build identity never hears 'ready'
+    // or 'engaged' from this one, and this one never engages against it.
+    if (!HelloProto::MayEngage(LocalState(), gVerdict, gPeerDelayFinal != 0, gPeerReady, gPeerEngaged)) return;
     gEngaged = true;
     gSessionThisMatch = true;
     gEngagedAt = now;
@@ -957,6 +1226,7 @@ void Tick() {
     gLockedTicks = 0;
     gLockDone = false;
     gLockStretches = gDelayChanges = 0;
+    FramePace::TakeReplayHitches(nullptr);  // the CPU check counts this engagement's frames only
     Rollback::GgpoSteamCommand(gPeer, 1, gSessionDelay, true);  // the side is taken from the game at the fight start
     // StartSendingGamepadData already zeroed GameFrame (the timeline restart) before the hellos met: wait for this
     // timeline's first fight frame if it has not come yet, otherwise for the next fight.
@@ -971,6 +1241,8 @@ void Tick() {
     char p2p[200];
     DescribePeer(p2p, sizeof p2p);
     Logger::Info("ONLINE: Steam P2P with the opponent: %s", p2p);
+    // 'engaged' goes out now, not at the next hello period (up to 500 ms): the other game may be waiting for it.
+    SendHello();
 }
 
 }  // namespace Online

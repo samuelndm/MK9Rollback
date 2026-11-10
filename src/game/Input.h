@@ -55,6 +55,12 @@ bool HwPadOverridden(int index);
 bool InstallSamplerHook();
 void SetLocalCapture(bool on);
 uint32_t LocalHardwareMask();
+int64_t LocalSampleQpc();  // when that mask was sampled (QueryPerformanceCounter ticks; 0 = no capture)
+// Late sampling (rc21): while on, the main loop's sampler call is deferred to SampleDeferredNow (the P2P boundary's
+// start, after MK9's frame-limiter wait), one sample per main-loop pass as before.
+void SetDeferSampling(bool on);
+void SampleDeferredNow();
+void LogSamplingCounts();
 
 // Netplay start: both fighters' input history (pad records past the header, their rings, the last-buttons lists)
 // cleared to the same neutral state on both peers. Returns the number of pads reset.

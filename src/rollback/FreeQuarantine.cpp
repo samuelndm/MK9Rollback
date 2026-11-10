@@ -15,6 +15,7 @@
 #include "../game/MKHeap.h"
 #include "../hook/HookManager.h"
 #include "../hook/ObjectHooks.h"
+#include "ParallelMem.h"
 #include "RollbackManager.h"
 
 namespace {
@@ -479,6 +480,7 @@ uint32_t gProtected = 0;
 uint64_t gProtectedBytes = 0;
 double gScanMs = 0;
 uint32_t gRequeuedOld = 0;
+int gLastScanHelpers = 0;  // helper threads of the last requeue scan (ParallelMem)
 uint64_t gRequeuedOldBytes = 0;
 // The blocks the last OnLoad requeued (older blocks freed after S by non-MK code that no restored span referenced), for
 // ProtectReferenced: restores that run after OnLoad (CinemaRestore) can put references to them back.
@@ -726,37 +728,16 @@ int OnLoad(uint32_t S, const std::vector<std::pair<uintptr_t, uint32_t>>* restor
             lo = std::min(lo, p);
             hi = std::max(hi, p);
         }
-        std::unordered_map<uint32_t, bool> hit;
-        auto probe = [&](uint32_t v) {
-            for (uint32_t i = (v >> 3) * 2654435761u & (cap - 1); set[i]; i = (i + 1) & (cap - 1))
-                if (set[i] == v) {
-                    hit[v] = true;
-                    break;
-                }
-        };
-        // Four dwords at a time (SSE2): only aligned values inside [lo, hi] are probed (the scan read every restored
-        // dword, the 11.8 MB master image included: ~4.2 ms of every load, 2026-11-04).
-        const __m128i bias = _mm_set1_epi32((int)0x80000000u), vlo = _mm_set1_epi32((int)lo);
-        const __m128i vspan = _mm_set1_epi32((int)((hi - lo) ^ 0x80000000u)), seven = _mm_set1_epi32(7), zero = _mm_setzero_si128();
-        if (restored)
-            for (auto& [base, size] : *restored) {
-                const uint32_t* d = reinterpret_cast<const uint32_t*>(base);
-                const uint32_t n = size / 4;
-                uint32_t k = 0;
-                for (; k + 4 <= n; k += 4) {
-                    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(d + k));
-                    const __m128i outside = _mm_cmpgt_epi32(_mm_xor_si128(_mm_sub_epi32(v, vlo), bias), vspan);  // v - lo > hi - lo
-                    const __m128i aligned = _mm_cmpeq_epi32(_mm_and_si128(v, seven), zero);
-                    const int m = _mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(outside, aligned)));
-                    if (!m) continue;
-                    for (int j = 0; j < 4; ++j)
-                        if (m & (1 << j)) probe(d[k + j]);
-                }
-                for (; k < n; ++k) {
-                    const uint32_t v = d[k];
-                    if (v >= lo && v <= hi && !(v & 7)) probe(v);
-                }
-            }
+        static std::vector<uint32_t> hits;  // game thread only (OnLoad)
+        hits.clear();
+        // Every restored range (~12-14 MB): 1.8-2.2 ms of a 6.6-7.3 ms load on the fast test PC (b38, rc22) on one core;
+        // split with the helper threads since rc23 (ParallelMem, 'memthreads'), the same pass over the same memory.
+        if (restored) {
+            ParallelMem::ScanForValues(*restored, set.data(), cap, lo, hi, hits);
+            gLastScanHelpers = ParallelMem::LastHelpers();
+        }
+        std::sort(hits.begin(), hits.end());
+        auto referenced = [&](uint32_t p) { return std::binary_search(hits.begin(), hits.end(), p); };
         QueryPerformanceCounter(&q1);
         QueryPerformanceFrequency(&qf);
         gScanMs += (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;
@@ -764,7 +745,7 @@ int OnLoad(uint32_t S, const std::vector<std::pair<uintptr_t, uint32_t>>* restor
         for (uint32_t p : cand) {
             auto it = gList.find(reinterpret_cast<void*>((uintptr_t)p));
             if (it == gList.end()) continue;
-            if (!restored || hit.count(p)) {  // still referenced (or no ranges given): live again, as before
+            if (!restored || referenced(p)) {  // still referenced (or no ranges given): live again, as before
                 ++gProtected;
                 gProtectedBytes += it->second.size;
                 gList.erase(it);
@@ -780,8 +761,8 @@ int OnLoad(uint32_t S, const std::vector<std::pair<uintptr_t, uint32_t>>* restor
         LeaveCriticalSection(&gLock);
     }
     if (gLoadsSeen % 100 == 0) {
-        Logger::Info("ALLOCLEAK: requeue scan %.2f ms/load; %u referenced by restored state kept live (%llu KB)", gScanMs / 100,
-                     gProtected, (unsigned long long)(gProtectedBytes >> 10));
+        Logger::Info("ALLOCLEAK: requeue scan %.2f ms/load (%d helper thread(s)); %u referenced by restored state kept live (%llu KB)",
+                     gScanMs / 100, gLastScanHelpers, gProtected, (unsigned long long)(gProtectedBytes >> 10));
         gScanMs = 0;
         Logger::Info("ALLOCLEAK: %u blocks (%llu KB) allocated and freed in abandoned timelines requeued for release", gReclaimed,
                      (unsigned long long)(gReclaimedBytes >> 10));

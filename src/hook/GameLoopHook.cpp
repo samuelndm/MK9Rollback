@@ -240,7 +240,8 @@ void __fastcall HkEngineTick(void* engine, void* /*edx*/, float dt) {
             gCombatActive = false;
         }
     }
-    if ((gEngineTicks % 60) == 0) Logger::Flush();
+    // No periodic Logger::Flush any more (round 3): the logger's own thread writes both logs (Info within a few ms, Frame
+    // within ~100 ms), and Flush now writes on the calling thread, which here would be the game thread inside a frame.
 }
 }  // namespace
 

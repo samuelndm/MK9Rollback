@@ -2,9 +2,11 @@
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
+#include <cwchar>
 #include <string>
 #include <vector>
 #include "../debug/Logger.h"
+#include "HelloProto.h"
 #include "../rollback/FpuGuard.h"
 #include "../rollback/RollbackManager.h"
 #include "../rollback/ScriptRng.h"
@@ -89,20 +91,80 @@ uint32_t SwitchPrint() {
                             CrowdRng::Active() ? 1u : 0u};
     return Fnv(h, fp, sizeof fp);
 }
+
+// <root>\build\clang\MK9Rollback.dll -> <root>\version.txt (the packaged layout, tools\package.ps1).
+Stamp ReadStamp() {
+    Stamp s{};
+    wchar_t path[MAX_PATH + 16];
+    const DWORD n = GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return s;
+    for (int up = 0; up < 3; ++up) {  // the file name and two folders
+        wchar_t* cut = nullptr;
+        for (wchar_t* c = path; *c; ++c)
+            if (*c == L'\\' || *c == L'/') cut = c;
+        if (!cut) return s;
+        *cut = 0;
+    }
+    wcscat(path, L"\\version.txt");
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return s;
+    char text[512];
+    DWORD got = 0;
+    if (!ReadFile(f, text, sizeof text, &got, nullptr)) got = 0;
+    CloseHandle(f);
+    HelloProto::ParseStamp(text, got, &s.date, &s.time);
+    return s;
+}
+
+// The cached part: computed once, by whichever of Prepare()'s thread and Get() comes first; the other waits for it.
+INIT_ONCE gOnce = INIT_ONCE_STATIC_INIT;
+Print gPrint{};
+Stamp gStamp{};
+volatile LONG gReady = 0;
+volatile LONG gThread = 0;  // Prepare(): 0 not called, 1 its thread runs, 2 done
+
+BOOL CALLBACK ComputeOnce(PINIT_ONCE, PVOID where, PVOID*) {
+    const ULONGLONG t0 = GetTickCount64();
+    int files = 0;
+    gPrint.v[kContent] = ContentPrint(&files);
+    gPrint.v[kDll] = DllPrint();
+    gStamp = ReadStamp();
+    char stamp[24];
+    Logger::Info("ENVPRINT content %08X (%d files under Asset), dll %08X, release %s (%llu ms on %s)", gPrint.v[kContent], files,
+                 gPrint.v[kDll], HelloProto::FormatStamp(gStamp.date, gStamp.time, stamp, sizeof stamp),
+                 (unsigned long long)(GetTickCount64() - t0), static_cast<const char*>(where));
+    InterlockedExchange(&gReady, 1);
+    return TRUE;
+}
+
+void Compute(const char* where) { InitOnceExecuteOnce(&gOnce, ComputeOnce, const_cast<char*>(where), nullptr); }
+
+DWORD WINAPI PrepareThread(void*) {
+    Compute("a background thread");
+    InterlockedExchange(&gThread, 2);
+    return 0;
+}
 }  // namespace
 
 const Print& Get() {
-    static Print p{};
-    static bool once = false;
-    if (!once) {
-        once = true;
-        int files = 0;
-        p.v[kContent] = ContentPrint(&files);
-        p.v[kDll] = DllPrint();
-        Logger::Info("ENVPRINT content %08X (%d files under Asset), dll %08X", p.v[kContent], files, p.v[kDll]);
-    }
-    p.v[kSwitches] = SwitchPrint();
-    return p;
+    Compute("the game thread");
+    gPrint.v[kSwitches] = SwitchPrint();
+    return gPrint;
+}
+
+void Prepare() {
+    if (gReady || InterlockedCompareExchange(&gThread, 1, 0) != 0) return;
+    if (HANDLE t = CreateThread(nullptr, 0, PrepareThread, nullptr, 0, nullptr)) CloseHandle(t);
+    else InterlockedExchange(&gThread, 2);  // Get() computes it
+}
+
+bool Ready() { return gReady != 0; }
+bool Busy() { return gThread == 1; }
+uint32_t Switches() { return SwitchPrint(); }
+
+Stamp ReleaseStamp() {
+    Compute("the game thread");
+    return gStamp;
 }
 
 const char* FieldName(int f) {

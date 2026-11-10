@@ -16,6 +16,7 @@
 #include "FramePace.h"
 #include "FreeQuarantine.h"
 #include "OnlineKeep.h"
+#include "ParallelMem.h"
 #include "RngTrace.h"
 #include "ScriptRng.h"
 #include "../hook/Ue3Refs.h"
@@ -78,6 +79,10 @@ bool ProbeRead(uintptr_t p, size_t n) {
     return true;
 }
 bool Writable(uintptr_t p, size_t n) { return gProbeFast ? ProbeRead(p, n) : MemQuery::Writable(p, n); }
+// A read-only decision outside the save's guarded-read window (LoadAB's checks before anything is written): guarded
+// reads when the crash handler is installed, else the VirtualQuery test as before. Whatever is then written is checked
+// with Writable (VirtualQuery) again where it is written (rc25 save/load audit).
+bool ReadableForCheck(uintptr_t p, size_t n) { return CrashLog::SafeReadAvailable() ? ProbeRead(p, n) : MemQuery::Writable(p, n); }
 
 // GMalloc block lookup (0x00405A10) plus an allocated test. For medium-heap blocks (0x800 < size <=
 // 0x40000, MK heap class 0x00C66A3C) the lookup reads the chunk size without checking that the chunk is in
@@ -114,28 +119,82 @@ struct ScanRegion {
 };
 ScanRegion gScan[64];
 int gScanN = 0;
-ScanRegion gCommitted[64];
+// Committed regions seen in recent saves (positive answers only), as disjoint address ranges sorted by start. rc25: 1024
+// ranges with a binary search instead of 64 searched in turn; the set of addresses answered "committed" is the union of
+// the regions VirtualQuery answered since the last reset, as before (overlapping or touching ranges are merged, which
+// covers the same addresses), with the same reset (every 120 saves, SaveAB) and the same "stop adding when full". The 64
+// filled within a few saves on prop-heavy stages, and every later miss cost a VirtualQuery (263-291 a save in SAVE SKEL).
+struct CommittedRange {
+    uint32_t lo, hi;
+};
+constexpr int kCommittedMax = 1024;
+CommittedRange gCommitted[kCommittedMax];
 int gCommittedN = 0;
+uint32_t gCommittedHits = 0, gScanHits = 0, gVqCommitted = 0, gVqOther = 0;  // since the last SAVE SKEL line
+bool InCommittedCache(uint32_t v) {
+    int a = 0, b = gCommittedN;  // first range with lo > v
+    while (a < b) {
+        const int m = (a + b) / 2;
+        if (gCommitted[m].lo <= v) a = m + 1;
+        else b = m;
+    }
+    return a > 0 && v < gCommitted[a - 1].hi;
+}
+int gCommittedCap = kCommittedMax;  // 'heapcache N' (rc25 A/B; 64 = rc24's capacity, counted in merged ranges)
+void AddCommittedRange(uint32_t lo, uint32_t hi) {
+    if (gCommittedN >= gCommittedCap) return;  // full: nothing is added until the next reset (as the 64-entry cache)
+    int a = 0, b = gCommittedN;  // first range with hi >= lo (ranges are disjoint, so their ends are sorted too)
+    while (a < b) {
+        const int m = (a + b) / 2;
+        if (gCommitted[m].hi < lo) a = m + 1;
+        else b = m;
+    }
+    int e = a;  // ranges [a, e) overlap or touch [lo, hi)
+    while (e < gCommittedN && gCommitted[e].lo <= hi) {
+        lo = std::min(lo, gCommitted[e].lo);
+        hi = std::max(hi, gCommitted[e].hi);
+        ++e;
+    }
+    if (e == a) {  // a new range
+        if (gCommittedN >= gCommittedCap) return;  // full: not added (as the 64-entry cache)
+        memmove(&gCommitted[a + 1], &gCommitted[a], (gCommittedN - a) * sizeof gCommitted[0]);
+        gCommitted[a] = {lo, hi};
+        ++gCommittedN;
+        return;
+    }
+    gCommitted[a] = {lo, hi};
+    memmove(&gCommitted[a + 1], &gCommitted[e], (gCommittedN - e) * sizeof gCommitted[0]);
+    gCommittedN -= e - a - 1;
+}
 
 bool CommittedHeap(uint32_t v) {
     // MKKE is large-address-aware: heap blocks above 2 GB are common (soak28: a fighter's
     // attachment TArray at 0x80EB69F0 was taken for data and restored by value).
     if (v < 0x01000000 || v >= 0xFFFE0000 || (v & 3)) return false;
     for (int i = 0; i < gScanN; ++i)
-        if (v >= gScan[i].lo && v < gScan[i].hi) return gScan[i].ok;
+        if (v >= gScan[i].lo && v < gScan[i].hi) {
+            ++gScanHits;
+            return gScan[i].ok;
+        }
     // Committed regions seen in recent saves (positive answers only: memory gets committed all the time, so a
     // cached 'not committed' would go stale; a stale 'committed' only keeps a field live, and the one read of a
     // target is guarded by SafeRead32). Reset every 120 saves (ResetCommittedCache).
-    for (int i = 0; i < gCommittedN; ++i)
-        if (v >= gCommitted[i].lo && v < gCommitted[i].hi) return true;
+    if (InCommittedCache(v)) {
+        ++gCommittedHits;
+        return true;
+    }
     MEMORY_BASIC_INFORMATION mbi;
     ++MemQuery::gVqCalls;  // counted with MemQuery's (SAVE SKEL)
-    if (!VirtualQuery(reinterpret_cast<void*>(v), &mbi, sizeof mbi)) return false;
+    if (!VirtualQuery(reinterpret_cast<void*>(v), &mbi, sizeof mbi)) {
+        ++gVqOther;
+        return false;
+    }
     const bool ok = mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
-    if (ok && gCommittedN < 64 && Snapshot::gPositiveCache) {
+    ++(ok ? gVqCommitted : gVqOther);
+    if (ok && Snapshot::gPositiveCache) {
         const uint32_t lo = (uint32_t)reinterpret_cast<uintptr_t>(mbi.BaseAddress);
         const uint32_t hi = lo + (uint32_t)mbi.RegionSize;
-        if (hi > lo) gCommitted[gCommittedN++] = {lo, hi, true};
+        if (hi > lo) AddCommittedRange(lo, hi);
     }
     if (gScanN < 64) {
         const uint32_t lo = (uint32_t)reinterpret_cast<uintptr_t>(mbi.BaseAddress);
@@ -200,12 +259,97 @@ bool ForeignVtable(uint32_t first) {
 // Classify over a byte image of the span (saved copy or live memory).
 // Marks: pointers (strict rule above) and UE3 TArray headers {T* data; int num; int max}
 // (all three dwords: restoring num/max against a different allocation would overflow it).
-void MarkKeep(const uint8_t* bytes, uint32_t size, std::vector<uint8_t>& keep) {
+// Targets on pages outside the working set are not read. A trimmed page (the game minimized, Windows' working-set
+// trimming) can take a disk read to come back: on the other player's PC (2026-11-08 22:02-22:19, working set 660-750 MB
+// of 890-980 MB private) four 0.8 s freezes were each one SafeRead32 below, on the game thread inside the live save,
+// while that PC's game opening a file at a round end took as long (its disk). One QueryWorkingSetEx per scan answers for
+// every candidate; one on a page that is not resident is kept live, as a pointer would be (a field kept live is never a
+// stale pointer written back; a float taken for one is not rolled back in that save). 'coldcheck 0' reads them all again
+// (Snapshot::gColdCheck).
+// Those pages are touched by a background thread instead (WarmPages): a trimmed page's disk read then blocks it, not the
+// game thread, and a committed page nothing had touched yet (about 40 targets a save in b34, mostly floats landing in
+// untouched GMalloc memory) becomes resident as the game thread's own read made it before, so the next saves read and
+// classify them as before.
+uint32_t gColdKeeps = 0, gColdScans = 0, gWarmQueued = 0;  // since the last COLDKEEP line
+struct PageWarmer {
+    CRITICAL_SECTION lock;
+    HANDLE wake = nullptr, thread = nullptr;
+    volatile LONG stop = 0;
+    std::vector<uint32_t> queue;
+    static DWORD WINAPI Run(void* p) {
+        PageWarmer* w = static_cast<PageWarmer*>(p);
+        std::vector<uint32_t> batch;
+        while (WaitForSingleObject(w->wake, INFINITE) == WAIT_OBJECT_0 && !w->stop) {
+            EnterCriticalSection(&w->lock);
+            batch.swap(w->queue);
+            LeaveCriticalSection(&w->lock);
+            for (uint32_t a : batch) {
+                if (w->stop) break;
+                uint32_t v;
+                CrashLog::SafeRead32(a, &v);  // guarded: the page can be decommitted meanwhile
+            }
+            batch.clear();
+        }
+        return 0;
+    }
+    PageWarmer() {
+        InitializeCriticalSection(&lock);
+        wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (wake) thread = CreateThread(nullptr, 0, Run, this, 0, nullptr);
+        if (thread) SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+    }
+};
+PageWarmer* gWarmer = nullptr;
+void WarmPages(const std::vector<uint32_t>& pages) {
+    static PageWarmer* w = (gWarmer = new PageWarmer());  // thread-safe one-time start; never freed (see StopPageWarmer)
+    if (!w->thread || w->stop || pages.empty()) return;
+    EnterCriticalSection(&w->lock);
+    if (w->queue.size() < 4096) w->queue.insert(w->queue.end(), pages.begin(), pages.end());
+    LeaveCriticalSection(&w->lock);
+    SetEvent(w->wake);
+}
+struct WsExInfo {
+    void* va;
+    ULONG_PTR attr;  // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid (in the working set)
+};
+// The scan over a chosen set of origin dwords (rc25, LoadAB's diff-first merge): 'origins' lists dword offsets (ascending,
+// each + 4 <= size), or null for every dword of the span (MarkKeep). A dword o can only be marked by the origins o - 8,
+// o - 4 and o (a TArray triple marks its start and the next two dwords; every other rule marks the origin itself), and
+// each origin's rules read only the dwords o .. o + 8 of 'bytes' and its target's memory, so scanning a subset that
+// contains o - 8, o - 4 and o gives keep[o / 4] exactly as the whole scan does.
+void MarkKeepOrigins(const uint8_t* bytes, uint32_t size, const uint32_t* origins, size_t nOrigins, std::vector<uint8_t>& keep);
+void MarkKeep(const uint8_t* bytes, uint32_t size, std::vector<uint8_t>& keep) { MarkKeepOrigins(bytes, size, nullptr, 0, keep); }
+void MarkKeepOrigins(const uint8_t* bytes, uint32_t size, const uint32_t* origins, size_t nOrigins, std::vector<uint8_t>& keep) {
     constexpr uint32_t kImageLo = 0x00401000, kImageHi = 0x010AE000;
     constexpr uint32_t kTextHi = 0x00C54FD4, kRdataLo = 0x00C55000, kRdataHi = 0x00DE064B;  // MKKE D1C71E08 sections
     auto at = [&](uint32_t o) { uint32_t v; memcpy(&v, bytes + o, 4); return v; };
+    // A target above 0x30000000 counts when it starts with a real vtable (see below); classified after the residency
+    // query when gColdCheck.
+    auto classify = [&](uint32_t o, uint32_t v) {
+        // Guarded: v was committed when VirtualQuery ran, but a worker thread can decommit it before this read
+        // (synctest41: read of 0x3F800000 = 1.0f in the fightercomp scan).
+        uint32_t first = 0;
+        if (!CrashLog::SafeRead32(v, &first)) return;
+        if (Snapshot::gStrictVtable) {
+            if (!(first & 3) && first >= kRdataLo && first < kRdataHi) {
+                const uint32_t slot0 = Read32(first);
+                if (slot0 >= kImageLo && slot0 < kTextHi) keep[o / 4] = 1;
+            } else if (Snapshot::gForeignVtables && first >= 0x01000000 && ForeignVtable(first)) {
+                keep[o / 4] = 1;
+                ++gForeignKeeps;
+            }
+        } else if (first >= kImageLo && first < kImageHi) {
+            keep[o / 4] = 1;
+        }
+    };
+    thread_local std::vector<uint32_t> pending;  // (offset, target) pairs
+    thread_local std::vector<WsExInfo> ws;
+    pending.clear();
     gScanN = 0;  // fresh region cache for this scan (a save-wide cache was followed by a task-wait hang, synctest57)
-    for (uint32_t o = 0; o + 4 <= size; o += 4) {
+    const size_t nScan = origins ? nOrigins : size / 4;
+    for (size_t idx = 0; idx < nScan; ++idx) {
+        const uint32_t o = origins ? origins[idx] : static_cast<uint32_t>(idx) * 4;
+        if (o + 4 > size || (o & 3)) continue;  // (never for the whole scan: o = 4 * idx <= size - 4)
         const uint32_t v = at(o);
         if (!CommittedHeap(v)) continue;
         if (o + 12 <= size) {
@@ -226,21 +370,35 @@ void MarkKeep(const uint8_t* bytes, uint32_t size, std::vector<uint8_t>& keep) {
         // with a real vtable counts: a 4-aligned .rdata address whose first slot is code. Image-range first
         // dwords that are code/.data addresses or unaligned kept floats live (VTKEEP 07:30: anim node +0x5C =
         // 26.1 -> "vt" 0x0048D12F, actor +0x1CC = 35.0 -> 0x00D7E3E7), so they were never restored.
-        // Guarded: v was committed when VirtualQuery ran, but a worker thread can decommit it before this read
-        // (synctest41: read of 0x3F800000 = 1.0f in the fightercomp scan).
-        uint32_t first = 0;
-        if (!CrashLog::SafeRead32(v, &first)) continue;
-        if (Snapshot::gStrictVtable) {
-            if (!(first & 3) && first >= kRdataLo && first < kRdataHi) {
-                const uint32_t slot0 = Read32(first);
-                if (slot0 >= kImageLo && slot0 < kTextHi) keep[o / 4] = 1;
-            } else if (Snapshot::gForeignVtables && first >= 0x01000000 && ForeignVtable(first)) {
-                keep[o / 4] = 1;
-                ++gForeignKeeps;
-            }
-        } else if (first >= kImageLo && first < kImageHi) {
-            keep[o / 4] = 1;
+        if (!Snapshot::gColdCheck) {
+            classify(o, v);
+            continue;
         }
+        pending.push_back(o);
+        pending.push_back(v);
+    }
+    if (pending.empty()) return;
+    const size_t n = pending.size() / 2;
+    ws.resize(n);
+    for (size_t i = 0; i < n; ++i) ws[i] = {reinterpret_cast<void*>(static_cast<uintptr_t>(pending[2 * i + 1])), 0};
+    ++gColdScans;
+    const bool known = K32QueryWorkingSetEx(GetCurrentProcess(), ws.data(), static_cast<DWORD>(n * sizeof(WsExInfo))) != 0;
+    thread_local std::vector<uint32_t> cold;
+    cold.clear();
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t o = pending[2 * i], v = pending[2 * i + 1];
+        if (!known || (ws[i].attr & 1)) {
+            classify(o, v);
+        } else {
+            keep[o / 4] = 1;
+            ++gColdKeeps;
+            const uint32_t page = v & ~0xFFFu;
+            if (cold.empty() || cold.back() != page) cold.push_back(page);
+        }
+    }
+    if (!cold.empty()) {
+        gWarmQueued += static_cast<uint32_t>(cold.size());
+        WarmPages(cold);
     }
 }
 
@@ -328,6 +486,11 @@ uintptr_t CharObj(int player, uint32_t* id) {
 }  // namespace
 
 namespace Snapshot {
+void SetCommittedCap(int n) {
+    gCommittedCap = n < 0 ? 0 : n > kCommittedMax ? kCommittedMax : n;
+    gCommittedN = 0;  // starts over (as the 120-save reset)
+    Logger::Info("HEAPCACHE %d: the pointer scan keeps up to %d committed ranges between resets (rc24: 64)", gCommittedCap, gCommittedCap);
+}
 bool gFastProbe = true;
 const std::vector<uint8_t>& ReflectDataMask(uint32_t cls);  // UE3 reflection: data-only dwords of a class (below)
 void SaveBindState(uint32_t comp, std::vector<uint32_t>& r);        // fighter SkelControl binding state (below)
@@ -342,6 +505,15 @@ bool gTierENodes = true;
 bool gTierETickNodes = true;  // also every node in the fighter components' tick arrays
 bool gStrictVtable = true;
 bool gForeignVtables = true;
+bool gColdCheck = true;
+int gTrimWsMs = 0;
+void StopPageWarmer() {  // MK9R_Unload: the thread must leave this module's code before it is unloaded
+    PageWarmer* w = gWarmer;
+    if (!w || !w->thread) return;
+    InterlockedExchange(&w->stop, 1);
+    SetEvent(w->wake);
+    WaitForSingleObject(w->thread, 3000);
+}
 bool gFloatFields = true;
 bool gPositiveCache = true;  // persistent cache of committed regions for the pointer scan ('poscache 0|1')
 int gLearnFields = 2;  // learned pointer/data kind: 0 off, 1 restore learned-data fields, 2 report only ('learnfields N'). synctest62 (1): 2.6%/2.0% vs 0.7%/1.3%  // actor Location is always restored by value ('floatfields 0|1')
@@ -1039,7 +1211,18 @@ int ExternalBlocks(std::vector<std::pair<uintptr_t, uint32_t>>& out) {
 }
 
 bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
+    struct ProbeFastOff {  // never leave the save with guarded-read probing on: LoadAB's Writable must query
+        ~ProbeFastOff() { gProbeFast = false; }
+    } probeFastOff;
     gScanN = 0;  // fresh region cache for this save
+    if (gTrimWsMs > 0) {  // test aid ('trimws N'): the working set emptied as Windows trims a minimized game's
+        static ULONGLONG lastTrim = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastTrim >= static_cast<ULONGLONG>(gTrimWsMs)) {
+            lastTrim = now;
+            K32EmptyWorkingSet(GetCurrentProcess());
+        }
+    }
     static int savesSinceReset = 0;
     if (++savesSinceReset >= 120 || !gPositiveCache) {
         gCommittedN = 0;
@@ -1049,6 +1232,10 @@ bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
     if (gModSections.empty() || ++savesSinceModules >= 600) {  // modules can load late (PhysX on first use)
         if (gForeignKeeps) Logger::Info("FOREIGNVT: %u pointer dwords to other modules' objects kept live in 600 saves", gForeignKeeps);
         gForeignKeeps = 0;
+        if (gColdKeeps)
+            Logger::Info("COLDKEEP: %u pointer-like dwords kept live unread (target page not in the working set) in %u scans; "
+                         "%u page(s) handed to the warming thread", gColdKeeps, gColdScans, gWarmQueued);
+        gColdKeeps = gColdScans = gWarmQueued = 0;
         savesSinceModules = 0;
         FramePace::Note("modsections");
         BuildModSections();
@@ -1120,7 +1307,9 @@ bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
                              size, (unsigned)blk, info[1], (unsigned)(base + size - blk - info[1]));
         }
         b.resize(size);
-        memcpy(b.data(), reinterpret_cast<const void*>(base), size);
+        // The master image (11.8 MB, ~1.2 ms of every save on one core) is copied with the helper threads (rc23); spans
+        // under 256 KB as before. Into the slot with non-temporal stores from 64 KB up (rc25; the same bytes).
+        ParallelMem::CopyToSlot(b.data(), reinterpret_cast<const void*>(base), size);
         ++n;
     };
     // Save cost profile (phases 1..5, accumulated QPC ticks, printed every 600 saves).
@@ -1146,6 +1335,10 @@ bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
         for (int i = 0; i < nmr; ++i) add("mkmaster", mr[i].base, mr[i].size, {});
     }
     Mark(2);
+    // rc25: guarded-read probing from here on (it was turned on at the skel phase): the extlists and actors phases' Writable
+    // checks only decide which spans are copied (VirtualQuery each in the extlists walk, uncached: 'memcache' is off).
+    // LoadAB checks every span with VirtualQuery before it writes. 'fastprobe 0' turns it off with the rest.
+    gProbeFast = gFastProbe && CrashLog::SafeReadAvailable();
     static std::vector<uintptr_t> extLists;
     ExternalLists(mr, nmr, extLists);
     for (uintptr_t l : extLists) add("extlist", l, 0x14, {});
@@ -1548,7 +1741,10 @@ bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
         }
     }
     Sub(8);
-    gProbeFast = false;
+    // rc21: guarded reads instead of VirtualQuery through the Tier E and script phases too (until Mark(10)). Their
+    // Writable checks only decide which spans are copied (LoadAB checks Writable with VirtualQuery before writing); the
+    // 2026-11-09 save audit counted 209-242 VirtualQuery calls a save, ~100 of them in Tier E for 12 SkelControls, at
+    // ~9 us each on the slower field PC (~2 ms of its 4.7-7 ms save). 'fastprobe 0' turns both phases back.
     skelVq += MemQuery::gVqCalls - vqAtSkel;
     Mark(7);
     if (gTierEOn) {
@@ -1746,6 +1942,7 @@ bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
         if (worldInfo && c.size) add(c.name, worldInfo + c.offset, c.size, {});
     out->spans.resize(n);
     out->bytes.resize(n);
+    gProbeFast = false;
     Mark(10);
     if (++gProfSaves % 600 == 0) {
         LARGE_INTEGER f;
@@ -1760,6 +1957,13 @@ bool SaveAB(StateAB* out, uint32_t gameFrame, char* why, size_t whyLen) {
                      "propcomps %.1f; VirtualQuery calls/save: skel %.0f, all MemQuery callers %.0f",
                      sk(0), sk(1), sk(2), sk(3), sk(4), sk(5), sk(6), sk(7), sk(8), skelCounts[0] / 600.0, skelCounts[1] / 600.0,
                      skelCounts[2] / 600.0, skelCounts[3] / 600.0, skelVq / 600.0, (MemQuery::gVqCalls - saveVq) / 600.0);
+        // rc25: the pointer scan's committed-region test (saves and the loads' live scans together, per save): answers from
+        // the 1024-range cache of committed regions, from the per-scan cache, and VirtualQuery calls by answer.
+        Logger::Info("SAVE SKEL committed test (per save, 600 saves; loads included): cache hits %.1f, scan-cache hits %.1f, VirtualQuery "
+                     "%.1f (committed %.1f, other %.1f); %d ranges cached",
+                     gCommittedHits / 600.0, gScanHits / 600.0, (gVqCommitted + gVqOther) / 600.0, gVqCommitted / 600.0, gVqOther / 600.0,
+                     gCommittedN);
+        gCommittedHits = gScanHits = gVqCommitted = gVqOther = 0;
         for (int64_t& v : skelProf) v = 0;
         for (uint32_t& v : skelCounts) v = 0;
         skelVq = 0;
@@ -1815,7 +2019,13 @@ const char* CoveredStatic(uintptr_t addr, uint32_t len) {
 // PropertiesSize +0x40, Children +0x58; UProperty Next +0x3C, ArrayDim +0x44, ElementSize +0x48, Offset +0x58,
 // UStructProperty Struct +0x78. Unknown/native fields stay with the heuristic.
 bool gReflectData = true;
-uint32_t gReflectRestored = 0;
+uint32_t gReflectRestored = 0, gReflectLoggedAt = 0;
+// LoadAB's pointer-safe merge (rc25): 0 the whole-span merge, 1 diff-first (default), 2 diff-first checked against the
+// whole-span merge on every span (DIFFMERGE MISMATCH lines; the whole-span result is used on a mismatch).
+int gDiffMerge = 1;
+// Since the last LOADAB PROFILE line: merged spans by diff, those with no differing dword, differing dwords, live origins
+// classified, spans merged whole (fallback), mismatches in 'diffmerge 2'.
+uint32_t gDiffSpans = 0, gDiffUnchanged = 0, gDiffDwords = 0, gDiffOrigins = 0, gDiffFull = 0, gDiffMismatch = 0;
 const std::vector<uint8_t>& ReflectDataMask(uint32_t cls) {
     static std::unordered_map<uint32_t, std::vector<uint8_t>> cache;
     auto it = cache.find(cls);
@@ -2416,6 +2626,50 @@ const char* SavedDword(uint32_t addr, uint32_t* value) {
     return nullptr;
 }
 
+namespace {
+// LoadAB's per-span name tests, made once per span name (rc25) instead of ~25 strcmp/strncmp per span (~2,200 spans a load
+// on prop-heavy stages). Each flag is exactly the expression the span loop used before.
+struct SpanNameFlags {
+    bool hwpads, mkmaster, script, skelp, proprot, propl2w, skel, skelM, namemap, complist, scratch, fxactor, mkactor, costdmg,
+        movereq, ue3anim, fightercomp, scriptModData, compArrays, skelbound, mkhelper, xblock, actor, aipad;
+};
+SpanNameFlags FlagsOfName(const char* n) {
+    SpanNameFlags f{};
+    f.hwpads = !strcmp(n, "hwpads");
+    f.mkmaster = !strcmp(n, "mkmaster");
+    f.script = !strncmp(n, "script", 6);
+    f.skelp = !strncmp(n, "skelp_", 6);
+    f.proprot = !strcmp(n, "proprot");
+    f.propl2w = !strcmp(n, "propl2w");
+    f.skel = !strncmp(n, "skel", 4);
+    f.skelM = !strncmp(n, "skel_m", 6) || !strncmp(n, "skelp_m", 7);
+    f.namemap = !strncmp(n, "namemap_", 8);
+    f.complist = !strcmp(n, "complist");
+    f.scratch = !strcmp(n, "script_scratch");
+    f.fxactor = !strcmp(n, "fxactor");
+    f.mkactor = !strcmp(n, "mkactor");
+    f.costdmg = !strcmp(n, "costdmg");
+    f.movereq = !strcmp(n, "movereq");
+    f.ue3anim = !strcmp(n, "ue3anim");
+    f.fightercomp = !strcmp(n, "fightercomp");
+    f.scriptModData = !strcmp(n, "script_module") || !strcmp(n, "script_data");
+    f.compArrays = !strcmp(n, "compbound") || !strcmp(n, "compweights");
+    f.skelbound = !strcmp(n, "skelbound");
+    f.mkhelper = !strcmp(n, "mkhelper");
+    f.xblock = !strcmp(n, "xblock");
+    f.actor = !strncmp(n, "actor", 5);
+    f.aipad = !strcmp(n, "aipad");
+    return f;
+}
+// LOADAB PROFILE's per-name accumulator (first: QPC ticks, second: spans), with the name's flags.
+struct SpanAcc {
+    int64_t first = 0;
+    uint32_t second = 0;
+    bool flagged = false;
+    SpanNameFlags f{};
+};
+}  // namespace
+
 int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
     LARGE_INTEGER loadStart;
     QueryPerformanceCounter(&loadStart);
@@ -2491,7 +2745,9 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
             const uint32_t obj = st.mapObjs[k], id = st.mapObjs[k + 1];
             MapHdr m{};
             m.obj = obj;
-            const bool alive = Writable(obj + 0x138, 0x3C) && Read32(obj + 4) == id;
+            // Read-only here (the header is written after the span loop, behind Writable): guarded reads (rc25: ~83 uncached
+            // VirtualQuery calls a load on a prop-heavy stage, most of LoadAB's 'setup').
+            const bool alive = ReadableForCheck(obj + 0x138, 0x3C) && Read32(obj + 4) == id;
             if (alive) memcpy(m.bytes, reinterpret_cast<const void*>(obj + 0x138), 0x3C);
             bool same = alive, restorable = true;
             for (const auto& f : kField) {
@@ -2520,14 +2776,29 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
             Logger::Info("NAMEMAP loads: %u maps unchanged, %u restored from held blocks, %u kept live, %u emptied", sMapHow[3], sMapHow[0],
                          sMapHow[1], sMapHow[2]);
     }
+    // LOADAB PROFILE's setup in parts (rc25): name-map decisions, external lists, script checks + heap locks + online
+    // memory, the medium-heap free-tree walk.
+    static int64_t sSetupPart[4] = {};
+    int64_t tPart = FramePace::Now();
+    sSetupPart[0] += tPart - gLoadStartQpc;
+    auto setupMark = [&](int k) {
+        const int64_t t = FramePace::Now();
+        sSetupPart[k] += t - tPart;
+        tPart = t;
+    };
     // External node lists that exist now but not in the snapshot belong to objects created
     // after the save: their nodes go back to the pool with the image, so they must end empty.
     static std::vector<uintptr_t> liveExt;
     {
         MKHeap::Region mr[8];
         const int nmr = MKHeap::MasterRanges(mr, 8);
+        // Its per-list Writable only decides which lists are candidates; each one emptied below is checked with
+        // Writable (VirtualQuery) right before the write (rc25).
+        gProbeFast = gFastProbe && CrashLog::SafeReadAvailable();
         ExternalLists(mr, nmr, liveExt);
+        gProbeFast = false;
     }
+    setupMark(1);
     // Script modules are checked before anything is written (the master image restores the contexts'
     // pointers to them): still an allocated GMalloc block of the size seen at the save. A module freed
     // after the save through a path the quarantine does not defer had its bytecode written over the
@@ -2547,6 +2818,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
     MemQuery::LockedScope memLocked;  // VirtualQuery answers cached while the heaps are locked (released first)
     // MK9's online memory (heap #5): copied here and measured or put back at the end, both under the heap locks.
     OnlineKeep::BeforeLoad(st);
+    setupMark(2);
     // Free chunks of GMalloc's medium heap (tree at [0x00E0AC18+0x34]; node = chunk {+4 size|flags, +0xC/+0x10 kids}).
     // A content span overlapping one would write over the free tree: the block was freed (and maybe coalesced) since
     // the save, and the header-based LiveBlockInfo check can be fooled by a merged chunk's stale interior header
@@ -2569,6 +2841,9 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
         }
         std::sort(freeRanges.begin(), freeRanges.end());
     }
+    setupMark(3);
+    static uint64_t sFreeNodes = 0;  // free-tree nodes walked (LOADAB PROFILE)
+    sFreeNodes += freeRanges.size();
     auto overlapsFree = [&](uint32_t b, uint32_t sz) {
         auto it = std::upper_bound(freeRanges.begin(), freeRanges.end(), std::make_pair(b + sz, 0u));
         while (it != freeRanges.begin()) {
@@ -2582,7 +2857,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
     uint32_t propOk[64];  // prop components whose matrix-array headers were restored (identifies them for propl2w)
     int propOkN = 0;
     // Load cost by span name (LOADAB PROFILE every 100 loads; the whole load cost ~48 ms, 2026-11-04).
-    static std::unordered_map<const char*, std::pair<int64_t, uint32_t>> sSpanT;
+    static std::unordered_map<const char*, SpanAcc> sSpanT;
     static int64_t sSetupT = 0, sTailT = 0;
     static int sProfLoads = 0;
     auto qpc = [] {
@@ -2593,7 +2868,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
     const int64_t tLoop = qpc();
     sSetupT += tLoop - gLoadStartQpc;
     struct SpanTimer {
-        std::pair<int64_t, uint32_t>& acc;
+        SpanAcc& acc;
         int64_t t0;
         ~SpanTimer() {
             LARGE_INTEGER t;
@@ -2604,13 +2879,19 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
     };
     for (size_t i = 0; i < st.spans.size(); ++i) {
         const Span& s = st.spans[i];
-        SpanTimer spanTimer{sSpanT[s.name], qpc()};
+        SpanAcc& acc = sSpanT[s.name];
+        if (!acc.flagged) {
+            acc.f = FlagsOfName(s.name);
+            acc.flagged = true;
+        }
+        const SpanNameFlags& nf = acc.f;
+        SpanTimer spanTimer{acc, qpc()};
         if (!Writable(s.base, s.size)) continue;
         uint32_t padHw[kHwPadSlots];
-        const bool padHwKeep = gPadHwLive && s.size >= kHwPadSlots * kPadObjSize && !strcmp(s.name, "hwpads");
+        const bool padHwKeep = gPadHwLive && s.size >= kHwPadSlots * kPadObjSize && nf.hwpads;
         if (padHwKeep)
             for (int p = 0; p < kHwPadSlots; ++p) padHw[p] = Read32(s.base + p * kPadObjSize + 8);
-        if (s.base >= 0x01000000 && strcmp(s.name, "mkmaster") && overlapsFree((uint32_t)s.base, s.size)) {
+        if (s.base >= 0x01000000 && !nf.mkmaster && overlapsFree((uint32_t)s.base, s.size)) {
             if (freeSkips++ < 20)
                 Logger::Info("LOADAB skip %s %08X+%X: overlaps a free medium-heap chunk (freed since the save)", s.name, (unsigned)s.base,
                              s.size);
@@ -2618,7 +2899,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
         }
         // A content block the quarantine really freed after this save may already belong to someone else (the size-only
         // identity check passes for any reuse of the same size class): never write the old contents into it.
-        if (!strncmp(s.name, "script", 6)) {  // the release ring is scanned linearly: only the few script spans
+        if (nf.script) {  // the release ring is scanned linearly: only the few script spans
             uint32_t fg = 0, rg = 0, caller = 0;
             if (FreeQuarantine::RecentlyReleased(reinterpret_cast<const void*>(s.base), 1, &fg, &rg, &caller, nullptr, st.gameFrame) &&
                 rg >= st.gameFrame &&
@@ -2632,15 +2913,15 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 continue;
             }
         }
-        if (!strncmp(s.name, "skelp_", 6) && !gPropSkelLoad) continue;
+        if (nf.skelp && !gPropSkelLoad) continue;
         // A prop component's matrix-array headers: restored only when they still name the same three blocks (a rotation
         // of them), which also identifies the component for its LocalToWorld below (same order of spans as saved).
-        if (!strcmp(s.name, "proprot") || !strcmp(s.name, "propl2w")) {
+        if (nf.proprot || nf.propl2w) {
             if (!gPropSkelLoad || Read32(s.identity) != kSkelMeshVtable) {
                 ++gPropSkelSkipped;
                 continue;
             }
-            if (!strcmp(s.name, "proprot")) {
+            if (nf.proprot) {
                 uint32_t sv[3][3], lv[3][3];
                 memcpy(sv, st.bytes[i].data(), sizeof sv);
                 memcpy(lv, reinterpret_cast<const void*>(s.base), sizeof lv);
@@ -2665,12 +2946,12 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                                  gPropSkelSkipped, gPropSkelSaved);
             }
         }
-        if (!strncmp(s.name, "skel", 4)) {
+        if (nf.skel) {
             uint32_t info[2] = {0, 0};
             // The three matrix arrays rotate the same three blocks every frame (see the fightercomp merge, which
             // restores the saved rotation): a matrix block is still the component's if it is any of the three.
             bool owned = Read32(s.identity) == s.base;
-            if (!owned && gBoneRotation && (!strncmp(s.name, "skel_m", 6) || !strncmp(s.name, "skelp_m", 7))) {
+            if (!owned && gBoneRotation && nf.skelM) {
                 const char k = s.name[strlen(s.name) - 1];
                 const uint32_t off = k == '0' ? 0x2F4 : k == '1' ? 0x300 : 0x30C;
                 const uint32_t comp = s.identity - off;
@@ -2680,7 +2961,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
             if (!owned || !LiveBlockInfo(reinterpret_cast<const void*>(s.base), info) || info[1] < s.size)
                 continue;  // the component reallocated the array: the saved block is not its data any more
         }
-        if (!strncmp(s.name, "namemap_", 8)) {
+        if (nf.namemap) {
             // The map's decision (above, made before anything was written; it checked these blocks too).
             bool restore = false;
             for (const MapHdr& m : liveMaps)
@@ -2693,7 +2974,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 continue;
             }
         }
-        if (!strcmp(s.name, "complist")) {
+        if (nf.complist) {
             uint32_t info[2] = {0, 0};
             // The list emptied and freed its block after the save (live header null): the block is still held by the
             // free quarantine, which gives it back at OnLoad because the restored component header references it.
@@ -2702,7 +2983,8 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 SkipSpan(s.name);
                 continue;
             }
-        }        if (!strcmp(s.name, "script_scratch")) {
+        }
+        if (nf.scratch) {
             // [0x00E39FC4] is live (not in Tier A): the executor scratch must still be this block.
             uint32_t info[2] = {0, 0};
             if (Read32(0x00E39FC4) != s.base || !LiveBlockInfo(reinterpret_cast<const void*>(s.base), info) || info[1] < s.size) {
@@ -2710,17 +2992,17 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 continue;
             }
         }
-        if (!strcmp(s.name, "fxactor") && !gFxActorsLoad) continue;  // 'abtest fxactors'
-        if (!strcmp(s.name, "mkactor") && !gMkActorsLoad) {  // 'abtest mkactors'
+        if (nf.fxactor && !gFxActorsLoad) continue;  // 'abtest fxactors'
+        if (nf.mkactor && !gMkActorsLoad) {  // 'abtest mkactors'
             NoteMkLoc((uint32_t)s.base - 0x3C, 3, nullptr);
             continue;
         }
-        if (!strcmp(s.name, "costdmg") && (!gCostDmgLoad || !Writable(s.identity, 8) || Read32(s.identity) != s.base ||
+        if (nf.costdmg && (!gCostDmgLoad || !Writable(s.identity, 8) || Read32(s.identity) != s.base ||
                                            Read32(s.identity + 4) * 0x14 != s.size || !Writable(s.base, s.size))) {
             SkipSpan(s.name);  // 'abtest costdmg', or the group reallocated its pieces since the save
             continue;
         }
-        if (!strcmp(s.name, "movereq")) {
+        if (nf.movereq) {
             bool listed = false;  // the fighter (identity) must still list this entry
             const uint32_t cnt = Writable(s.identity + 0x7524, 0xCC) ? Read32(s.identity + 0x75EC) : 0;
             for (uint32_t k = 0; k < cnt && k < 50 && !listed; ++k) listed = Read32(s.identity + 0x7524 + 4 * k) == s.base;
@@ -2729,40 +3011,40 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 continue;
             }
         }
-        const bool fxspan = !strcmp(s.name, "fxactor") || !strcmp(s.name, "mkactor");
-        if (!strcmp(s.name, "ue3anim") || !strcmp(s.name, "fightercomp") || fxspan) {
+        const bool fxspan = nf.fxactor || nf.mkactor;
+        if (nf.ue3anim || nf.fightercomp || fxspan) {
             // Tier E UE3 objects (restored from +0x3C): the object must still be an allocated GMalloc block
             // covering the span; a garbage-collected object's memory may hold allocator links or another object.
             uint32_t info[2] = {0, 0};
             const uintptr_t obj = s.base - 0x3C;
             if (!LiveBlockInfo(reinterpret_cast<const void*>(obj), info) || info[1] < s.size + 0x3C ||
-                ((!strcmp(s.name, "ue3anim") || fxspan) && (!LiveUObject(obj) || Read32(obj + 4) != s.identity)) ||
+                ((nf.ue3anim || fxspan) && (!LiveUObject(obj) || Read32(obj + 4) != s.identity)) ||
                 (fxspan && (Read32(obj + 0x80) & 0x20))) {  // bDeleteMe: destroyed since the save
-                if (!strcmp(s.name, "mkactor")) NoteMkLoc((uint32_t)obj, Writable(obj + 0x80, 4) && (Read32(obj + 0x80) & 0x20) ? 2 : 1, nullptr);
+                if (nf.mkactor) NoteMkLoc((uint32_t)obj, Writable(obj + 0x80, 4) && (Read32(obj + 0x80) & 0x20) ? 2 : 1, nullptr);
                 SkipSpan(s.name);
                 continue;
             }
-            if (!strcmp(s.name, "fxactor")) ++gFxActorRestored;
-            if (!strcmp(s.name, "mkactor")) {
+            if (nf.fxactor) ++gFxActorRestored;
+            if (nf.mkactor) {
                 ++gMkActorRestored;
                 NoteMkLoc((uint32_t)obj, 9, nullptr);  // becomes 0 once written
             }
         }
-        if ((!strcmp(s.name, "script_module") || !strcmp(s.name, "script_data")) && !scriptOk[i]) {
+        if (nf.scriptModData && !scriptOk[i]) {
             SkipSpan(s.name);
             continue;
         }
-        if ((!strcmp(s.name, "compbound") || !strcmp(s.name, "compweights")) &&
+        if (nf.compArrays &&
             (!gCompWeightsLoad || !Writable(s.identity, 4) || Read32(s.identity) != s.base)) {
             SkipSpan(s.name);  // the component reallocated the array since the save
             continue;
         }
-        if (!strcmp(s.name, "skelbound") && (!gSkelBoundLoad ||
+        if (nf.skelbound && (!gSkelBoundLoad ||
             !Writable(s.base, 0x60) || Read32(s.base) != kSkelBoundVtable || Read32(s.base + 0xC) != s.identity)) {
             SkipSpan(s.name);  // element moved, reused or unbound since the save
             continue;
         }
-        if (!strcmp(s.name, "mkhelper")) {
+        if (nf.mkhelper) {
             // Restored only while the owner still points at the same live helper block.
             uint32_t info[2] = {0, 0}, cell = 0;
             uint8_t why = 0;
@@ -2792,7 +3074,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                              gMkHelperRevived, (uint32_t)s.base, s.identity, gHelperLastN ? gHelperLast[gHelperLastN - 1].savedC : 0,
                              gHelperLastN ? gHelperLast[gHelperLastN - 1].liveC : 0);
         }
-        if (!strcmp(s.name, "xblock")) {
+        if (nf.xblock) {
             // A block freed after the save by a path the quarantine does not defer holds allocator
             // links now; writing the saved bytes over them corrupted an MK heap free tree (soak31,
             // 0x0042AF1D, after blend-node mask arrays were added as xblocks).
@@ -2804,6 +3086,11 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
         }
         if (!s.keepOffsets.empty()) {  // actors: pointer-safe merge
             std::vector<uint8_t> merged = st.bytes[i];
+            static int sCompKeepLogged = 0, sArrLogged = 0;  // COMPKEEP / ACTORARRAY lines (both merges below)
+            static uint32_t sCompLiveLogged = 0;              // COMPLIVEDATA lines
+            // The whole-span merge (every load before rc25; 'diffmerge 0', the diff merge's fallback and its 'diffmerge 2'
+            // check). 'quiet': no counters or log lines (the check).
+            auto fullMerge = [&](std::vector<uint8_t>& mg, bool quiet) {
             // Fields that are pointers now are kept live too, not only those that were pointers at
             // the save: a fighter's attachment TArray that was empty (null) at S was restored to null
             // while the other fighter's Base, a pointer, stayed live -> Base without a record
@@ -2845,11 +3132,12 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                                                 return w < dm.size() && dm[w];
                                             }),
                              ko.end());
-                    gReflectRestored += (uint32_t)(before - ko.size());
-                    static uint32_t sLoggedAt = 0;
-                    if (gReflectRestored >= sLoggedAt + 500) {
-                        sLoggedAt = gReflectRestored;
-                        Logger::Info("REFLECTDATA: %u declared-data dwords restored by value instead of kept live", gReflectRestored);
+                    if (!quiet) {
+                        gReflectRestored += (uint32_t)(before - ko.size());
+                        if (gReflectRestored >= gReflectLoggedAt + 500) {
+                            gReflectLoggedAt = gReflectRestored;
+                            Logger::Info("REFLECTDATA: %u declared-data dwords restored by value instead of kept live", gReflectRestored);
+                        }
                     }
                 }
             }
@@ -2864,7 +3152,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                                                    (co >= 0x5E0 && co <= 0x5E8) || (co >= 0x60C && co <= 0x614);
                                         }),
                          ko.end());
-                if (ko.size() != before && (++gCompFloatsRestored == 1 || gCompFloatsRestored % 500 == 0))
+                if (!quiet && ko.size() != before && (++gCompFloatsRestored == 1 || gCompFloatsRestored % 500 == 0))
                     Logger::Info("COMPFLOATS: fighter component float vectors restored by value instead of kept live (%u loads)", gCompFloatsRestored);
             }
             // A fighter-component dword kept because its SAVED value passed the pointer test is data when its LIVE value
@@ -2880,17 +3168,16 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 ko.erase(std::remove_if(ko.begin(), ko.end(),
                                         [&](uint32_t o) {
                                             uint32_t sv, lv;
-                                            memcpy(&sv, merged.data() + o, 4);
+                                            memcpy(&sv, mg.data() + o, 4);
                                             memcpy(&lv, reinterpret_cast<const void*>(s.base + o), 4);
                                             const bool data = sv != lv && lv && o / 4 < liveKeep.size() && !liveKeep[o / 4];
                                             if (data && !firstO) firstO = o + 0x3C, firstS = sv, firstL = lv;
                                             return data;
                                         }),
                          ko.end());
-                if (ko.size() != before) {
+                if (!quiet && ko.size() != before) {
                     gCompLiveDataRestored += (uint32_t)(before - ko.size());
-                    static uint32_t sLogged = 0;
-                    if (++sLogged <= 20 || sLogged % 200 == 0)
+                    if (++sCompLiveLogged <= 20 || sCompLiveLogged % 200 == 0)
                         Logger::Info("COMPLIVEDATA S=%u: %u fighter component dword(s) restored by value (live value not a pointer; first "
                                      "+0x%X saved %08X live %08X; %u so far)",
                                      st.gameFrame, (unsigned)(before - ko.size()), firstO, firstS, firstL, gCompLiveDataRestored);
@@ -2899,19 +3186,18 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
             // Diagnostic: fighter-component dwords still kept live whose saved and live values differ. Soak 11909 S=840:
             // comp +0xA8 was 3.5 (0x40600000) in the original and 51.7 (0x424EDD74) in the replay at the first replayed
             // frame's FightUpdate entry, +0x5E8 3.5 vs 0, then P2 z 0 -> 46.8: floats that pass the pointer test?
-            if (!strcmp(s.name, "fightercomp")) {
-                static int compKeepLogged = 0;
+            if (!quiet && !strcmp(s.name, "fightercomp")) {
                 for (uint32_t o : ko) {
-                    if (compKeepLogged >= 300) break;
+                    if (sCompKeepLogged >= 300) break;
                     // Expected: the triple-buffered bone matrix pointers (+0x2F4/+0x300/+0x30C, rotated by bonerot)
                     // and the queued anim-object list header (+0x3A8..+0x3B0) differ at almost every load.
                     const uint32_t co = o + 0x3C;
                     if (co == 0x2F4 || co == 0x300 || co == 0x30C || (co >= 0x3A8 && co <= 0x3B0)) continue;
                     uint32_t sv, lv;
-                    memcpy(&sv, merged.data() + o, 4);
+                    memcpy(&sv, mg.data() + o, 4);
                     memcpy(&lv, reinterpret_cast<const void*>(s.base + o), 4);
                     if (sv == lv) continue;
-                    ++compKeepLogged;
+                    ++sCompKeepLogged;
                     Logger::Info("COMPKEEP S=%u fightercomp +0x%X kept live: saved %08X live %08X", st.gameFrame, o + 0x3C, sv, lv);
                 }
             }
@@ -2925,7 +3211,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                     const size_t before = ko.size();
                     ko.erase(std::remove_if(ko.begin(), ko.end(), [](uint32_t o) { return (o >= 0x54 && o <= 0x5C) || (o >= 0x6C && o <= 0x74); }),
                              ko.end());
-                    if (ko.size() != before && (++gPinFloatsRestored == 1 || gPinFloatsRestored % 500 == 0))
+                    if (!quiet && ko.size() != before && (++gPinFloatsRestored == 1 || gPinFloatsRestored % 500 == 0))
                         Logger::Info("PINFLOATS: PinLimb vector fields restored by value instead of kept live (%u times)", gPinFloatsRestored);
                 }
             }
@@ -2936,7 +3222,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 // MK object created after the save) and later writes through it corrupt the heap
                 // free tree (soak12: an MK object id in a free-tree link, 0x0042AF1D).
                 uint32_t saved, live;
-                memcpy(&saved, merged.data() + o, 4);
+                memcpy(&saved, mg.data() + o, 4);
                 memcpy(&live, reinterpret_cast<const void*>(s.base + o), 4);
                 bool intoImage = false;
                 for (int r = 0; r < nmr; ++r)
@@ -2947,14 +3233,13 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 // num > 0 -> crash 0x007892AB, soak15).
                 const bool triple = k + 2 < ko.size() && ko[k + 1] == o + 4 && ko[k + 2] == o + 8;
                 const uint32_t n = triple ? 3 : 1;
-                if (triple && !strncmp(s.name, "actor", 5)) {
+                if (!quiet && triple && !strncmp(s.name, "actor", 5)) {
                     // Diagnostic: actor TArrays kept live whose count differs from the save (Touching etc.).
                     uint32_t sn, ln;
-                    memcpy(&sn, merged.data() + o + 4, 4);
+                    memcpy(&sn, mg.data() + o + 4, 4);
                     memcpy(&ln, reinterpret_cast<const void*>(s.base + o + 4), 4);
-                    static int arrLogged = 0;
-                    if (sn != ln && arrLogged < 2000) {
-                        ++arrLogged;
+                    if (sn != ln && sArrLogged < 2000) {
+                        ++sArrLogged;
                         Logger::Info("ACTORARRAY S=%u %s +0x%X: count %u at the save, %u live (kept live)", st.gameFrame, s.name, o, sn, ln);
                     }
                 }
@@ -2962,25 +3247,239 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                     const uint32_t oj = o + 4 * j;
                     // A field learned to hold data (a float that sometimes coincides with an object address) is restored.
                     if (n == 1 && LearnFieldsOn() && LearnedData((uint32_t)(s.base + oj))) {
-                        ++gLearnedRestores;
-                        char key[48];
-                        snprintf(key, sizeof key, "%.12s +0x%X", s.name, oj);
-                        auto& e = gLearnedWhere[key];
-                        ++e.first;
-                        memcpy(&e.second, merged.data() + oj, 4);
+                        if (!quiet) {
+                            ++gLearnedRestores;
+                            char key[48];
+                            snprintf(key, sizeof key, "%.12s +0x%X", s.name, oj);
+                            auto& e = gLearnedWhere[key];
+                            ++e.first;
+                            memcpy(&e.second, mg.data() + oj, 4);
+                        }
                         if (Snapshot::gLearnFields == 1) continue;
                     }
-                    if (!intoImage) memcpy(merged.data() + oj, reinterpret_cast<const void*>(s.base + oj), 4);
+                    if (!intoImage) memcpy(mg.data() + oj, reinterpret_cast<const void*>(s.base + oj), 4);
                 }
                 k += n - 1;
             }
-            if (!strncmp(s.name, "actor", 5)) KeepActorRenderFields(merged.data(), reinterpret_cast<const uint8_t*>(s.base));
+            };
+            // rc25 diff-first merge ('diffmerge 1', default): the same bytes as fullMerge, classifying only what can
+            // matter. A dword whose live and saved values are equal merges to that value whatever the classification,
+            // so only the differing dwords are decided, each exactly as fullMerge decides it:
+            //  - its kept-live membership (saved keepOffsets, the live pointer scan for actor spans, then the same
+            //    filters) is computed for it alone: a live mark on dword o can only come from the origins o - 8, o - 4
+            //    and o (MarkKeepOrigins), and every filter is a test of that one dword;
+            //  - fullMerge groups kept dwords greedily into TArray triples along the sorted list, so a dword's group is
+            //    fixed by the run of consecutive kept dwords around it: from the run's start, triples while 3 dwords
+            //    remain, then singles. The run is walked (memberships of its equal dwords computed the same way), and the
+            //    group's first dword decides intoImage for it, as in fullMerge.
+            // The counters and lines follow fullMerge's except REFLECTDATA on actor spans (the saved keepOffsets part only:
+            // the live part is no longer classified in full). Not used with LEARNFIELDS on (it learns from the full live
+            // scan), for a span whose saved bytes are short, or for unsorted keepOffsets: fullMerge then.
+            auto diffMerge = [&](std::vector<uint8_t>& mg) -> bool {
+                const std::vector<uint32_t>& sk = s.keepOffsets;
+                if (LearnFieldsOn() || st.bytes[i].size() < s.size) return false;
+                for (size_t k = 0; k < sk.size(); ++k)
+                    if ((sk[k] & 3) || sk[k] + 4 > s.size || (k && sk[k] <= sk[k - 1])) return false;
+                const uint8_t* svb = st.bytes[i].data();
+                const uint8_t* lvb = reinterpret_cast<const uint8_t*>(s.base);
+                auto sv32 = [&](uint32_t o) { uint32_t v; memcpy(&v, svb + o, 4); return v; };
+                auto lv32 = [&](uint32_t o) { uint32_t v; memcpy(&v, lvb + o, 4); return v; };
+                static std::vector<uint32_t> diff, origins;  // game thread only (LoadAB)
+                static std::vector<uint8_t> liveKeep, scanned;
+                static std::vector<int8_t> memo;
+                diff.clear();
+                for (uint32_t o = 0; o + 4 <= s.size; o += 4)
+                    if (sv32(o) != lv32(o)) diff.push_back(o);
+                ++gDiffSpans;
+                gDiffDwords += (uint32_t)diff.size();
+                if (diff.empty()) ++gDiffUnchanged;
+                const bool actorType = !strncmp(s.name, "actor", 5) || !strcmp(s.name, "fxactor") || !strcmp(s.name, "mkactor");
+                const bool isComp = !strcmp(s.name, "fightercomp"), isAnim = !strcmp(s.name, "ue3anim");
+                const bool ue3span = isAnim || isComp || actorType;
+                const uint32_t floatLo = s.name[0] == 'a' ? 0xDC : 0xA0;
+                const std::vector<uint8_t>* dm = nullptr;
+                uint32_t delta = 0;
+                if (gReflectData && ue3span) {
+                    delta = strncmp(s.name, "actor", 5) ? 0x3C : 0;  // span start inside the object
+                    uint32_t cls = 0;
+                    if (CrashLog::SafeRead32(s.base - delta + 0x30, &cls) && cls) dm = &ReflectDataMask(cls);
+                }
+                auto inSaved = [&](uint32_t o) { return std::binary_search(sk.begin(), sk.end(), o); };
+                auto floatOut = [&](uint32_t o) { return actorType && gFloatFields && o >= floatLo && o <= floatLo + 0x14; };
+                auto reflectOut = [&](uint32_t o) {
+                    const uint32_t w = (o + delta) / 4;
+                    return dm && w < dm->size() && (*dm)[w];
+                };
+                auto compFloatOut = [&](uint32_t o) {
+                    const uint32_t co = o + 0x3C;
+                    return isComp && gCompFloats &&
+                           ((co >= 0xA0 && co <= 0xA8) || (co >= 0xE0 && co <= 0xE8) || (co >= 0x5E0 && co <= 0x5E8) || (co >= 0x60C && co <= 0x614));
+                };
+                auto pinRange = [](uint32_t o) { return (o >= 0x54 && o <= 0x5C) || (o >= 0x6C && o <= 0x74); };
+                // The live pointer scan, origin by origin (MarkKeepOrigins: the whole scan's marks on the dwords asked for).
+                const uint32_t nd = s.size / 4;
+                const bool needLive = actorType || (isComp && gCompLiveData);
+                if (needLive) {
+                    liveKeep.assign(nd, 0);
+                    scanned.assign(nd, 0);
+                }
+                auto scanOrigins = [&](uint32_t lo, uint32_t hi) {  // the origins in [lo, hi] not scanned yet
+                    origins.clear();
+                    for (uint32_t p = lo; p <= hi && p + 4 <= s.size; p += 4)
+                        if (!scanned[p / 4]) {
+                            scanned[p / 4] = 1;
+                            origins.push_back(p);
+                        }
+                    if (origins.empty()) return;
+                    MarkKeepOrigins(lvb, s.size, origins.data(), origins.size(), liveKeep);
+                    gDiffOrigins += (uint32_t)origins.size();
+                };
+                auto liveAt = [&](uint32_t o) {
+                    scanOrigins(o >= 8 ? o - 8 : 0, o);
+                    return liveKeep[o / 4] != 0;
+                };
+                if (actorType && !diff.empty()) {  // one scan (one working-set query) for the differing dwords and their neighbours
+                    origins.clear();
+                    for (const uint32_t d : diff)
+                        for (uint32_t p = d >= 16 ? d - 16 : 0; p <= d + 8 && p + 4 <= s.size; p += 4)
+                            if (!scanned[p / 4]) {
+                                scanned[p / 4] = 1;
+                                origins.push_back(p);
+                            }
+                    if (!origins.empty()) {
+                        MarkKeepOrigins(lvb, s.size, origins.data(), origins.size(), liveKeep);
+                        gDiffOrigins += (uint32_t)origins.size();
+                    }
+                }
+                // fullMerge's list before COMPLIVEDATA / PINFLOATS: saved and (actor spans) live marks, minus Location /
+                // Rotation, declared data and the component float vectors.
+                auto preMember = [&](uint32_t o) {
+                    const bool in = inSaved(o) || (actorType && liveAt(o));
+                    return in && !floatOut(o) && !reflectOut(o) && !compFloatOut(o);
+                };
+                // REFLECTDATA / COMPFLOATS / PINFLOATS counters: those spans' lists are the saved keepOffsets alone (actor
+                // spans: their saved part), so the counts are fullMerge's.
+                bool savedLeft = false, compFloatHit = false, pinHit = false;
+                uint32_t reflectHits = 0;
+                for (const uint32_t o : sk) {
+                    if (floatOut(o)) continue;
+                    if (reflectOut(o)) {
+                        ++reflectHits;
+                        continue;
+                    }
+                    savedLeft = true;
+                    compFloatHit |= compFloatOut(o);
+                    pinHit |= isAnim && pinRange(o);
+                }
+                if (dm && reflectHits) {
+                    gReflectRestored += reflectHits;
+                    if (gReflectRestored >= gReflectLoggedAt + 500) {
+                        gReflectLoggedAt = gReflectRestored;
+                        Logger::Info("REFLECTDATA: %u declared-data dwords restored by value instead of kept live", gReflectRestored);
+                    }
+                }
+                if (isComp && gCompFloats && compFloatHit && (++gCompFloatsRestored == 1 || gCompFloatsRestored % 500 == 0))
+                    Logger::Info("COMPFLOATS: fighter component float vectors restored by value instead of kept live (%u loads)", gCompFloatsRestored);
+                // COMPLIVEDATA: a kept fighter-component dword whose live value is nonzero and not a pointer (only a differing
+                // dword can be one).
+                if (isComp && gCompLiveData) {
+                    uint32_t removed = 0, firstO = 0, firstS = 0, firstL = 0;
+                    for (const uint32_t d : diff) {
+                        const uint32_t lv = lv32(d);
+                        if (!lv || !preMember(d) || liveAt(d)) continue;
+                        if (!firstO) firstO = d + 0x3C, firstS = sv32(d), firstL = lv;
+                        ++removed;
+                    }
+                    if (removed) {
+                        gCompLiveDataRestored += removed;
+                        if (++sCompLiveLogged <= 20 || sCompLiveLogged % 200 == 0)
+                            Logger::Info("COMPLIVEDATA S=%u: %u fighter component dword(s) restored by value (live value not a pointer; first "
+                                         "+0x%X saved %08X live %08X; %u so far)",
+                                         st.gameFrame, removed, firstO, firstS, firstL, gCompLiveDataRestored);
+                    }
+                }
+                // PINFLOATS: the class test fullMerge makes when its list is not empty (ue3anim spans have no live part).
+                bool pinLimb = false;
+                if (isAnim && gPinFloats && savedLeft) {
+                    uint32_t cls = 0;
+                    char cn[64] = "";
+                    CrashLog::SafeRead32(s.base - 0x3C + 0x30, &cls);
+                    if (cls) Ue3Names::NameOf(cls, cn, sizeof cn);
+                    pinLimb = !strncmp(cn, "SkelControlPinLimb", 18);
+                    if (pinLimb && pinHit && (++gPinFloatsRestored == 1 || gPinFloatsRestored % 500 == 0))
+                        Logger::Info("PINFLOATS: PinLimb vector fields restored by value instead of kept live (%u times)", gPinFloatsRestored);
+                }
+                if (diff.empty()) return true;  // nothing differs: the merge is the saved bytes, as fullMerge's would be
+                memo.assign(nd, -1);
+                auto member = [&](uint32_t o) {  // in fullMerge's final list
+                    int8_t& m = memo[o / 4];
+                    if (m < 0) {
+                        bool in = preMember(o);
+                        if (in && isComp && gCompLiveData) {
+                            const uint32_t lv = lv32(o);
+                            if (sv32(o) != lv && lv && !liveAt(o)) in = false;
+                        }
+                        if (in && isAnim && gPinFloats && pinLimb && pinRange(o)) in = false;
+                        m = in ? 1 : 0;
+                    }
+                    return m != 0;
+                };
+                if (isComp) {  // COMPKEEP diagnostic: kept dwords whose values differ (fullMerge's order: ascending)
+                    for (const uint32_t o : diff) {
+                        if (sCompKeepLogged >= 300) break;
+                        const uint32_t co = o + 0x3C;
+                        if (co == 0x2F4 || co == 0x300 || co == 0x30C || (co >= 0x3A8 && co <= 0x3B0) || !member(o)) continue;
+                        ++sCompKeepLogged;
+                        Logger::Info("COMPKEEP S=%u fightercomp +0x%X kept live: saved %08X live %08X", st.gameFrame, o + 0x3C, sv32(o), lv32(o));
+                    }
+                }
+                uint32_t runLo = 1, runHi = 0;  // the run of consecutive kept dwords around the last decided dword
+                for (const uint32_t d : diff) {
+                    if (!member(d)) continue;  // not kept live: the saved value (already in mg)
+                    if (d < runLo || d > runHi) {
+                        runLo = runHi = d;
+                        while (runLo >= 4 && member(runLo - 4)) runLo -= 4;
+                        while (runHi + 8 <= s.size && member(runHi + 4)) runHi += 4;
+                    }
+                    const uint32_t g = runLo + 12 * (((d - runLo) / 4) / 3);  // its group's first dword if a triple
+                    const bool triple = g + 8 <= runHi;
+                    const uint32_t o = triple ? g : d;
+                    const uint32_t saved = sv32(o), live = lv32(o);
+                    bool intoImage = false;
+                    for (int r = 0; r < nmr; ++r)
+                        intoImage |= (saved >= mr[r].base && saved < mr[r].base + mr[r].size) ||
+                                     (live >= mr[r].base && live < mr[r].base + mr[r].size);
+                    if (triple && d == g + 4 && !strncmp(s.name, "actor", 5) && sArrLogged < 2000) {  // its count differs
+                        ++sArrLogged;
+                        Logger::Info("ACTORARRAY S=%u %s +0x%X: count %u at the save, %u live (kept live)", st.gameFrame, s.name, g, sv32(d), lv32(d));
+                    }
+                    if (!intoImage) memcpy(mg.data() + d, lvb + d, 4);
+                }
+                return true;
+            };
+            if (gDiffMerge <= 0 || !diffMerge(merged)) {
+                if (gDiffMerge > 0) ++gDiffFull;
+                fullMerge(merged, false);
+            } else if (gDiffMerge >= 2) {  // check: the whole-span merge must give the same bytes
+                std::vector<uint8_t> check = st.bytes[i];
+                fullMerge(check, true);
+                if (check != merged) {
+                    uint32_t at = 0;
+                    while (at < check.size() && check[at] == merged[at]) ++at;
+                    if (gDiffMismatch++ < 20)
+                        Logger::Info("DIFFMERGE MISMATCH S=%u %s %08X+%X: first at +0x%X (full %02X, diff %02X); the full merge is used",
+                                     st.gameFrame, s.name, (unsigned)s.base, s.size, at, at < check.size() ? check[at] : 0,
+                                     at < merged.size() ? merged[at] : 0);
+                    merged.swap(check);
+                }
+            }
+            if (nf.actor) KeepActorRenderFields(merged.data(), reinterpret_cast<const uint8_t*>(s.base));
             // SkelControl bound object (+0xC0, span offset 0x84): the control's strength is [bound+0x20] (0x007601B0)
             // and the binding is made by 0x0076DF10 (which also appends the object to the component's +0x3A8 list,
             // restored). Kept live as a pointer, it left the controls bound as at F: 'animtrace' found fighter
             // SkelControlPinLimb strength already at 1.0 / 0 on first replayed frames where live ramped 0.2..0.8,
             // in ~20% of loads (2026-10-17). Restored when the saved object is null or still/again allocated.
-            if (gSkelBind && !strcmp(s.name, "ue3anim") && s.size >= 0x88) {
+            if (gSkelBind && nf.ue3anim && s.size >= 0x88) {
                 uint32_t saved, live, cls = 0;
                 memcpy(&saved, st.bytes[i].data() + 0x84, 4);
                 memcpy(&live, reinterpret_cast<const void*>(s.base + 0x84), 4);
@@ -3006,7 +3505,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
             // skel_m* contents are restored by address, so after a load whose distance was not a multiple of
             // 3 the matrices sat in the wrong logical slots (synctest36: at the first replayed frame only these
             // three pointers differed, rotated). Same three allocations -> restore the saved rotation.
-            if (!strcmp(s.name, "fightercomp") && gBoneRotation && s.size >= 0x2DC) {
+            if (nf.fightercomp && gBoneRotation && s.size >= 0x2DC) {
                 uint32_t sv[3][3], lv[3][3];
                 for (int a = 0; a < 3; ++a)
                     for (int b = 0; b < 3; ++b) {
@@ -3026,7 +3525,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                         Logger::Info("BONEROT: restored the saved bone-matrix buffer rotation (%d loads so far)", gBoneRotations);
                 }
             }
-            if (!strcmp(s.name, "fightercomp") && gCompList && s.size >= 0x378) {
+            if (nf.fightercomp && gCompList && s.size >= 0x378) {
                 uint32_t sv[3], lv[3];
                 memcpy(sv, st.bytes[i].data() + 0x36C, sizeof sv);
                 memcpy(lv, reinterpret_cast<const void*>(s.base + 0x36C), sizeof lv);
@@ -3055,11 +3554,11 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                     }
                 }
             }            memcpy(reinterpret_cast<void*>(s.base), merged.data(), s.size);
-            if (!strcmp(s.name, "mkactor")) NoteMkLoc((uint32_t)s.base - 0x3C, 0, merged.data());
+            if (nf.mkactor) NoteMkLoc((uint32_t)s.base - 0x3C, 0, merged.data());
         } else {
             // 'abtest padfull': off restores the AI/remote pad only up to +0x5F8 as before (ring index left live).
-            const bool padCut = !gPadFullLoad && s.size > 0x5F8 && !strcmp(s.name, "aipad");
-            if (s.size > 0x5F8 && !strcmp(s.name, "aipad")) {  // how often does the tail past 0x5F8 differ at a load?
+            const bool padCut = !gPadFullLoad && s.size > 0x5F8 && nf.aipad;
+            if (s.size > 0x5F8 && nf.aipad) {  // how often does the tail past 0x5F8 differ at a load?
                 static uint32_t sLoads = 0, sDiff = 0, sIdx = 0;
                 ++sLoads;
                 const uint8_t* sv = st.bytes[i].data();
@@ -3074,7 +3573,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                 }
                 if (sLoads % 200 == 0) Logger::Info("PADTAIL: %u loads, tail differed %u, ring index differed %u", sLoads, sDiff, sIdx);
             }
-            if (!strcmp(s.name, "movereq")) {  // which entry fields change between the save and the load?
+            if (nf.movereq) {  // which entry fields change between the save and the load?
                 static uint32_t sHist[0x248 / 4], sLoads = 0, sDiffEntries = 0;
                 const uint32_t* sv = reinterpret_cast<const uint32_t*>(st.bytes[i].data());
                 const uint32_t* lv = reinterpret_cast<const uint32_t*>(s.base);
@@ -3090,8 +3589,9 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                     Logger::Info("MOVEREQ: %u entry restores, %u differed; offsets:%s", sLoads, sDiffEntries, ln ? line : " none");
                 }
             }
-            memcpy(reinterpret_cast<void*>(s.base), st.bytes[i].data(), padCut ? 0x5F8 : s.size);
-            if (!strcmp(s.name, "mkactor")) NoteMkLoc((uint32_t)s.base - 0x3C, 0, st.bytes[i].data());
+            // The master image with the helper threads (rc23; ~1.3 ms of every load on one core), the rest as before.
+            ParallelMem::Copy(reinterpret_cast<void*>(s.base), st.bytes[i].data(), padCut ? 0x5F8 : s.size);
+            if (nf.mkactor) NoteMkLoc((uint32_t)s.base - 0x3C, 0, st.bytes[i].data());
         }
         if (padHwKeep) KeepPadDeviceBits(s.base, padHw, st.gameFrame);
         ++restored;
@@ -3162,6 +3662,16 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
             k += snprintf(line + k, sizeof line - k, " %s %.2f (%u/load)", top[j].second.first, ms(top[j].first),
                           top[j].second.second / (uint32_t)sProfLoads);
         Logger::Info("%s", line);
+        // rc25: setup in parts, and the diff-first merge (per load: spans merged by diff, those with no differing dword, the
+        // differing dwords, the live origins classified for them, spans merged whole, 'diffmerge 2' mismatches in total).
+        const double nl = sProfLoads;
+        Logger::Info("LOADAB PROFILE setup (ms/load): namemaps %.2f extlists %.2f checks+locks %.2f freetree %.2f (%.0f nodes); diffmerge "
+                     "mode %d: %.1f spans/load (%.1f unchanged), %.1f dwords differ, %.1f origins classified, %.2f whole-span; %u mismatches",
+                     ms(sSetupPart[0]), ms(sSetupPart[1]), ms(sSetupPart[2]), ms(sSetupPart[3]), sFreeNodes / nl, gDiffMerge, gDiffSpans / nl,
+                     gDiffUnchanged / nl, gDiffDwords / nl, gDiffOrigins / nl, gDiffFull / nl, gDiffMismatch);
+        for (int64_t& v : sSetupPart) v = 0;
+        sFreeNodes = 0;
+        gDiffSpans = gDiffUnchanged = gDiffDwords = gDiffOrigins = gDiffFull = 0;
         sSpanT.clear();
         sSetupT = sTailT = 0;
         sProfLoads = 0;

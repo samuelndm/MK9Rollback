@@ -29,9 +29,12 @@
 #include "../rollback/FpuGuard.h"
 #include "../rollback/FramePace.h"
 #include "../rollback/FreeQuarantine.h"
+#include "../rollback/ParallelMem.h"
 #include "../rollback/OnlineKeep.h"
 #include "../rollback/RngTrace.h"
 #include "../rollback/ScriptRng.h"
+#include "../rollback/RenderTag.h"
+#include "../rollback/SoundDedupe.h"
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
 #include "../rollback/StateHash.h"
@@ -44,6 +47,7 @@
 
 namespace {
 wchar_t gPath[MAX_PATH];
+wchar_t gTakenPath[MAX_PATH];  // the command file while the poll thread reads it
 HANDLE gThread = nullptr;
 volatile LONG gStop = 0;
 CRITICAL_SECTION gLock;
@@ -239,7 +243,12 @@ void __cdecl SetPauseGuard(int on) {
 DWORD WINAPI Poll(LPVOID) {
     while (!InterlockedCompareExchange(&gStop, 0, 0)) {
         Sleep(50);
-        FILE* f = _wfopen(gPath, L"r");
+        // Taken by rename first (round 3): read in place and removed afterwards, a file the launcher moved in between
+        // the read and the remove was deleted unread (an 'online' command lost, the window still saying "Ready"). The
+        // rename is atomic: the launcher's next file is a new one. It replaces a leftover of an earlier read (a game
+        // closed inside one), whose commands were for that game.
+        if (!MoveFileExW(gPath, gTakenPath, MOVEFILE_REPLACE_EXISTING)) continue;  // nothing waiting, or still being written
+        FILE* f = _wfopen(gTakenPath, L"r");
         if (!f) continue;
         std::vector<std::string> lines;
         char buf[256];
@@ -249,7 +258,7 @@ DWORD WINAPI Poll(LPVOID) {
             if (n) lines.emplace_back(buf);
         }
         fclose(f);
-        _wremove(gPath);
+        _wremove(gTakenPath);
         EnterCriticalSection(&gLock);
         for (auto& l : lines) gPending.push_back(l);
         LeaveCriticalSection(&gLock);
@@ -336,6 +345,12 @@ void Execute(const std::string& line) {
     } else if (!strcmp(verb, "fastprobe") && sscanf(line.c_str(), "fastprobe %d", &value) == 1) {
         Snapshot::gFastProbe = value != 0;
         Logger::Info("FASTPROBE %d: the save's skel phase checks reads with %s", value != 0, value ? "guarded loads" : "VirtualQuery");
+    } else if (!strcmp(verb, "diffmerge") && sscanf(line.c_str(), "diffmerge %d", &value) == 1) {
+        Snapshot::gDiffMerge = value < 0 ? 0 : value > 2 ? 2 : value;
+        Logger::Info("DIFFMERGE %d: the load's pointer-safe span merge %s", Snapshot::gDiffMerge,
+                     Snapshot::gDiffMerge == 0   ? "classifies every dword (before rc25)"
+                     : Snapshot::gDiffMerge == 1 ? "classifies only the dwords that differ"
+                                                 : "classifies only the differing dwords and checks each span against the full merge");
     } else if (!strcmp(verb, "heaplock") && sscanf(line.c_str(), "heaplock %d", &value) == 1) {
         Snapshot::gHeapLock = value != 0;
     } else if (!strcmp(verb, "namemaps") && sscanf(line.c_str(), "namemaps %d", &value) == 1) {
@@ -360,16 +375,32 @@ void Execute(const std::string& line) {
         Overlay::SetLevel(value);
         if (value > 0) Overlay::EnsureInstalled();
         Logger::Info("OVERLAY level %d", Overlay::Level());
+    } else if (!strcmp(verb, "framelatency") && sscanf(line.c_str(), "framelatency %d", &value) == 1) {
+        Overlay::SetFrameLatency(value);
+        Logger::Info("FRAMELATENCY %d (0: the game's own; applied at the next drawn frame)", Overlay::FrameLatencyWanted());
     } else if (!strcmp(verb, "learnfields") && sscanf(line.c_str(), "learnfields %d", &value) == 1) {
         Snapshot::gLearnFields = value;
     } else if (!strcmp(verb, "poscache") && sscanf(line.c_str(), "poscache %d", &value) == 1) {
         Snapshot::gPositiveCache = value != 0;
+    } else if (!strcmp(verb, "heapcache") && sscanf(line.c_str(), "heapcache %d", &value) == 1) {
+        Snapshot::SetCommittedCap(value);
+    } else if (!strcmp(verb, "slotnt") && sscanf(line.c_str(), "slotnt %d", &value) == 1) {
+        ParallelMem::SetSlotStreaming(value != 0);
     } else if (!strcmp(verb, "floatfields") && sscanf(line.c_str(), "floatfields %d", &value) == 1) {
         Snapshot::gFloatFields = value != 0;
     } else if (!strcmp(verb, "strictvt") && sscanf(line.c_str(), "strictvt %d", &value) == 1) {
         Snapshot::gStrictVtable = value != 0;
     } else if (!strcmp(verb, "foreignvt") && sscanf(line.c_str(), "foreignvt %d", &value) == 1) {
         Snapshot::gForeignVtables = value != 0;
+    } else if (!strcmp(verb, "coldcheck") && sscanf(line.c_str(), "coldcheck %d", &value) == 1) {
+        Snapshot::gColdCheck = value != 0;
+        Logger::Info("COLDCHECK %d: pointer targets on pages outside the working set are %s", value != 0,
+                     value ? "kept live unread" : "read");
+    } else if (!strcmp(verb, "trimws") && sscanf(line.c_str(), "trimws %d", &value) == 1) {
+        // Test aid: empty this process's working set every <value> ms on the game thread (0: off), like Windows trimming
+        // a minimized game; the pages come back as soft faults, or from the disk once repurposed.
+        Snapshot::gTrimWsMs = value > 0 ? value : 0;
+        Logger::Info("TRIMWS %d ms", Snapshot::gTrimWsMs);
     } else if (!strcmp(verb, "pawncomps") && sscanf(line.c_str(), "pawncomps %d", &value) == 1) {
         Snapshot::gPawnComps = value != 0;
     } else if (!strcmp(verb, "tierecam") && sscanf(line.c_str(), "tierecam %d", &value) == 1) {
@@ -412,6 +443,8 @@ void Execute(const std::string& line) {
         if (sscanf(line.c_str(), "netplaylife %f", &f) == 1) Rollback::SetNetplayLife(f > 1.0f ? 1.0f : f);
     } else if (!strcmp(verb, "protectlate") && sscanf(line.c_str(), "protectlate %d", &value) == 1) {
         FreeQuarantine::SetProtectLate(value != 0);  // requeued blocks the cinema restore points at again stay live
+    } else if (!strcmp(verb, "memthreads") && sscanf(line.c_str(), "memthreads %d", &value) == 1) {
+        ParallelMem::SetHelpers(value);  // helpers of the saves' and loads' big copies and scans: 0 none, -1 from the CPU count
     } else if (!strcmp(verb, "levelredo") && sscanf(line.c_str(), "levelredo %d", &value) == 1) {
         CinemaRestore::gLevelRedo = value != 0;  // levels added after a load point re-added at their next lookup
         Logger::Info("LEVELREDO %d", value != 0 ? 1 : 0);
@@ -1261,6 +1294,14 @@ void Execute(const std::string& line) {
         } else {
             Logger::Info("NETSIM: usage 'netsim <delay ms 0..1000> [out-of-order %% 0..50] [loss %% 0..50] [stall ms] [stall period ms] [drop 0|1]'");
         }
+    } else if (!strcmp(verb, "netsimtimed") && sscanf(line.c_str(), "netsimtimed %d", &value) == 1) {
+        // Test only, both games of a one-PC pair: netsim's delay is kept by the receiver until each packet's due time
+        // instead of by the sender until one of its polls (once a frame: 'netsim 15' was exactly a frame, on the
+        // sender's frame grid). Needed to measure anything under a frame (tools/build_ggpo.ps1, timed netsim).
+        SetEnvironmentVariableA("ggpo.network.timed", value ? "1" : nullptr);
+        Logger::Info("NETSIMTIMED %d: netsim packets %s, from the next session start", value ? 1 : 0,
+                     value ? "leave at once and are held by the receiver until their due time (both games need it)"
+                           : "wait in the sender's queue for one of its polls (stock)");
     } else if (!strcmp(verb, "lazysave") && sscanf(line.c_str(), "lazysave %d", &value) == 1) {
         Rollback::SetLazySave(value != 0);
     } else if (!strcmp(verb, "skipconfirmed") && sscanf(line.c_str(), "skipconfirmed %d", &value) == 1) {
@@ -1280,12 +1321,32 @@ void Execute(const std::string& line) {
         Rollback::SetQualityInterval(value);
     } else if (!strcmp(verb, "netretry") && sscanf(line.c_str(), "netretry %d", &value) == 1) {
         Rollback::SetRunningRetry(value);
+    } else if (!strcmp(verb, "firstretry") && sscanf(line.c_str(), "firstretry %d", &value) == 1) {
+        Rollback::SetFirstInputRetry(value);
     } else if (!strcmp(verb, "paysmooth") && sscanf(line.c_str(), "paysmooth %d", &value) == 1) {
         Rollback::SetPaySmooth(value);
+        int small = 0;
+        if (sscanf(line.c_str(), "paysmooth %d %d", &value, &small) == 2) Rollback::SetPaySmoothSmall(small);
+    } else if (!strcmp(verb, "ggposync") && sscanf(line.c_str(), "ggposync %d", &value) == 1) {
+        Rollback::SetGgpoTimesync(value != 0);
+    } else if (!strcmp(verb, "repoll") && sscanf(line.c_str(), "repoll %d", &value) == 1) {
+        Rollback::SetRepoll(value != 0);
+    } else if (!strcmp(verb, "phasesync") && sscanf(line.c_str(), "phasesync %d", &value) == 1) {
+        Rollback::SetPhaseSync(value != 0);
+    } else if (!strcmp(verb, "soundnear") && sscanf(line.c_str(), "soundnear %d", &value) == 1) {
+        SoundDedupe::SetNearFrames(value);
+    } else if (!strcmp(verb, "replayskip") && sscanf(line.c_str(), "replayskip %d", &value) == 1) {
+        RenderTag::SetReplaySkip(value != 0);
+    } else if (!strcmp(verb, "fastreadable") && sscanf(line.c_str(), "fastreadable %d", &value) == 1) {
+        Rollback::SetFastReadable(value != 0);
     } else if (!strcmp(verb, "renderlate") && sscanf(line.c_str(), "renderlate %d", &value) == 1) {
         Rollback::SetRenderLate(value);
     } else if (!strcmp(verb, "stallsample") && sscanf(line.c_str(), "stallsample %d", &value) == 1) {
         FramePace::SetStallSample(value);
+    } else if (!strcmp(verb, "limiterwait") && sscanf(line.c_str(), "limiterwait %d", &value) == 1) {
+        FramePace::SetLimiterWait(value != 0);
+    } else if (!strcmp(verb, "ecoqos") && sscanf(line.c_str(), "ecoqos %d", &value) == 1) {
+        FramePace::SetPowerThrottling(value != 0);
     } else if (!strcmp(verb, "fpupinsession") && sscanf(line.c_str(), "fpupinsession %d", &value) == 1) {
         FpuGuard::gPinInSessions = value != 0;
         Logger::Info("FPUPINSESSION %d: the all-thread FPU walk %s", value != 0 ? 1 : 0,
@@ -1294,6 +1355,20 @@ void Execute(const std::string& line) {
         Rollback::SetCanonClock(value != 0);
     } else if (!strcmp(verb, "startbarrier") && sscanf(line.c_str(), "startbarrier %d", &value) == 1) {
         Rollback::SetStartBarrier(value != 0);
+    } else if (!strcmp(verb, "desyncstop") && sscanf(line.c_str(), "desyncstop %d", &value) == 1) {
+        Rollback::SetDesyncStop(value);
+    } else if (!strcmp(verb, "handshakepoll") && sscanf(line.c_str(), "handshakepoll %d", &value) == 1) {
+        Rollback::SetHandshakePoll(value != 0);
+    } else if (!strcmp(verb, "phasegrow") && sscanf(line.c_str(), "phasegrow %d", &value) == 1) {
+        Rollback::SetPhaseGrowAfter(value);
+    } else if (!strcmp(verb, "waitshift") && sscanf(line.c_str(), "waitshift %d", &value) == 1) {
+        Rollback::SetWaitShift(value != 0);
+    } else if (!strcmp(verb, "earlyinput") && sscanf(line.c_str(), "earlyinput %d", &value) == 1) {
+        Rollback::SetEarlyInput(value != 0);
+    } else if (!strcmp(verb, "latesample") && sscanf(line.c_str(), "latesample %d", &value) == 1) {
+        Rollback::SetLateSample(value != 0);
+    } else if (!strcmp(verb, "skiplive") && sscanf(line.c_str(), "skiplive %d", &value) == 1) {
+        Rollback::SetSkipLive(value != 0);
     } else if (!strcmp(verb, "tickspin") && sscanf(line.c_str(), "tickspin %d", &value) == 1) {
         Rollback::SetTickSpin(value);
     } else if (!strcmp(verb, "stallhold") && sscanf(line.c_str(), "stallhold %d", &value) == 1) {
@@ -1451,6 +1526,7 @@ namespace CommandChannel {
 bool Start(const wchar_t* directory) {
     InitializeCriticalSection(&gLock);
     swprintf(gPath, MAX_PATH, L"%ls\\MK9Rollback_cmd.txt", directory);
+    swprintf(gTakenPath, MAX_PATH, L"%ls\\MK9Rollback_cmd.reading", directory);
     wcsncpy(gDir, directory, MAX_PATH - 1);
     // A stale command file was removed before the log was opened (InitThread): what is there now came from the
     // launcher for this game.

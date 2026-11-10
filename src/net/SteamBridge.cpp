@@ -2,6 +2,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <iphlpapi.h>
 
 #include <cstdio>
 
@@ -52,6 +53,22 @@ bool Resolve() {
     gUser = user ? user() : nullptr;
     return gNet && gUser;
 }
+
+// Reads and drops what is pending on a channel (bounded: a peer that keeps sending must not hold the start).
+unsigned Drain(int channel) {
+    auto avail = reinterpret_cast<AvailableFn>(Vfn(gNet, 1));
+    auto read = reinterpret_cast<ReadP2PFn>(Vfn(gNet, 2));
+    char buf[2048];
+    unsigned n = 0;
+    uint32_t size = 0;
+    while (n < 4096 && avail(gNet, &size, channel)) {
+        uint64_t from = 0;
+        uint32_t got = 0;
+        if (!read(gNet, buf, sizeof buf, &got, &from, channel)) break;
+        ++n;
+    }
+    return n;
+}
 }  // namespace
 
 namespace SteamBridge {
@@ -72,6 +89,16 @@ bool Start(uint64_t peer, const LinkSpec* links, int count) {
     }
     gPeer = peer;
     gSent = gReceived = gForeign = 0;
+    // A session on the game's own Steam connection is not closed between fights (Stop), and the links' packets carry no
+    // session number: what an earlier session left unread on a channel (a checksum of a session that stopped in its first
+    // second, read as this session's frame) is dropped here, before the sockets exist. When the other game started its
+    // session first, its first GGPO sync request goes with them: GGPO sends it again when this game's own request
+    // arrives (the sync kick, tools\build_ggpo.ps1), about half a round trip later than it would have been answered.
+    // LinkSpec::keepPending leaves a link's channel as it is.
+    unsigned dropped = 0;
+    for (int i = 0; i < count && i < 4; ++i)
+        if (!links[i].keepPending) dropped += Drain(links[i].channel);
+    if (dropped) Logger::Info("STEAM bridge: %u packet(s) an earlier session left on the links' channels dropped", dropped);
     for (int i = 0; i < count && i < 4; ++i) {
         Link& l = gLinks[i];
         l.s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -87,6 +114,11 @@ bool Start(uint64_t peer, const LinkSpec* links, int count) {
             Stop();
             return false;
         }
+        // A datagram to a loopback port nobody has bound yet (the session's start) must not make the next recv fail
+        // (SIO_UDP_CONNRESET: Windows' "port unreachable" report on UDP sockets). Failure is harmless (ForwardOut skips it).
+        BOOL off = FALSE;
+        DWORD ret = 0;
+        WSAIoctl(l.s, 0x9800000C /* SIO_UDP_CONNRESET */, &off, sizeof off, nullptr, 0, &ret, nullptr, nullptr);
         l.local = {};
         l.local.sin_family = AF_INET;
         l.local.sin_port = htons(links[i].localPort);
@@ -98,20 +130,30 @@ bool Start(uint64_t peer, const LinkSpec* links, int count) {
     return true;
 }
 
+// The datagrams waiting on one link's loopback socket go to the peer. A recv error other than "no more data" is skipped,
+// not taken as the end: WSAECONNRESET reports an earlier datagram that found no listener (SIO_UDP_CONNRESET is off on
+// these sockets, Start, but older systems may still report it) and the queued ones behind it are fine.
+void ForwardOut(Link& l, char* buf, int cap) {
+    auto send = reinterpret_cast<SendP2PFn>(Vfn(gNet, 0));
+    for (int n = 0; n < 64; ++n) {  // local -> peer
+        const int got = recv(l.s, buf, cap, 0);
+        if (got <= 0) {
+            if (got < 0 && WSAGetLastError() == WSAECONNRESET) continue;
+            break;
+        }
+        if (send(gNet, gPeer, buf, (uint32_t)got, kSendUnreliableNoDelay, l.channel)) ++gSent;
+    }
+}
+
 void Pump() {
     if (!gLinkCount || !gNet) return;
-    auto send = reinterpret_cast<SendP2PFn>(Vfn(gNet, 0));
     auto avail = reinterpret_cast<AvailableFn>(Vfn(gNet, 1));
     auto read = reinterpret_cast<ReadP2PFn>(Vfn(gNet, 2));
     char buf[2048];
     for (int i = 0; i < gLinkCount; ++i) {
         Link& l = gLinks[i];
         if (l.s == INVALID_SOCKET) continue;
-        for (int n = 0; n < 64; ++n) {  // local -> peer
-            const int got = recv(l.s, buf, sizeof buf, 0);
-            if (got <= 0) break;
-            if (send(gNet, gPeer, buf, (uint32_t)got, kSendUnreliableNoDelay, l.channel)) ++gSent;
-        }
+        ForwardOut(l, buf, sizeof buf);
         uint32_t size = 0;
         for (int n = 0; n < 64 && avail(gNet, &size, l.channel); ++n) {  // peer -> local
             uint64_t from = 0;
@@ -121,10 +163,18 @@ void Pump() {
                 ++gForeign;
                 continue;
             }
+            if (got > sizeof buf) got = sizeof buf;  // the size Steam reports is the sender's: never past the buffer
             sendto(l.s, buf, (int)got, 0, reinterpret_cast<const sockaddr*>(&l.local), sizeof l.local);
             ++gReceived;
         }
     }
+}
+
+void PumpOut() {
+    if (!gLinkCount || !gNet) return;
+    char buf[2048];
+    for (int i = 0; i < gLinkCount; ++i)
+        if (gLinks[i].s != INVALID_SOCKET) ForwardOut(gLinks[i], buf, sizeof buf);
 }
 
 void Stop() {
@@ -153,13 +203,45 @@ int ReadRaw(int channel, void* buf, uint32_t cap, uint64_t* from) {
     if (!reinterpret_cast<AvailableFn>(Vfn(gNet, 1))(gNet, &size, channel)) return -1;
     uint32_t got = 0;
     if (!reinterpret_cast<ReadP2PFn>(Vfn(gNet, 2))(gNet, buf, cap, &got, from, channel)) return -1;
-    return (int)got;
+    return (int)(got < cap ? got : cap);  // never more than was written to buf, whatever size the packet claimed
 }
 
 bool SessionActive(uint64_t peer) {
     if (!Resolve() || !peer) return false;
     P2PSessionState s{};
     return reinterpret_cast<SessionStateFn>(Vfn(gNet, 6))(gNet, peer, &s) && s.connectionActive;
+}
+
+bool UsingRelay(uint64_t peer) {
+    if (!Resolve() || !peer) return false;
+    P2PSessionState s{};
+    return reinterpret_cast<SessionStateFn>(Vfn(gNet, 6))(gNet, peer, &s) && s.connectionActive && s.usingRelay;
+}
+
+int DefaultRouteOnWifi() {
+    // The interface of the route to a public IPv4 address: read from the routing table, nothing is sent.
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(0x08080808u);
+    DWORD index = 0;
+    if (GetBestInterfaceEx(reinterpret_cast<sockaddr*>(&to), &index) != NO_ERROR) return -1;
+    ULONG size = 16 * 1024;
+    for (int attempt = 0; attempt < 3; ++attempt) {  // the list can grow between the size and the data
+        IP_ADAPTER_ADDRESSES* list = static_cast<IP_ADAPTER_ADDRESSES*>(HeapAlloc(GetProcessHeap(), 0, size));
+        if (!list) return -1;
+        const ULONG r = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+                                             list, &size);
+        int wifi = -1;
+        if (r == NO_ERROR)
+            for (const IP_ADAPTER_ADDRESSES* a = list; a; a = a->Next)
+                if (a->IfIndex == index) {
+                    wifi = a->IfType == IF_TYPE_IEEE80211 ? 1 : 0;
+                    break;
+                }
+        HeapFree(GetProcessHeap(), 0, list);
+        if (r != ERROR_BUFFER_OVERFLOW) return wifi;
+    }
+    return -1;
 }
 
 void DescribeSession(uint64_t peer, char* out, unsigned cap) {

@@ -171,22 +171,15 @@ void Uninstall() { gInstalled = false; }  // CodePatch::RestoreAll() restores th
 
 void CollectCells(std::vector<std::pair<uintptr_t, uint32_t>>& out) {
     if (!gLockInit) return;
-    // Region cache for this walk only (one VirtualQuery per list node cost ~0.9 ms per save; a save-wide
-    // cache went stale against other threads, so it lives just for this call).
-    struct Region {
-        uintptr_t lo, hi;
-        bool ok;
-    } regions[16];
-    int nr = 0;
-    auto Readable = [&](uintptr_t p, size_t n) {
-        for (int i = 0; i < nr; ++i)
-            if (p >= regions[i].lo && p < regions[i].hi) return regions[i].ok && p + n <= regions[i].hi;
-        MEMORY_BASIC_INFORMATION mbi;
-        if (p < 0x10000 || !VirtualQuery(reinterpret_cast<void*>(p), &mbi, sizeof mbi)) return false;
-        const bool ok = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
-        const uintptr_t lo = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-        if (nr < 16) regions[nr++] = {lo, lo + mbi.RegionSize, ok};
-        return ok && p + n <= lo + mbi.RegionSize;
+    // Readability by fault-recovering reads of each range's first and last dword (rc25 save audit): the per-walk
+    // VirtualQuery cache held 16 regions and stopped growing, so every list node outside them asked VirtualQuery
+    // (~3-20 us each in this process: the call walks the page table of its multi-MB region), 0.9 ms of a save on a
+    // prop-heavy stage (699 cells). The ranges (0xCC-byte objects, 12-byte nodes) are GMalloc blocks, so "first and last
+    // dword readable" is "committed and accessible" as before; FixDangling below reads them the same way.
+    // Without the crash handler SafeR falls back to MemQuery (VirtualQuery) as before.
+    auto Readable = [](uintptr_t p, size_t n) {
+        uint32_t v = 0;
+        return p >= 0x10000 && SafeR((uint32_t)p, v) && SafeR((uint32_t)((p + n - 1) & ~uintptr_t(3)), v);
     };
     EnterCriticalSection(&gLock);
     for (auto it = gInstances.begin(); it != gInstances.end();) {

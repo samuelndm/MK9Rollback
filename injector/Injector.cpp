@@ -5,6 +5,10 @@
 // Attaches to a running MKKE.exe, verifies its on-disk SHA-256 matches the
 // pinned build, then LoadLibraryW's the DLL (or calls its MK9R_Unload export).
 // Nothing is written to the game directory.
+// Exit codes (the Play Online window, tools\launcher_lib.ps1 Get-InjectorResult, maps them to player messages):
+//   0 done, 1 other failure (game not running, ...), 2 unknown MKKE.exe build, 3 MK9Rollback.dll missing,
+//   4 OpenProcess access denied (the game runs elevated), 5 LoadLibraryW returned NULL, 6 already loaded,
+//   7 the remote thread did not finish within 15 s.
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -18,6 +22,17 @@
 namespace {
 constexpr const char* kExpectedSha256 = "D1C71E086DEAC26716E48F060E486679A36DDD4002AB5080D66DF9D11437D0E6";
 constexpr const wchar_t* kDllName = L"MK9Rollback.dll";
+enum ExitCode : int {
+    kExitOk = 0,
+    kExitFailed = 1,
+    kExitUnknownBuild = 2,
+    kExitDllMissing = 3,
+    kExitAccessDenied = 4,
+    kExitLoadFailed = 5,
+    kExitAlreadyLoaded = 6,
+    kExitTimeout = 7,
+};
+enum class RemoteResult { kFailed, kDone, kTimeout };
 
 DWORD FindProcess(const wchar_t* exe) {
     DWORD pid = 0, count = 0;
@@ -52,12 +67,13 @@ uintptr_t FindRemoteModule(DWORD pid, const wchar_t* name) {
     return base;
 }
 
-bool VerifyTarget(HANDLE process) {
+// kExitOk, or why the target is refused (kExitUnknownBuild / kExitFailed).
+int VerifyTarget(HANDLE process) {
     wchar_t path[MAX_PATH];
     DWORD n = MAX_PATH;
     if (!QueryFullProcessImageNameW(process, 0, path, &n)) {
         fprintf(stderr, "QueryFullProcessImageName failed (%lu)\n", GetLastError());
-        return false;
+        return kExitFailed;
     }
     BOOL wow64 = FALSE;
     IsWow64Process(process, &wow64);
@@ -65,53 +81,85 @@ bool VerifyTarget(HANDLE process) {
     printf("Target: %ls\nSHA256: %s\nWOW64 (32-bit): %s\n", path, sha.c_str(), wow64 ? "yes" : "no");
     if (sha != kExpectedSha256) {
         fprintf(stderr, "Unknown MKKE.exe build (expected %s). Refusing.\n", kExpectedSha256);
-        return false;
+        return kExitUnknownBuild;
     }
-    return true;
+    return kExitOk;
 }
 
-bool RunRemote(HANDLE process, LPTHREAD_START_ROUTINE fn, void* arg, DWORD* exitCode) {
+// kDone only when the thread finished within 15 s; then *exitCode is its return value. On kTimeout the thread may
+// still be running and reading its argument: the caller must not free that memory.
+RemoteResult RunRemote(HANDLE process, LPTHREAD_START_ROUTINE fn, void* arg, DWORD* exitCode) {
     HANDLE t = CreateRemoteThread(process, nullptr, 0, fn, arg, 0, nullptr);
     if (!t) {
         fprintf(stderr, "CreateRemoteThread failed (%lu)\n", GetLastError());
-        return false;
+        return RemoteResult::kFailed;
     }
-    WaitForSingleObject(t, 15000);
-    GetExitCodeThread(t, exitCode);
+    const DWORD wait = WaitForSingleObject(t, 15000);
+    if (wait != WAIT_OBJECT_0) {
+        fprintf(stderr, "The remote thread did not finish within 15 s (wait result %lu)\n", wait);
+        CloseHandle(t);
+        return RemoteResult::kTimeout;
+    }
+    const BOOL got = GetExitCodeThread(t, exitCode);
     CloseHandle(t);
-    return true;
+    if (!got) {
+        fprintf(stderr, "GetExitCodeThread failed (%lu)\n", GetLastError());
+        return RemoteResult::kFailed;
+    }
+    return RemoteResult::kDone;
 }
 
-int Inject(DWORD pid, const std::wstring& dllPath) {
-    if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        fprintf(stderr, "DLL not found: %ls\n", dllPath.c_str());
-        return 1;
-    }
-    if (FindRemoteModule(pid, kDllName)) {
-        fprintf(stderr, "MK9Rollback.dll is already loaded; run 'unload' first.\n");
-        return 1;
-    }
+HANDLE OpenTarget(DWORD pid, int* rc) {
     HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
                                      PROCESS_VM_WRITE | PROCESS_VM_READ,
                                  FALSE, pid);
     if (!process) {
-        fprintf(stderr, "OpenProcess failed (%lu)\n", GetLastError());
-        return 1;
+        const DWORD err = GetLastError();
+        fprintf(stderr, "OpenProcess failed (%lu)%s\n", err,
+                err == ERROR_ACCESS_DENIED ? ": access denied (is the game running as administrator?)" : "");
+        *rc = err == ERROR_ACCESS_DENIED ? kExitAccessDenied : kExitFailed;
     }
-    int rc = 1;
-    if (VerifyTarget(process)) {
+    return process;
+}
+
+int Inject(DWORD pid, const std::wstring& dllPath) {
+    if (FindRemoteModule(pid, kDllName)) {
+        fprintf(stderr, "MK9Rollback.dll is already loaded; run 'unload' first.\n");
+        return kExitAlreadyLoaded;
+    }
+    int rc = kExitFailed;
+    HANDLE process = OpenTarget(pid, &rc);
+    if (!process) return rc;
+    rc = VerifyTarget(process);
+    if (rc == kExitOk) {
+        rc = kExitFailed;
         const size_t bytes = (dllPath.size() + 1) * sizeof(wchar_t);
         void* remote = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         DWORD code = 0;
-        if (remote && WriteProcessMemory(process, remote, dllPath.c_str(), bytes, nullptr) &&
-            RunRemote(process,
-                      reinterpret_cast<LPTHREAD_START_ROUTINE>(
-                          GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW")),
-                      remote, &code)) {
-            printf(code ? "Injected: module handle 0x%08lX\n" : "LoadLibraryW returned NULL\n", code);
-            rc = code ? 0 : 1;
+        RemoteResult run = RemoteResult::kFailed;
+        if (!remote) {
+            fprintf(stderr, "VirtualAllocEx failed (%lu)\n", GetLastError());
+        } else if (!WriteProcessMemory(process, remote, dllPath.c_str(), bytes, nullptr)) {
+            fprintf(stderr, "WriteProcessMemory failed (%lu)\n", GetLastError());
+        } else {
+            run = RunRemote(process,
+                            reinterpret_cast<LPTHREAD_START_ROUTINE>(
+                                GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW")),
+                            remote, &code);
         }
-        if (remote) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        if (run == RemoteResult::kDone) {
+            if (code) {
+                printf("Injected: module handle 0x%08lX\n", code);
+                rc = kExitOk;
+            } else {
+                fprintf(stderr, "LoadLibraryW returned NULL\n");
+                rc = kExitLoadFailed;
+            }
+        } else if (run == RemoteResult::kTimeout) {
+            rc = kExitTimeout;
+        }
+        // A thread still running LoadLibraryW reads the path from this memory: it is left allocated (a few bytes).
+        if (remote && run != RemoteResult::kTimeout) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
     }
     CloseHandle(process);
     return rc;
@@ -136,27 +184,25 @@ int Unload(DWORD pid, const std::wstring& dllPath) {
         fprintf(stderr, "MK9R_Unload export not found.\n");
         return 1;
     }
-    HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
-                                     PROCESS_VM_WRITE | PROCESS_VM_READ,
-                                 FALSE, pid);
-    if (!process) {
-        fprintf(stderr, "OpenProcess failed (%lu)\n", GetLastError());
-        return 1;
-    }
+    int rc = kExitFailed;
+    HANDLE process = OpenTarget(pid, &rc);
+    if (!process) return rc;
     DWORD code = 0;
-    const bool ok = RunRemote(process, reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteBase + rva), nullptr, &code);
+    const RemoteResult run = RunRemote(process, reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteBase + rva), nullptr, &code);
     CloseHandle(process);
+    if (run == RemoteResult::kTimeout) return kExitTimeout;
+    const bool ok = run == RemoteResult::kDone;
     Sleep(200);
     const bool gone = FindRemoteModule(pid, kDllName) == 0;
     printf("Unload %s; module %s\n", ok ? "requested" : "failed", gone ? "unloaded" : "STILL LOADED");
-    return ok && gone ? 0 : 1;
+    return ok && gone ? kExitOk : kExitFailed;
 }
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
     if (sizeof(void*) != 4) {
         fprintf(stderr, "Build this injector as x86.\n");
-        return 1;
+        return kExitFailed;
     }
     const std::wstring cmd = argc > 1 ? argv[1] : L"status";
 
@@ -169,12 +215,17 @@ int wmain(int argc, wchar_t** argv) {
         GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);
         dll = full;
     }
+    // Checked before looking for the game: a DLL removed by an antivirus is reported as such even without the game.
+    if (cmd == L"inject" && GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "DLL not found: %ls\n", dll.c_str());
+        return kExitDllMissing;
+    }
 
     // Optional third argument: the PID of one MKKE.exe (two-instance tests); its image is still hash-verified.
     const DWORD pid = argc > 3 ? (DWORD)wcstoul(argv[3], nullptr, 10) : FindProcess(L"MKKE.exe");
     if (!pid) {
         fprintf(stderr, "MKKE.exe is not running.\n");
-        return 1;
+        return kExitFailed;
     }
     printf("MKKE.exe pid %lu\n", pid);
 

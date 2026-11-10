@@ -10,20 +10,44 @@ players run the mod, and leaves every other match (and Ranked) to the game's own
 2. Double-click **Play Online.bat**. (If Windows says it protected your PC: "More info", then "Run anyway".)
 3. Press **Play**. The window starts the game with the mod.
 4. In the game: Online > Player Match, a 1 vs 1 room. Against another player who started the game the same way,
-   rollback takes over at the fight start (the top left of the screen shows ROLLBACK, the ping and the input delay).
+   rollback takes over at the fight start (the top left of the screen shows ROLLBACK, the ping, the input delay and a
+   three-bar connection marker: green is good, yellow so-so, red bad). F9 shows or hides the network details; the
+   window's "Network display" box picks Compact, Detailed or Off.
 
 Both players need the same version. The Play Online window checks for a new release when it opens; press
-**Update now** (with the game closed) to install it. If something goes wrong, press "Save logs to the Desktop" and
-attach the zip to an issue, from both players.
+**Update now** (with the game closed) to install it; **Go back to the previous version** undoes the last update. If
+something goes wrong, press "Save logs to the Desktop" and attach the zip to an issue, from both players (send yours
+together with your opponent's). The zip replaces Steam IDs, IP addresses and your Windows user and PC names first;
+PRIVACY.txt inside it lists what was replaced.
+
+### Having trouble?
+
+The window has a "Having trouble?" button with the same list:
+
+- Allow MKKE.exe through the Windows firewall (Windows Security > Firewall > Allow an app).
+- Add the MK9 Rollback folder to your antivirus exclusions.
+- Run the game from an SSD, and turn off disk sleep.
+- On a laptop: plug it in and set the Windows power mode to "Best performance".
+- Close browsers and other heavy apps (downloads, streaming, launchers).
+- Use a wired (Ethernet) connection instead of Wi-Fi.
+- Both players need the same version ("Check for updates" at the bottom of the window).
+- In a fight, F9 shows or hides the network details.
 
 ## What it does
 
-- Rollback with GGPO, input delay picked from the ping (2 frames at a normal ping, up to 6) and adjusted between rounds.
+- Rollback with GGPO, input delay picked from the ping (1 frame up to a 50 ms ping, 2 at a normal one, up to 6) and
+  adjusted between rounds; a PC too slow for the extra replays of 1 frame moves to 2 by itself. The launcher can fix it
+  at 0-3 frames instead (the larger choice of the two players is used).
 - Whole-game snapshots each frame (fighters, effects, stage cinematics, script state) restored on a misprediction.
 - Checks against desyncs: per-frame gameplay checksums compared with the other player, a build/content fingerprint at
   the session start.
 - Smoothing for real connections: frame-advantage balancing, a short hold after a network stall so both games come out
   level, fast input resend after packet loss, X-ray starts run on confirmed inputs.
+- Frame-timing alignment: the two games line up their frame timing to within a fraction of a frame, so on a short link
+  each input arrives before the other game needs it and neither side has to roll back (about 90% fewer rollbacks at
+  1 frame of delay on a ~25 ms link in the two-game tests).
+- Low latency on the game's side: the controllers are read after the game's frame wait, the input is sent the moment
+  it is read, and no snapshot is taken of a frame whose remote input has already arrived.
 - "Safe mode": delay-based lockstep instead of rollback.
 
 ## Build

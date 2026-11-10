@@ -38,14 +38,27 @@ void SetTickSpin(int ms);        // 'tickspin N' (test): N ms of busy CPU per li
 void SetXrayLock(int on, int cine, int window, int freeze);
 void SetStallHold(int minMs, int maxMs);  // 'stallhold 0' off; 'stallhold MIN MAX' (default 60 150): even the games after a stall
 void SetFreeze(int ms, int everyMs);      // 'freezeevery MS EVERY' (test): this game stops MS ms every EVERY ms in a P2P session
+void SetDesyncStop(int frames);  // 'desyncstop N': an online match's session stops after N differing checksum frames in a row (default 120, 0 never)
+void SetHandshakePoll(bool on);  // 'handshakepoll 0|1': the paused wait for a session polls GGPO every millisecond (default 1)
+void SetPhaseGrowAfter(int decisions);  // 'phasegrow N': the phase search's step grows from decision N+1 in a row with one leader (default 2; 1 = rc27)
+void SetWaitShift(bool on);      // 'waitshift 0|1': a boundary that waited for the peer moves the frame deadline by the wait (default 1)
 void SetStartBarrier(bool on);   // 'startbarrier 0|1': rollback frame 0 waits for the peer's first input (default 1)
+void SetEarlyInput(bool on);     // 'earlyinput 0|1': P2P local input added and sent at the boundary's start (default 1)
+void SetLateSample(bool on);     // 'latesample 0|1': P2P controllers sampled at the boundary, after MK9's frame wait (default 1)
+void SetSkipLive(bool on);       // 'skiplive 0|1': no live save for a frame whose remote input is already in (default 1)
 void SetCanonClock(bool on);     // 'canonclock 0|1': world clocks set to the same value at the netplay start (default 0)
 void SetBalance(bool on);        // 'balance 0|1': frame-advantage balancing on top of GGPO's time sync (default 1)
 void SetBalanceTuning(int settleFrames, int samples, int maxGive);  // 'balancecfg S N G' (default 24 4 3)
 void SetQualityInterval(int ms); // 'qualityms N': GGPO quality report period (default 200 ms, stock 1000)
 void SetRunningRetry(int ms);    // 'netretry N': unacked inputs resent after N ms without a new peer frame (default 34, stock 200)
+void SetFirstInputRetry(int ms); // 'firstretry N': until the peer's first input arrives, inputs resent every N+1 ms (default 3, 0 = off)
 void SetRenderLate(int pct);     // 'renderlate N': a frame starting > N% of a period late is not rendered (default 50, stock 5)
 void SetPaySmooth(int ms);       // 'paysmooth N': time-sync debt paid by moving the frame limiter deadline N ms/frame (default 2; 0: waits)
+void SetPaySmoothSmall(int ms);  // 'paysmooth N S': debts of up to 2 frames paid S ms/frame (default 1; 0: as larger ones)
+void SetGgpoTimesync(bool on);   // 'ggposync 0|1': pay GGPO's own time-sync requests although BALANCE is on (default 0 since rc25)
+void SetRepoll(bool on);         // 'repoll 0|1': one more poll after a live save made before the frame's remote input (default 1)
+void SetPhaseSync(bool on);      // 'phasesync 0|1': sub-frame phase alignment with the other game (default 1)
+void SetFastReadable(bool on);   // 'fastreadable 0|1': readability checks by guarded reads instead of VirtualQuery (default 1)
 void SetQuarantineMargin(int frames);  // 'qmargin N': frees kept N frames beyond the snapshot ring (default 8)
 void SetTickParity(bool on);
 void SetDeferOnlyGgpo(bool on);

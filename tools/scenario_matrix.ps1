@@ -38,7 +38,13 @@ function Scenarios {
     if ($Set -in 'stages', 'all') {
         $st = if ($StageList.Count) { $StageList } else { StagesFromLogs }
         if (-not $st.Count) { Write-Host 'no stage list: run a scenario first (its log has the STAGES line) or pass -StageList'; }
-        else { $all += @{ Name = 'stages_ns30_d2'; NetSim = 30; Delay = 2; Stages = $st } }
+        else {
+            $all += @{ Name = 'stages_ns30_d2'; NetSim = 30; Delay = 2; Stages = $st }
+            # rc22 (2026-11-09): every stage at the delay the online mode now picks below a 55 ms round trip, with the
+            # scripted combos: the field link (ns15) and a slower one (ns30).
+            $all += @{ Name = 'stages_ns15_d1_combo'; NetSim = 15; Delay = 1; Combo = $true; Stages = $st }
+            $all += @{ Name = 'stages_ns30_d1_combo'; NetSim = 30; Delay = 1; Combo = $true; Stages = $st }
+        }
     }
     if ($Set -in 'network', 'all') {
         $all += @{ Name = 'lan_d1'; NetSim = 0; Delay = 1; Stages = $NetStages }
@@ -99,6 +105,29 @@ function Scenarios {
         # the hold's threshold in about half the drops, and B then rolled back up to 8 frames after them.
         $all += @{ Name = 'ns30_d2_dropB_hold60'; NetSim = 30; Delay = 2; Combo = $true; SetupB = @('netsim 30 0 0 300 10000 1'); Setup = @('stallhold 60 150'); Stages = $NetStages }
         $all += @{ Name = 'ns30_d2_dropB400_hold60'; NetSim = 30; Delay = 2; Combo = $true; SetupB = @('netsim 30 0 0 400 10000 1'); Setup = @('stallhold 60 150'); Stages = $NetStages }
+    }
+    if ($Set -in 'delay') {
+        # 2026-11-08 field test (round trip 33-50 ms, delay 2 all night): the player still felt the 2 frames. Delay 1 at
+        # that link against delay 2: rollbacks, frame times, desyncs. ns15: a round trip of about 20-30 ms.
+        $all += @{ Name = 'ns30_d2_combo'; NetSim = 30; Delay = 2; Combo = $true; Stages = $NetStages }
+        $all += @{ Name = 'ns30_d1_combo'; NetSim = 30; Delay = 1; Combo = $true; Stages = $NetStages }
+        $all += @{ Name = 'ns15_d1_combo'; NetSim = 15; Delay = 1; Combo = $true; Stages = $NetStages }
+        $all += @{ Name = 'ns30_d1_spinB6_combo'; NetSim = 30; Delay = 1; Combo = $true; TickSpinB = 6; Stages = $NetStages }
+        $all += @{ Name = 'ns30_d2_spinB6_combo'; NetSim = 30; Delay = 2; Combo = $true; TickSpinB = 6; Stages = $NetStages }
+        # Render queue (GPUQUEUE lines): the game's own D3D9Ex frame latency against a cap of 1 ('framelatency 1').
+        $all += @{ Name = 'ns15_d1_combo_fl1'; NetSim = 15; Delay = 1; Combo = $true; Setup = @('framelatency 1'); Stages = $NetStages }
+        # Street Fighter 6 adds no delay below a 100 ms ping (Infil's SF6 review): delay 0 at the field link.
+        $all += @{ Name = 'ns15_d0_combo'; NetSim = 15; Delay = 0; Combo = $true; Stages = $NetStages }
+        # rc21's early send and late sampling off: the same build as before them.
+        $all += @{ Name = 'ns15_d1_combo_old'; NetSim = 15; Delay = 1; Combo = $true; Setup = @('earlyinput 0', 'latesample 0'); Stages = $NetStages }
+        $all += @{ Name = 'ns30_d1_spinB3_combo'; NetSim = 30; Delay = 1; Combo = $true; TickSpinB = 3; Stages = $NetStages }
+        # rc23: the saves' and loads' big copies and the load's requeue scan on helper threads; 'memthreads 0' is rc22's
+        # single-threaded passes in the same build.
+        $all += @{ Name = 'ns15_d1_combo_mt0'; NetSim = 15; Delay = 1; Combo = $true; Setup = @('memthreads 0'); Stages = $NetStages }
+        $all += @{ Name = 'ns15_d0_combo_mt0'; NetSim = 15; Delay = 0; Combo = $true; Setup = @('memthreads 0'); Stages = $NetStages }
+        # The friend's PC had ~230 MB of the game outside its working set; B's emptied every 2 s (pointer targets then
+        # off the working set are kept live unread, 'coldcheck'): desyncs and crashes against the plain run.
+        $all += @{ Name = 'ns30_d2_trimB_combo'; NetSim = 30; Delay = 2; Combo = $true; SetupB = @('trimws 2000'); Stages = $NetStages }
     }
     if ($Set -in 'cpu', 'all') {
         $all += @{ Name = 'ns30_d2_spinB6'; NetSim = 30; Delay = 2; TickSpinB = 6; Stages = $NetStages }
