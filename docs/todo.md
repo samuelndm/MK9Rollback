@@ -1814,7 +1814,8 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       finisher 17, codewrite 26, strappend 11, guardpage 11, GGPO 15 cases + 12 in-process checks + the churn and
       relay runs, logger (passed in 2 of 3 runs: see "found, not fixed"); launcher selftest 86 of 86. **The gate
       and a Safe-mode regression passed, and it is released as v20261112-0150 (this entry's last bullets). Still to
-      come: a two-PC evening. The source is not committed.**
+      come: a two-PC evening. Source: commit 8307b87, pushed the same day on the player's word (the release tag sits on the
+      commit before it).**
       - Fixed in the DLL:
         - **Arming froze the game thread ~3 s at every launch.** Each of the 56 code patches suspended the other
           threads through a system-wide Toolhelp snapshot (32 ms a pass here, ~50 ms in the field: the "HANG? game thread
