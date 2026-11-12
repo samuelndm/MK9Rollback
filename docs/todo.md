@@ -1979,7 +1979,7 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       tree as it stood at 01:41, which also holds the code audit's fixes above (checked at 01:46: no source file is
       newer than the DLL, and the HUD display is not in it: that had left the tree for `..\MK9Rollback_hud` by 01:37
       and came back at 08:38, after this build). Not in rc30 (DB95DB0C). Part of rc31 (bullet below), which passed
-      the gate and was published 2026-11-12 as v20261112-1043. Not played on two PCs, not committed.**
+      the gate and was published 2026-11-12 as v20261112-1043; source in bd00397. Not played on two PCs.**
       - The finding (both players' logs of the 2026-11-11 evening, session 3, 14 starts): 159 of the friend's 279
         rollbacks fell into the first ~10 s of six matches. In those six the player's game, waiting at the start
         barrier, took the one-way trip as 5.2-5.7 ms (the handshake had read the wire's own round trip, 27-28 ms, and a
@@ -2041,8 +2041,10 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         1043.zip` (SHA-256 45446044..., its files scanned: nothing personal). `build\clang` / `clang2` hold rc31;
         rc30's binaries are in `build\clang_rc30`. Published 2026-11-12 11:47 as v20261112-1043 (user: "Yes,
         publish"): Latest, and the zip downloaded back from GitHub has the gated zip's SHA-256. The release tag sits
-        on f1dfa52 (the rc30 source): rc31's own part of the source, this start alignment and the HUD display, is
-        not committed. rc31 does not start a rollback session against rc30, so both players update.**
+        on f1dfa52 (the rc30 source); rc31's own part of the source, this start alignment and the HUD display, is
+        the next commit, bd00397 (user: "Yes, push source"; a build of it with the release's GGPO library equals the
+        released DLL and injector in every code and data section). rc31 does not start a rollback session against
+        rc30, so both players update.**
         - The start alignment in the gate's 9 starts (delay 0, no netsim, game B on one core at low priority): both
           games decided in every start, none without timing, no rc29 estimate used; B moved 5.4-39.9 ms each time
           (in one start B had not waited at all and was simply behind its own frame grid).
@@ -2060,7 +2062,7 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       - Still to do: a two-PC evening on the published rc31 (the friend's rollbacks in each match's first 10 s were
         57% of that evening's): one STARTSYNC line per game and start with the measured one-way trip, whether a
         BALANCE give still follows a start when one PC is the slower one, and how the HUD display looks in a real
-        online match. And the user's word on committing rc31's source.
+        online match.
       - The audit's other findings, by gain for the risk (none started): the player's 147-238 ms stalls at round ends
         (lead: the overlay's draw time, 199 ms in the interval of one stall; rc29's stall sampler should name it);
         the display path (both PCs fullscreen with vertical sync on, the DISPLAY note never shown by the launcher);
