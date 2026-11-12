@@ -1,5 +1,5 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,codewrite,strappend,guardpage,hud,ggpo,logger] [-Seconds 25]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,codewrite,strappend,guardpage,hud,ggpo,logger] [-Seconds 25]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
 #   finisher  src\net\FinisherRule.h: the frame where a session is handed back to MK9's netcode in the finisher phase;
@@ -7,6 +7,9 @@
 #   startsync  src\net\StartSync.h: the start alignment of a session's two games; two simulated games that reach frame 0
 #           at different moments exchange their timing over simulated links (trips of 0.1-80 ms, jitter, loss, the
 #           harness's loopback channel) and must end with their frame grids together, only the earlier game moving.
+#   flow    src\net\FlowDecode.h: the text of the stage / rematch trace lines (ONLINEFLOW, ONLINEMSG): message 9
+#           "GameSettings" and message 10 "ReadyState" decoded from their bytes (a player's name never reaches the
+#           text), the traced script natives, which calls of a polled native get a line, every text bounded.
 #   codewrite  src\hook\CodePatch + src\common\ThreadWalk.h: code patched while 48 threads run (all suspended for a write
 #           and running after it, a write under a running thread refused), and 56 writes (what arming makes in one game
 #           frame) inside half a second. The program is not called "codepatch": Windows takes a 32-bit program with
@@ -30,10 +33,10 @@
 #           lines early, for the report of dropped lines.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'startsync', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'), [int]$Seconds = 25)
+      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'), [int]$Seconds = 25)
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'startsync', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'
+$known = 'hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -106,6 +109,11 @@ function RunSmall([string]$name, [string]$title, [string[]]$sources, [string[]]$
     $lines = @(Get-Content $log)
     $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm|^largest frame' } | ForEach-Object { Write-Host "  $_" }
     return $p.ExitCode -eq 0 -and ($lines -contains 'ALL CHECKS PASSED')
+}
+
+if ($Only -contains 'flow') {
+    $ok = RunSmall 'flow_test' 'stage / rematch trace text' @((Join-Path $PSScriptRoot 'flow_test.cpp')) @('-I', (Join-Path $root 'src\net')) 30
+    if (-not $ok) { $failed += 'flow' }
 }
 
 if ($Only -contains 'codewrite') {

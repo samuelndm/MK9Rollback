@@ -34,5 +34,11 @@ void OnFightStart();  // restarts the attract pick index (combat start)
 void ForceStage(int index);
 void SetPickVariety(uint32_t v);  // 'pickvariety N': other attract fighters for the same scriptseed
 void LogStages();  // 'stages': the table's entries (index, name, selectable flag, attract exclusion)
+// Read-only looks at the stage table for trace lines (FlowTrace): its number of entries; the name of entry 'index'
+// (the game's own text, null when there is no such entry or it cannot be read); the entry whose name is 'name', letter
+// case ignored (-1: none).
+uint32_t StageCount();
+const char* StageAt(uint32_t index);
+int StageIndex(const char* name);
 
 }  // namespace ScriptRng

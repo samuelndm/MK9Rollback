@@ -296,6 +296,17 @@ void LogStages() {
     Logger::Info("%s", line);
 }
 
+uint32_t StageCount() { return *reinterpret_cast<const uint32_t*>(0x00E92350); }
+const char* StageAt(uint32_t index) { return StageName(index, nullptr); }
+int StageIndex(const char* name) {
+    const uint32_t n = StageCount();
+    for (uint32_t i = 0; name && i < n && i < 256; ++i) {
+        const char* s = StageName(i, nullptr);
+        if (s && !_strnicmp(s, name, 64)) return (int)i;
+    }
+    return -1;
+}
+
 void SetAttractSeed(uint32_t seed) {
     static bool hooked = false;
     if (seed && !hooked) {

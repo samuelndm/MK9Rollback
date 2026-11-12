@@ -17,6 +17,8 @@
 #include "../hook/ObjectHooks.h"
 #include "../hook/GameLoopHook.h"
 #include "../debug/Ue3Names.h"
+#include "../net/FlowDecode.h"
+#include "../net/FlowTrace.h"
 #include "../net/OnlineMode.h"
 #include "RollbackManager.h"
 #include "Snapshot.h"
@@ -173,6 +175,13 @@ constexpr uint16_t kFlowNatives[] = {1144, 1173, 1174, 1175, 1176, 1177, 1178, 1
 uint32_t gFlowCalls[kOnlineNativeCount];
 bool FlowNative(uint16_t id) { return std::binary_search(std::begin(kFlowNatives), std::end(kFlowNatives), id); }
 void NoteOnlineNative(uint32_t fn, uint32_t exec) {
+    // The players and the stage a script sets (natives 670-672: 0x008BB510, 0x008BB530, 0x008BB550) do not reach the
+    // online engine and are not in the table; in an online one-on-one match the stage and rematch trace (FlowTrace,
+    // docs\feature_parity_plan.md row G2) logs their live calls with their values. Elsewhere it does nothing.
+    if (fn - 0x008BB510u <= 0x40u && !Rollback::gIsResimulating) {
+        const uint32_t id = fn == 0x008BB510 ? 670 : fn == 0x008BB530 ? 671 : fn == 0x008BB550 ? 672 : 0;
+        if (id) FlowTrace::OnNative(id, fn, exec, (uint32_t)gCurGf, 0);
+    }
     size_t lo = 0, hi = kOnlineNativeCount;
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
@@ -186,12 +195,18 @@ void NoteOnlineNative(uint32_t fn, uint32_t exec) {
     if (kOnlineNatives[lo].id == 1182 && !replay) Online::OnLoadedNative();
     if (!replay && FlowNative(kOnlineNatives[lo].id)) {
         const uint32_t n = ++gFlowCalls[lo];
+        gOnlineSeen[lo] = true;
+        // 1178, 1179 and 1375 in an online one-on-one match: FlowTrace writes the line, with the call's values (the same
+        // counted calls, and also a call whose values changed). Outside such a match it does nothing and says so.
+        if (FlowDecode::Traced(kOnlineNatives[lo].id) && FlowTrace::OnNative(kOnlineNatives[lo].id, fn, exec, (uint32_t)gCurGf, n)) return;
         if (n <= 3 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000)
             Logger::Info("ONLINEFLOW id %u native %08X call #%u of this timeline at gf %u (%s)", kOnlineNatives[lo].id, fn, n,
                          (uint32_t)gCurGf, Rollback::GgpoActive() ? "in a GGPO session" : "no session");
-        gOnlineSeen[lo] = true;
         return;
     }
+    // BeginSyncWait (1259) and the scripts' message sends (1224-1227): their live calls with their values, in an online
+    // one-on-one match (FlowTrace); the first-call line below stays as it was.
+    if (!replay && FlowDecode::Traced(kOnlineNatives[lo].id)) FlowTrace::OnNative(kOnlineNatives[lo].id, fn, exec, (uint32_t)gCurGf, 0);
     // StartSendingGamepadData (1172) zeroes GameFrame online: every call (up to 20) tells whether fight scripts reach it
     // once per fight or once per round, even offline where 0x0081C080 finds no online engine and does nothing.
     static int startCalls = 0;
@@ -691,6 +706,7 @@ bool Install() {
     memcpy(j + 1, &rel, 4);
     if (!CodePatch::Write(0x0045C9FF, kDispatchOrig, j, 11, "MKScript native dispatch 0x0045C9FF (trace)"))
         Logger::Info("RNGTRACE: native dispatch trace not installed");
+    FlowTrace::Install();  // the stage and rematch trace's two message taps (logging only; players' games too)
     auto hookRand = [] {
         gMK9R_RandIntTramp = MakeTramp(kRandIntOrig, 5, kRandInt + 5);
         gMK9R_RandFloatTramp = MakeTramp(kRandFloatOrig, 6, kRandFloat + 6);
@@ -834,6 +850,7 @@ const std::vector<uint32_t>& ScriptContexts() {
 }
 void ClearScriptContexts() {
     memset(gFlowCalls, 0, sizeof gFlowCalls);  // ONLINEFLOW counts per timeline
+    FlowTrace::NewTimeline();
     gContexts.clear();
     gContextSeen.clear();
 }

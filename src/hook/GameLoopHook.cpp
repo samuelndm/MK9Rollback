@@ -12,6 +12,7 @@
 #include "../game/Fighter.h"
 #include "../game/Input.h"
 #include "../game/MK9Game.h"
+#include "../net/FlowTrace.h"
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
 #include "../rollback/StateHash.h"
@@ -226,6 +227,7 @@ void __fastcall HkEngineTick(void* engine, void* /*edx*/, float dt) {
                          GameInfoField(MK9Game::kGameInfoGameFrame), gIdleTicks, gSkippedCalls);
             gCombatActive = true;
             Snapshot::LogFight(GameInfoField(MK9Game::kGameInfoGameFrame));
+            FlowTrace::OnFightStart(GameInfoField(MK9Game::kGameInfoGameFrame));  // online one-on-one match: the stage's line
             RngTrace::DumpIdle();
             ScriptRng::OnFightStart();
         }

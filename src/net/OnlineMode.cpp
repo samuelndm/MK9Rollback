@@ -934,6 +934,11 @@ void MatchReset(const char* why) {
 
 namespace Online {
 
+bool OneOnOne() {
+    uint32_t type = 0, matchType = 0;
+    return OneOnOneMatch(&type, &matchType);
+}
+
 bool Install() {
     if (gExchangeTramp && gIdleTramp && gSendTramp) return true;
     if (!gExchangeTramp)

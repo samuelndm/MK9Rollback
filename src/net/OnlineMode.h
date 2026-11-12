@@ -78,5 +78,9 @@ bool LinkRelayed();                      // Steam's P2P connection with the oppo
 // MK9's online connection object (its gamepad data - 0x4C3C) and the size through the end of the gamepad data; 0 when
 // no online fight data was seen.
 uintptr_t ConnectionAddress(uint32_t* size);
+// The game is online in a match this mode would engage in: a one-on-one Player / Private / invited room (the
+// GameContext check of the engagement: type 0, 2 or 3 and match type 0). False offline, in ranked and in King of the
+// Hill. Reads only, any thread; for the trace lines of FlowTrace.
+bool OneOnOne();
 
 }  // namespace Online
