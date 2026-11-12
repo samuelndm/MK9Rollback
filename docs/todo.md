@@ -1761,7 +1761,8 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         the user's name, profile paths and SteamIDs before and after packaging: only the repository name, the SteamID
         base constant and the scrubber's `C:\Users\<user>` text). The player said yes to publishing once the two extra
         checks below passed: published 2026-11-11 22:03 as release v20261111-2115 (Latest; the downloaded asset has
-        the zip's SHA-256). The source of rc29 is not committed.**
+        the zip's SHA-256). Source: commit d918e36, pushed the same evening on the player's word (the release tag
+        sits on the commit before it).**
         - Extra checks before publishing, from `build\clang_rc29` / `build\clang_rc29b` (results\batch_rc29x.txt):
           the Safe-mode regression (lockstep, delay 3): 3 fights, 6 checksum reports, 0 mismatching, 0 crashes, 0 cut
           sessions. The stage sweep `rc29xst` (ns15, delay 1, all 28 stages, 21:23-22:02): 0 crashes, no hang but game
