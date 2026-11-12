@@ -483,7 +483,22 @@ int Where(uint32_t a, char* out, size_t cap) {
     }
     return snprintf(out, cap, " %08X?", a);
 }
-// Copies a suspended thread's context and the top of its stack (up to 1024 dwords).
+// The game's own code or this DLL's (the rest is Windows, Steam, drivers' user-mode parts).
+bool OwnCode(uint32_t a) {
+    if (a >= 0x00401000 && a < 0x00F9C000) return true;
+    static uint32_t base = 0, size = 0;
+    if (!base) {
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery(&gSampler, &m, sizeof m) && m.AllocationBase) {  // any address inside this DLL's image
+            base = (uint32_t)reinterpret_cast<uintptr_t>(m.AllocationBase);
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.AllocationBase);
+            size = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(dos) + dos->e_lfanew)->OptionalHeader.SizeOfImage;
+        }
+    }
+    return base && a - base < size;
+}
+constexpr uint32_t kStackWords = 4096;
+// Copies a suspended thread's context and the top of its stack (up to kStackWords dwords).
 bool Capture(HANDLE t, CONTEXT* c, DWORD* stack, uint32_t* count) {
     *count = 0;
     if (SuspendThread(t) == (DWORD)-1) return false;
@@ -495,7 +510,7 @@ bool Capture(HANDLE t, CONTEXT* c, DWORD* stack, uint32_t* count) {
         if (VirtualQuery(sp, &smbi, sizeof smbi) && smbi.State == MEM_COMMIT) {
             const DWORD* end = reinterpret_cast<const DWORD*>(reinterpret_cast<uintptr_t>(smbi.BaseAddress) + smbi.RegionSize);
             uint32_t n = end > sp ? (uint32_t)(end - sp) : 0;
-            if (n > 1024) n = 1024;
+            if (n > kStackWords) n = kStackWords;
             memcpy(stack, sp, n * 4);
             *count = n;
         }
@@ -504,16 +519,26 @@ bool Capture(HANDLE t, CONTEXT* c, DWORD* stack, uint32_t* count) {
     return got;
 }
 // " eip X; stack R1 R2 ..." (after the resume: the module lookups take the loader lock, which the thread may hold).
-int Describe(const CONTEXT& c, const DWORD* stack, uint32_t count, int maxShown, char* out, int cap) {
+// Return addresses in the game or this DLL and those elsewhere are counted apart: a wait deep inside Windows (the COM
+// call of 2026-11-11: 18 system addresses and no caller of ours) still shows who called it. ".." = others left out.
+int Describe(const CONTEXT& c, const DWORD* stack, uint32_t count, int maxOwn, int maxOther, char* out, int cap) {
     int n = snprintf(out, cap, "eip");
     n += Where((uint32_t)c.Eip, out + n, cap - n);
     n += snprintf(out + n, cap - n, "; stack");
-    int shown = 0;
-    for (uint32_t i = 0; i < count && shown < maxShown && n < cap - 64; ++i) {
+    int own = 0, other = 0;
+    bool gap = false;
+    for (uint32_t i = 0; i < count && own < maxOwn && n < cap - 64; ++i) {
         const uint32_t v = stack[i];
         if (!IsCode(v) || !LooksLikeReturn(v)) continue;
+        const bool ours = OwnCode(v);
+        if (!ours && other >= maxOther) {
+            if (!gap) n += snprintf(out + n, cap - n, " ..");
+            gap = true;
+            continue;
+        }
         n += Where(v, out + n, cap - n);
-        ++shown;
+        ++(ours ? own : other);
+        gap = false;
     }
     return n;
 }
@@ -535,15 +560,15 @@ DWORD WINAPI Sampler(LPVOID) {
     int samples = 0;
     double lastMs = 0;
     uint32_t blackouts = 0;
-    static DWORD stack[1024], rstack[1024];
+    static DWORD stack[kStackWords], rstack[kStackWords];
     for (;;) {
         const LONG th = gStallMs;
         if (!th) {
             Sleep(100);
             continue;
         }
-        // 2 ms steps for test thresholds (< 100 ms), 20 ms for the release's (250 ms): ~50 wakes a second.
-        const int stepMs = th < 100 ? 2 : 20;
+        // 2 ms steps for test thresholds (< 100 ms), 10 ms for the release's (120 ms): ~100 wakes a second.
+        const int stepMs = th < 100 ? 2 : th < 200 ? 10 : 20;
         const int64_t w0 = Now();
         if (timer) {
             LARGE_INTEGER due;
@@ -568,7 +593,7 @@ DWORD WINAPI Sampler(LPVOID) {
             samples = 0;
             lastMs = 0;
         }
-        if (el < th || el > 3000 || samples >= 5 || (samples && el - lastMs < 8)) continue;
+        if (el < th || el > 3000 || samples >= 5 || (samples && el - lastMs < (th < 100 ? 8 : 30))) continue;
         OpenFor(id, &game, &gameId);
         // The render thread too (Graveyard 2026-11-06: the game thread sat in the render-command fence wait 0x006360E0
         // called from the main loop at 0x00402995, so the frame's time was the render thread's).
@@ -586,10 +611,10 @@ DWORD WINAPI Sampler(LPVOID) {
         lastMs = el;
         char line[2600];
         int n = snprintf(line, sizeof line, "STALL gf=%ld +%.1f ms (sample %d): game ", (long)gf, el, samples);
-        n += Describe(c, stack, count, 18, line + n, (int)sizeof line - n);
+        n += Describe(c, stack, count, 18, 12, line + n, (int)sizeof line - n);
         if (rgot && n < (int)sizeof line - 80) {
             n += snprintf(line + n, sizeof line - n, " | render thread %lu ", rid);
-            n += Describe(rc, rstack, rcount, 24, line + n, (int)sizeof line - n);
+            n += Describe(rc, rstack, rcount, 14, 10, line + n, (int)sizeof line - n);
         }
         Logger::Info("%s", line);
     }

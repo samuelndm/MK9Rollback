@@ -54,6 +54,12 @@ bool SkipNative();                       // the native exchange is replaced righ
 int LocalPlayer();                       // 1 or 2: which fighter this game controls in the online fight (0 = unknown)
 bool Engaged();                          // armed through the online mode for the current fight
 void OnSessionStop(const char* why);     // a P2P session ended: idle-timer grace period; a timeline restart re-arms
+// A session frame is about to start, live or replayed, with the game's state as that frame finds it (RollbackManager's
+// NetplayFrameEvents): noted for the finisher phase's hand-back to MK9's netcode (FinisherRule.h).
+void NoteFrameStart(uint32_t gameFrame);
+// Script native 1182 ran live on the game thread: this game finished loading the fight and now waits for the other
+// player's load. In an online match the wait's ticks are held to 60 per second from here (OnlineMode.cpp, kLoadState).
+void OnLoadedNative();
 // A background thread of the online mode is running (unload waits for it): the auto mode's memory pass, the Wi-Fi
 // look, EnvFingerprint's build prints.
 bool ScanRunning();

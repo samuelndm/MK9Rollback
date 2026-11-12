@@ -23,6 +23,7 @@
 #include "../hook/ObjectHooks.h"
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <string>
 #include <cstdio>
@@ -214,8 +215,21 @@ struct ModSection {
 };
 std::vector<ModSection> gModSections;
 uint32_t gForeignKeeps = 0;
+// ForeignVtable's verdict per address: address | 1 (known) | 2 (a vtable). Scans run on several threads.
+std::atomic<uint32_t> gForeignVerdict[1024];
 void BuildModSections() {
-    gModSections.clear();
+    std::vector<ModSection> was;
+    was.swap(gModSections);
+    gModSections.reserve(was.size());
+    // The verdicts hold while the sections are the same ones (this runs every 600 saves for modules that load late).
+    struct Verdicts {
+        const std::vector<ModSection>& was;
+        ~Verdicts() {
+            auto same = [](const ModSection& a, const ModSection& b) { return a.lo == b.lo && a.hi == b.hi && a.mod == b.mod && a.exec == b.exec; };
+            if (was.size() == gModSections.size() && std::equal(was.begin(), was.end(), gModSections.begin(), same)) return;
+            for (std::atomic<uint32_t>& e : gForeignVerdict) e.store(0, std::memory_order_relaxed);
+        }
+    } verdicts{was};
     HMODULE mods[512];
     DWORD need = 0;
     if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need)) return;
@@ -244,16 +258,6 @@ const ModSection* FindSection(uint32_t a) {
     if (it == gModSections.begin()) return nullptr;
     --it;
     return a < it->hi ? &*it : nullptr;
-}
-// A vtable of another module: 4-aligned, in a read-only non-code section, slot 0 in code of the same module.
-bool ForeignVtable(uint32_t first) {
-    if (first & 3) return false;
-    const ModSection* d = FindSection(first);
-    if (!d || d->exec) return false;
-    uint32_t slot0 = 0;
-    if (!CrashLog::SafeRead32(first, &slot0)) return false;
-    const ModSection* c = FindSection(slot0);
-    return c && c->exec && c->mod == d->mod;
 }
 
 // Classify over a byte image of the span (saved copy or live memory).
@@ -312,6 +316,37 @@ struct WsExInfo {
     void* va;
     ULONG_PTR attr;  // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid (in the working set)
 };
+// A vtable of another module: 4-aligned, in a read-only non-code section, slot 0 in code of the same module.
+// The verdict per address is kept (gForeignVerdict), so the module's page is read once and not in every save. On the
+// other player's PC (two-PC match of 2026-11-11, 18:36:48) one frame's live save took 812.8 ms in the SafeRead32 below:
+// the DLL's page had left the working set and came back from that PC's disk, the 0.8 s of the heap targets of
+// 2026-11-08 (above). An address without a verdict whose page is not resident answers "a vtable" unread (kept live, as
+// MarkKeepOrigins does for a cold target), and the warming thread fetches the page for the next saves.
+bool ForeignVtable(uint32_t first) {
+    if (first & 3) return false;
+    std::atomic<uint32_t>& kept = gForeignVerdict[(first * 0x9E3779B1u) >> 22];
+    const uint32_t e = kept.load(std::memory_order_relaxed);
+    if ((e & 1) && (e & ~3u) == first) return (e & 2) != 0;
+    const ModSection* d = FindSection(first);
+    if (!d || d->exec) return false;
+    if (Snapshot::gColdCheck) {
+        WsExInfo ws{reinterpret_cast<void*>(static_cast<uintptr_t>(first)), 0};
+        if (K32QueryWorkingSetEx(GetCurrentProcess(), &ws, sizeof ws) && !(ws.attr & 1)) {
+            thread_local std::vector<uint32_t> page(1);
+            page[0] = first & ~0xFFFu;
+            ++gColdKeeps;
+            ++gWarmQueued;
+            WarmPages(page);
+            return true;
+        }
+    }
+    uint32_t slot0 = 0;
+    if (!CrashLog::SafeRead32(first, &slot0)) return false;
+    const ModSection* c = FindSection(slot0);
+    const bool vtable = c && c->exec && c->mod == d->mod;
+    kept.store(first | 1u | (vtable ? 2u : 0u), std::memory_order_relaxed);
+    return vtable;
+}
 // The scan over a chosen set of origin dwords (rc25, LoadAB's diff-first merge): 'origins' lists dword offsets (ascending,
 // each + 4 <= size), or null for every dword of the span (MarkKeep). A dword o can only be marked by the origins o - 8,
 // o - 4 and o (a TArray triple marks its start and the next two dwords; every other rule marks the origin itself), and
@@ -2225,10 +2260,11 @@ void DescribeHelper(uint32_t owner, uint32_t helper, char* out, size_t n) {
 bool gPadFullLoad = true;  // restore the whole 0x60C AI/remote pad, incl. the ring index at +0x5F8 ('abtest padfull')
 // Hardware pad slot +8 bits 0x1 (a device is attached: the poll 0x00424A60 calls the device in the table 0x00E0E1F0 +
 // slot*0x17C, +0xCC) and 0x20 (its kind) belong to the device manager: set only by the attach 0x00422FC0 (with the
-// device record), cleared only by the release 0x004219D8 (with the device), which also runs after any >300 ms gap
-// between polls (0x00424A89 -> 0x00422E10). The hwpads span restored them with the input state, so a load after a
-// release brought back "attached" over a released device: traced soak 13120 (2026-11-05 01:55), null read at 0x00424B1E
-// (GetDeviceState through a null device), game closed. Kept live; the rest of the record is restored.
+// device record), cleared only by the release 0x004219D8 (with the device), which also runs in the re-detection 300 ms
+// after a WM_DEVICECHANGE (flag 0x00DE9934, 0x00424A89 -> 0x00422E10; Input.cpp, HoldDeviceChange). The hwpads span
+// restored them with the input state, so a load after a release brought back "attached" over a released device: traced
+// soak 13120 (2026-11-05 01:55), null read at 0x00424B1E (GetDeviceState through a null device), game closed. Kept
+// live; the rest of the record is restored.
 bool gPadHwLive = true;
 uint32_t gPadHwKept = 0;
 namespace {

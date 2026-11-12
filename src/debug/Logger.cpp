@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <initializer_list>
 
 // No file I/O on the caller's thread: Info / Frame format on the caller (stack buffer), take a short lock only to append the
 // finished text to an in-memory pending buffer, and return. A below-normal writer thread swaps the pending buffers out and
@@ -21,6 +22,9 @@
 #ifndef MK9R_LOG_FRAME_CAP  // a test may build with a smaller cap
 #define MK9R_LOG_FRAME_CAP (48LL << 20)
 #endif
+#ifndef MK9R_LOG_PENDING_FRAME_CAP  // the same
+#define MK9R_LOG_PENDING_FRAME_CAP (16u << 20)
+#endif
 
 namespace {
 // The frame log grows ~2 MB every few minutes; a long online session would fill the disk and the player's
@@ -28,10 +32,10 @@ namespace {
 constexpr long long kFrameLogCap = MK9R_LOG_FRAME_CAP;
 // Frame-log text waiting for a stalled disk past this is dropped (counted, reported in the main log on recovery).
 // Main-log text is never dropped.
-constexpr size_t kPendingFrameCap = 16u << 20;
+constexpr size_t kPendingFrameCap = MK9R_LOG_PENDING_FRAME_CAP;
 constexpr DWORD kWriterPeriodMs = 100;  // frame-log text reaches the disk at most this long after it was logged
 constexpr size_t kLineStack = 4096;     // longer lines are formatted on the process heap (Info / Frame) or cut (TryInfo)
-constexpr size_t kShrinkAbove = 4u << 20;
+constexpr size_t kBufStart = 64u << 10, kShrinkAbove = 4u << 20;  // a buffer's first size; the writer's shrink back to it
 // Bounds of the crash / exit paths.
 constexpr DWORD kFlushIoMs = 250, kFlushPendMs = 100, kTryInfoPendMs = 200, kTryInfoIoMs = 200;
 
@@ -69,6 +73,9 @@ wchar_t gDir[MAX_PATH] = L"";
 volatile LONG gSeg = 0;
 long long gSegStart = 0;
 size_t gSegDone = 0, gSegLen = 0;
+// gDroppedFrames / gLostMain taken with the pending text, until the main log says them (NoteLosses): kept here, not
+// in a local of the writer, so that a Flush after its death still says them.
+unsigned gNoteDropped = 0, gNoteLost = 0;
 
 using ShutdownFn = BOOLEAN(NTAPI*)();
 ShutdownFn gShutdown = nullptr;  // ntdll's RtlDllShutdownInProgress
@@ -121,7 +128,7 @@ size_t CountNl(const char* p, size_t n) {
 bool Reserve(Buf& b, size_t add, bool mayGrow) {
     if (b.len + add <= b.cap) return true;
     if (!mayGrow) return false;
-    size_t nc = b.cap ? b.cap : (64u << 10);
+    size_t nc = b.cap ? b.cap : kBufStart;
     while (nc < b.len + add) nc *= 2;
     char* np = static_cast<char*>(HeapAlloc(gHeap, 0, nc));
     if (!np) return false;
@@ -160,6 +167,15 @@ bool Append(Buf& b, const Line& l, size_t nls, bool mayGrow = true) {
 void FreeBuf(Buf& b) {  // gPendLock held
     if (b.p) HeapFree(gHeap, 0, b.p);
     b = Buf{};
+}
+
+// gPendLock held; b is empty. A buffer is never left without memory while the log is open: the next swap hands it to
+// the callers, and an Info at process exit, after a thread died holding gPendLock, cannot grow it (Append's mayGrow).
+// 2026-11-11: the host test's exit children lost both lines of their DLL_PROCESS_DETACH about once in 100 exits on a
+// busy PC (a thread killed in the first allocation after a swap: "no memory for the log buffer").
+void Shrink(Buf& b) {
+    FreeBuf(b);
+    Reserve(b, 1, true);
 }
 
 void SetClosed() {
@@ -295,6 +311,41 @@ void WriteOutFrames() {
     }
 }
 
+void Note(const char* fmt, ...) {  // a main-log line straight to the file, after everything written so far
+    Line l;
+    const size_t off = Stamp(l.stack);
+    va_list ap;
+    va_start(ap, fmt);
+    Format(l, off, false, fmt, ap);
+    va_end(ap);
+    if (l.len > kLineStack - 3) l.len = kLineStack - 3;
+    l.stack[l.len] = '\r';
+    l.stack[l.len + 1] = '\n';
+    WriteMain(l.stack, l.len + 2);
+}
+
+// The lines that never reached a file, said in the main log after the text they were taken with. A count is cleared
+// after its line is written (stores ordered as in Reserve): a thread that dies in here leaves it to the next Flush,
+// which may say it twice but not lose it.
+void NoteLosses() {
+    if (gNoteLost) Note("LOGGER: %u main-log line(s) lost: no memory for the log buffer", gNoteLost);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gNoteLost = 0;
+    if (gNoteDropped)
+        Note("LOGGER: %u frame-log line(s) dropped: more than %u MB of frame-log text waited for the disk", gNoteDropped,
+             (unsigned)(kPendingFrameCap >> 20));
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gNoteDropped = 0;
+}
+
+// gPendLock held, or its owner dead: the counts of the pending text go with it.
+void TakeLossCounts() {
+    gNoteDropped += gDroppedFrames;
+    gNoteLost += gLostMain;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gDroppedFrames = gLostMain = 0;
+}
+
 // The writer's buffers after their writer died (gIoLock orphaned): what the in-progress write did not get to the file.
 void RecoverOut() {
     struct {
@@ -319,33 +370,20 @@ void RecoverOut() {
         e.o->len = e.o->done = 0;
     }
     gSeg = 0;
-}
-
-void Note(const char* fmt, ...) {  // a main-log line straight to the file, after everything written so far
-    Line l;
-    const size_t off = Stamp(l.stack);
-    va_list ap;
-    va_start(ap, fmt);
-    Format(l, off, false, fmt, ap);
-    va_end(ap);
-    if (l.len > kLineStack - 3) l.len = kLineStack - 3;
-    l.stack[l.len] = '\r';
-    l.stack[l.len + 1] = '\n';
-    WriteMain(l.stack, l.len + 2);
+    NoteLosses();  // what the dead writer had taken with that text
 }
 
 // gIoLock and gPendLock held; releases gPendLock before writing.
 void SwapAndWrite() {
-    if (gOutMain.cap > kShrinkAbove) FreeBuf(gOutMain);  // after a stall: give the memory back (heap ops need gPendLock)
-    if (gOutFrames.cap > kShrinkAbove) FreeBuf(gOutFrames);
+    if (gOutMain.cap > kShrinkAbove) Shrink(gOutMain);  // after a stall: give the memory back (heap ops need gPendLock)
+    if (gOutFrames.cap > kShrinkAbove) Shrink(gOutFrames);
     Buf t = gPendMain;
     gPendMain = gOutMain;
     gOutMain = t;
     t = gPendFrames;
     gPendFrames = gOutFrames;
     gOutFrames = t;
-    const unsigned dropped = gDroppedFrames, lost = gLostMain;
-    gDroppedFrames = gLostMain = 0;
+    TakeLossCounts();
     LeaveCriticalSection(&gPendLock);
     LARGE_INTEGER t0;
     if (gOutMain.len) {
@@ -360,10 +398,7 @@ void SwapAndWrite() {
         NoteIo(t0);
         gOutFrames.len = gOutFrames.done = 0;
     }
-    if (lost) Note("LOGGER: %u main-log line(s) lost: no memory for the log buffer", lost);
-    if (dropped)
-        Note("LOGGER: %u frame-log line(s) dropped: more than %u MB of frame-log text waited for the disk", dropped,
-             (unsigned)(kPendingFrameCap >> 20));
+    NoteLosses();
 }
 
 // The pending text straight to the files, without gPendLock: its owner is dead, or we hold it.
@@ -373,6 +408,8 @@ void WritePendingDirect() {
     WriteAll(gFramesH, gPendFrames.p, gPendFrames.len);
     gFrameBytes += (long long)gPendFrames.len;
     gPendFrames.len = 0;
+    TakeLossCounts();
+    NoteLosses();
 }
 
 // Everything pending to the disk, now, on this thread. Never waits longer than ioMs + pendMs for a lock (plus the
@@ -488,6 +525,8 @@ bool Open(const wchar_t* directory) {
     if (!gOpen) {
         gMainOn = 0;
         gFramesOn = 0;
+    } else {
+        for (Buf* b : {&gPendMain, &gPendFrames, &gOutMain, &gOutFrames}) Reserve(*b, 1, true);  // see Shrink
     }
     LeaveCriticalSection(&gPendLock);
     LeaveCriticalSection(&gIoLock);

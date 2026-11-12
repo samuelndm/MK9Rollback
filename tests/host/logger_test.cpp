@@ -406,9 +406,14 @@ static int Child(const wchar_t* dir, int n, bool flush, bool paced = false) {
 }
 // ---------------- child: ExitProcess while threads log; Flush in DLL_PROCESS_DETACH (a TLS callback) ----------------
 static volatile LONG gExitChild = 0, gDone[3] = {-1, -1, -1};
+// ExitProcess ends the other threads without waiting for them: one that is running on another processor goes on for a
+// moment. Counted here: the rounds a logging thread began with the process's shutdown flag already set.
+static BOOLEAN(NTAPI* gShutdownFn)() = nullptr;  // ntdll's RtlDllShutdownInProgress
+static volatile LONG gLateRounds = 0;
 static DWORD WINAPI ExitLogger(LPVOID p) {
     const int id = (int)(intptr_t)p;
     for (int i = 0;; ++i) {
+        if (gShutdownFn && gShutdownFn()) InterlockedIncrement(&gLateRounds);
         Logger::Info("EX t%d i%d payload %08X %08X", id, i, i * 3u, i * 5u);
         Logger::Frame("EXF t%d i%d", id, i);
         gDone[id] = i;  // Info line i returned
@@ -426,29 +431,47 @@ static void NTAPI TlsCb(PVOID, DWORD reason, PVOID) {
     if (reason != DLL_PROCESS_DETACH || !gExitChild) return;
     Mark("cb ");
     long long a = Qpc();
-    Logger::Info("DETACH: the other threads are gone; done %ld %ld %ld", gDone[0], gDone[1], gDone[2]);
+    const LONG late = gLateRounds;
+    Logger::Info("DETACH: the other threads are gone; done %ld %ld %ld; rounds begun after the shutdown flag: %ld", gDone[0], gDone[1],
+                 gDone[2], late);
     Mark("info ");
     Logger::Flush();
-    Mark("flush\r\n");
+    Mark("flush ");
     long long b = Qpc();
     Logger::Info("DETACH: Info+Flush took %.0f us", Us(b - a));
     Logger::Flush();
+    char m[40] = "late ", *e = m + 5;  // the same count for a child whose DETACH line is not in the log (no CRT here)
+    char digits[12];
+    int n = 0;
+    for (unsigned long v = (unsigned long)(late < 0 ? 0 : late); n == 0 || v; v /= 10) digits[n++] = (char)('0' + v % 10);
+    while (n) *e++ = digits[--n];
+    *e++ = '\r';
+    *e++ = '\n';
+    *e = 0;
+    Mark(m);
 }
 extern "C" __attribute__((section(".CRT$XLB"), used)) PIMAGE_TLS_CALLBACK gTlsCb = TlsCb;
 static int ChildExit(const wchar_t* dir, int ms) {
     gExitChild = 1;
+    if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+        gShutdownFn = reinterpret_cast<BOOLEAN(NTAPI*)()>(reinterpret_cast<void*>(GetProcAddress(nt, "RtlDllShutdownInProgress")));
     swprintf(gMarkPath, MAX_PATH, L"%ls\\mark.txt", dir);
     Logger::Open(dir);
     for (int t = 0; t < 3; ++t) CreateThread(nullptr, 0, ExitLogger, (LPVOID)(intptr_t)t, 0, nullptr);
     Sleep(ms);
     ExitProcess(9);
 }
+// Frame-log text is dropped, by design, while more of it waits for the disk than the logger's cap (a stalled or starved
+// writer; the main log says how many lines). Children that had such lines, over all rounds.
+static int gDropChildren = 0;
 static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
     printf("== 60 children: 3 threads log flat out, ExitProcess at a random point, Info+Flush in DLL_PROCESS_DETACH ==\n");
-    int ok = 0, gaps = 0, missing = 0, maxUs = 0, lostChildren = 0;
-    long long lines = 0;
+    int ok = 0, gaps = 0, missing = 0, maxUs = 0, lostChildren = 0, dropChildren = 0, lateChildren = 0;
+    long long lines = 0, droppedLines = 0, lateRounds = 0;
+    static int kept = 0;
     for (int k = 0; k < 60; ++k) {
         std::wstring d = Dir(base, L"childexit");
+        DeleteFileW((d + L"\\mark.txt").c_str());
         wchar_t cmd[1024];
         swprintf(cmd, 1024, L"\"%ls\" childexit \"%ls\" %d", exe, d.c_str(), 20 + k * 4);
         STARTUPINFOW si{};
@@ -468,18 +491,26 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
         CloseHandle(pi.hThread);
         int next[3] = {0, 0, 0}, done[3] = {-2, -2, -2};
         bool sawDetach = false;
-        int us = -1, bad = 0;
-        ForEachLine(d + L"\\MK9Rollback.log", [&](const std::string& l) {
+        int us = -1, bad = 0, late = 0;
+        long long dropped = 0;  // frame lines the main log reports as dropped
+        unsigned lostNotes = 0; // main-log lines it reports as lost
+        const int malformed = ForEachLine(d + L"\\MK9Rollback.log", [&](const std::string& l) {
             const char* m = Msg(l);
-            int t, i;
+            int t, i, end = 0;
+            unsigned n;
             if (!m) return (void)++bad;
             if (sscanf(m, "EX t%d i%d", &t, &i) == 2 && t >= 0 && t < 3) {
                 if (i != next[t]) ++bad;
                 next[t] = i + 1;
                 ++lines;
-            } else if (sscanf(m, "DETACH: the other threads are gone; done %d %d %d", &done[0], &done[1], &done[2]) == 3) {
+            } else if (sscanf(m, "DETACH: the other threads are gone; done %d %d %d; rounds begun after the shutdown flag: %d", &done[0],
+                              &done[1], &done[2], &late) >= 3) {
                 sawDetach = true;
             } else if (sscanf(m, "DETACH: Info+Flush took %d us", &us) == 1) {
+            } else if (sscanf(m, "LOGGER: %u frame-log line(s) dropped%n", &n, &end) == 1 && end) {
+                dropped += n;
+            } else if (sscanf(m, "LOGGER: %u main-log line(s) lost%n", &n, &end) == 1 && end) {
+                lostNotes += n;
             } else if (strncmp(m, "LOGGER:", 7)) {
                 ++bad;
             } else if (k < 3 || bad) {
@@ -487,15 +518,31 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
             }
         });
         int fnext[3] = {-1, -1, -1};  // from each thread's first line: the test-sized cap rotates the frame log
+        // Frame lines that are not in the files: skipped numbers inside a thread's lines, and its last completed ones.
+        // Each must be one the main log reports as dropped (the report may count more: lines of a file rotated away,
+        // and a line a thread was killed in).
+        long long absent = 0;
         auto fcheck = [&](const std::string& l) {
             int t, i;
-            if (sscanf(l.c_str(), "EXF t%d i%d", &t, &i) != 2 || t < 0 || t >= 3 || (fnext[t] >= 0 && i != fnext[t]))
+            if (sscanf(l.c_str(), "EXF t%d i%d", &t, &i) != 2 || t < 0 || t >= 3 || (fnext[t] >= 0 && i < fnext[t]))
                 return (void)++bad;
+            if (fnext[t] >= 0) absent += i - fnext[t];
             fnext[t] = i + 1;
         };
         ForEachLine(d + L"\\MK9Rollback_frames.old.log", fcheck);
         ForEachLine(d + L"\\MK9Rollback_frames.log", fcheck);
-        for (int t = 0; t < 3; ++t) bad += sawDetach && fnext[t] <= done[t];
+        for (int t = 0; t < 3; ++t)
+            if (sawDetach && fnext[t] <= done[t]) absent += done[t] + 1 - (fnext[t] < 0 ? 0 : fnext[t]);
+        if (absent > dropped) {
+            printf("  child %d: %lld frame lines are not in the files, the main log reports %lld dropped\n", k, absent, dropped);
+            ++bad;
+        }
+        if (lostNotes) {
+            printf("  child %d: the main log reports %u of its own lines lost\n", k, lostNotes);
+            bad += (int)lostNotes;
+        }
+        dropChildren += dropped > 0;
+        droppedLines += dropped;
         gaps += bad;
         if (!sawDetach) printf("  child %d: no DETACH line, exit code %08lX, main log %d EX lines\n", k, xc, next[0] + next[1] + next[2]);
         missing += !sawDetach;
@@ -503,11 +550,32 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
         int lost = 0;
         for (int t = 0; t < 3; ++t) lost += sawDetach && next[t] <= done[t];
         if (lost && lostChildren++ < 3) printf("  child %d: lines missing: done %d/%d/%d, on disk to %d/%d/%d\n", k, done[0], done[1], done[2], next[0] - 1, next[1] - 1, next[2] - 1);
+        // A line that is not text + CRLF (a NUL inside, a cut last line) is not read above: it counts.
+        if (malformed > 0) {
+            printf("  child %d: %d line(s) of the main log are not text ending in CR LF\n", k, malformed);
+            bad += malformed;
+            gaps += malformed;
+        }
         ok += sawDetach && !bad && !lost;
+        lateChildren += late > 0;
+        lateRounds += late;
+        if ((!sawDetach || bad || lost) && kept < 4) {  // a failed child's files stay, with the marks of its exit
+            wchar_t to[MAX_PATH];
+            swprintf(to, MAX_PATH, L"%ls\\failed%d", base, kept++);
+            CreateDirectoryW(to, nullptr);
+            for (const wchar_t* f : {L"MK9Rollback.log", L"MK9Rollback_frames.log", L"MK9Rollback_frames.old.log", L"mark.txt"})
+                CopyFileW((d + L"\\" + f).c_str(), (std::wstring(to) + L"\\" + f).c_str(), FALSE);
+            printf("  child %d (lived %d ms): files kept in %ls; exit marks: %s\n", k, 20 + k * 4, to,
+                   ReadFile(d + L"\\mark.txt").c_str());
+        }
     }
     CHECK(!gaps && !missing && !lostChildren, "exit children: %d gaps, %d without the detach line, %d lost lines", gaps, missing, lostChildren);
     printf("  %d of 60 exits: every line each thread completed, in order, plus the DETACH line on disk (%lld lines); longest Info+Flush in\n"
            "  DLL_PROCESS_DETACH %d us; children that hung: none if no FAIL above\n", ok, lines, maxUs);
+    printf("  frame-log lines dropped over the cap on text waiting for the disk: %lld in %d of 60 children, every absent line reported\n",
+           droppedLines, dropChildren);
+    printf("  threads still logging after the shutdown flag was set: %lld rounds in %d of 60 children\n", lateRounds, lateChildren);
+    gDropChildren += dropChildren;
 }
 static void PhaseChild(const wchar_t* base, const wchar_t* exe, const wchar_t* mode) {
     const bool flush = !wcscmp(mode, L"child"), paced = !wcscmp(mode, L"childpaced");
@@ -573,8 +641,12 @@ int wmain(int argc, wchar_t** argv) {
 #else
     printf("##### new Logger.cpp #####\n");
 #endif
-    if (argc >= 3 && !wcscmp(argv[2], L"exitonly")) {
-        for (int r = 0; r < 5; ++r) PhaseExit(base, exe);
+    if (argc >= 3 && !wcscmp(argv[2], L"exitonly")) {  // exitonly [rounds] [drops]
+        const int rounds = argc >= 4 ? _wtoi(argv[3]) : 5;
+        for (int r = 0; r < rounds; ++r) PhaseExit(base, exe);
+        // A build with a small MK9R_LOG_PENDING_FRAME_CAP: the drop report itself is under test.
+        if (argc >= 5 && !wcscmp(argv[4], L"drops")) CHECK(gDropChildren > 0, "no child dropped a frame-log line: the drop report was not exercised");
+        printf("%s (%d failures)\n", gFail ? "FAILED" : "ALL CHECKS PASSED", gFail);
         return gFail;
     }
     PhaseFormat(base);

@@ -2423,6 +2423,7 @@ uint32_t gNetplayGf = 100000;  // GameFrame at the netplay start ('netplaygf N',
 float gNetplayMeter = -1.0f, gNetplayLife = -1.0f;  // < 0: off
 constexpr uint32_t kNetplayMeterRel = 8;
 void NetplayFrameEvents(uint32_t F) {
+    if (gGgpo && gGgpoIsP2P) Online::NoteFrameStart(F);  // every frame of a session, as it starts (live or replayed)
     if ((gNetplayMeter < 0 && gNetplayLife < 0) || !gGgpo || !gGgpoIsP2P || !gNetplayGf || F != gNetplayGf + kNetplayMeterRel ||
         Online::Engaged())
         return;
@@ -2930,7 +2931,9 @@ bool GgpoStartP2P(const P2PConfig& c) {
     gBalanceRestart = false;
     gFreezeNext = 0;
     gGgpoIsP2P = true;
-    FramePace::DefaultStallSample(250);  // where a >= 250 ms frame sat, and whether the whole process had stopped
+    // Where a >= 120 ms frame sat, and whether the whole process had stopped. 250 ms until rc28: the 150-230 ms hitches
+    // near each match's end in the two-PC evening of 2026-11-11 (outside boundary, world tick and engine tick) left no sample.
+    FramePace::DefaultStallSample(120);
     Overlay::RequestDisplayLog();
     // Sessions without the netplay renumber ('netplaygf 0', plain 'ggpo p2p|steam') get the shared virtual clock here; the
     // players' netplay start already switched to it (AnchorCanonical in OnTickEntry).

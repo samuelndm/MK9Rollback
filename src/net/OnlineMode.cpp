@@ -15,6 +15,7 @@
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
 #include "EnvFingerprint.h"
+#include "FinisherRule.h"
 #include "HelloProto.h"
 #include "SteamBridge.h"
 
@@ -30,9 +31,9 @@ constexpr int kHelloChannel = 79;
 // (a game engages only when the other one is ready too); still 4, 24 bytes longer (2026-11-10): + this build's
 // identity and the Wi-Fi flag. The releases up to rc27 read the first 28 bytes of it and never see 'ready' from a
 // build with an identity, so they keep MK9's netcode against it.
-constexpr ULONGLONG kHelloEveryMs = 500, kHelloFreshMs = 3000, kGraceMs = 15000;
-// GameInfo+0x4 after the last round: MK9's results and rematch screens (8 through the rounds; 11 was seen late in a
-// fight, so only 9 ends a session).
+constexpr ULONGLONG kHelloEveryMs = 500, kHelloFastMs = 100, kHelloFreshMs = 3000, kGraceMs = 15000;
+// GameInfo+0x4 after the last round: MK9's results and rematch screens (8 through the rounds). 11 is the finisher
+// phase of a match with blood on, which ends the session by a rule of its own (FinisherRule.h, used below).
 constexpr uint32_t kResultsState = 9;
 // The session ends there with this reason: a normal end, like "timeline restart" (RollbackManager's GgpoStop).
 constexpr const char* kMatchOver = "match over";
@@ -109,6 +110,23 @@ uint32_t gRearms = 0;  // sessions re-armed at a fight end (this match)
 bool gMatchRefused = false;  // this match is not one-on-one Player/Private (logged once per match)
 bool gStateWaitLogged = false;  // "not in the fight's phase yet" (logged once per connection phase)
 constexpr uint32_t kFightState = 8;  // GameInfo+0x4 in online matches: 7 character select, 1 stage load, 8 fight
+constexpr uint32_t kLoadState = 1;
+
+// MK9's wait for the other player's stage load. From this game's own "loaded" (script native 1182) the fight script
+// counts 2400 ticks, 40 s at 60 ticks per second, and then gives up (natives 1209/1217/1144; the match disconnects).
+// The load wait is not paced by MK9's frame limiter: 2026-11-11 the user's PC ran it at 430-625 ticks per second, which
+// left the other player's PC 3.8-5.6 s to finish loading after this one. Three starts in a row failed that way (18:42:26:
+// 1182 at gf 2772, the give-up natives at gf 5172, 3.84 s later), and the one that worked at 18:46:37 had used 1578 of
+// the 2400 ticks. 2026-10-31 20:46 was the same count (gf 497 -> 2897 in 6.1 s; read as the virtual script clock then,
+// but players have had MK9's real clock outside sessions since). From 1182 until the load state ends, the ticks are
+// held to 60 per second: the wait gets the 40 s its count stands for. Only this game's own wait changes; nothing is
+// sent, and a game without the change still gives up on its own count.
+constexpr ULONGLONG kLoadWaitMaxMs = 60000;
+bool gLoadWait = false;
+ULONGLONG gLoadWaitSince = 0;
+uint32_t gLoadWaitGf = 0, gLoadWaitTicks = 0;
+int64_t gLoadWaitNext = 0;                 // performance-counter value of the next tick's earliest start
+uint32_t gTicksThisSecond = 0, gTickRate = 0;  // engine ticks per second (Tick's one-second window)
 
 // The other game's build, from its hellos (HelloProto.h). Two games with the same protocol version but different DLLs,
 // game files or switches used to engage and stop at the session's environment check (frame 24, in mid-fight, falling
@@ -142,6 +160,20 @@ uint32_t GameState() {
 volatile uint32_t gIdlePeak = 0;  // longest gap MK9's connection reported during the current second (ms)
 uint32_t gIdlePeaks[8] = {}, gIdlePeakPos = 0, gIdleLogs = 0;
 ULONGLONG gIdleWindowAt = 0;
+// MK9 asks the idle time of more than one socket, and one of them can be a socket nobody ever writes to: 2026-11-11 one
+// game reported 2,210,859 ms and counting, a line every second of every fight. A gap counts for the report only on a
+// socket that has had a packet (has ever answered less than a second). A socket that received and then stopped still
+// counts, whenever it stopped (2026-11-03: 166 s, counted from a session's start, closed a connection).
+void* gIdleReceived[8] = {};  // the sockets that have had a packet, the latest 8
+uint32_t gIdleReceivedPos = 0;
+
+bool IdleSocketReceived(void* self, uint32_t ms) {
+    for (void* s : gIdleReceived)
+        if (s == self) return true;
+    if (ms >= 1000) return false;
+    gIdleReceived[gIdleReceivedPos++ % 8] = self;
+    return true;
+}
 int gExResults[16] = {};
 uint32_t gExPos = 0, gExZero = 0, gExOne = 0, gExOther = 0;
 struct SentMsg {
@@ -388,6 +420,79 @@ bool FightActive() {
     return g && Readable(g, 0x240) && U32(g, 0x18) != 0;
 }
 
+uint32_t GameFrameNow() {
+    const uint32_t gi = *reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().gameInfoPtr);
+    return gi ? *reinterpret_cast<const volatile uint32_t*>(gi + 0x70) : 0;
+}
+
+void StopLoadWait(const char* why) {
+    if (!gLoadWait) return;
+    gLoadWait = false;
+    Logger::Info("ONLINE: the wait for the other player's load is over after %.1f s and %u ticks (%s)",
+                 (GetTickCount64() - gLoadWaitSince) / 1000.0, (unsigned)gLoadWaitTicks, why);
+}
+
+// Every tick of the wait (see kLoadWaitMaxMs): ends it, or sleeps until 1/60 s after the previous tick's start.
+void PaceLoadWait(bool active) {
+    if (!gLoadWait) return;
+    if (active) return StopLoadWait("the fight's connection started");
+    if (GameState() != kLoadState) return StopLoadWait("the load state ended");
+    if (Rollback::NetplayStarting() || Rollback::NetplayRunning()) return StopLoadWait("a session started");
+    if (GameFrameNow() < gLoadWaitGf) return StopLoadWait("the level changed");
+    if (GetTickCount64() - gLoadWaitSince > kLoadWaitMaxMs) return StopLoadWait("60 s passed");
+    ++gLoadWaitTicks;
+    LARGE_INTEGER f, q;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    const int64_t step = f.QuadPart / 60;
+    // The first tick, or one that itself took several steps: from now, nothing is caught up.
+    if (!gLoadWaitNext || q.QuadPart - gLoadWaitNext > 4 * step) gLoadWaitNext = q.QuadPart;
+    gLoadWaitNext += step;
+    const int64_t left = gLoadWaitNext - q.QuadPart;
+    if (left <= 0) return;
+    static const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                                       TIMER_MODIFY_STATE | SYNCHRONIZE);
+    LARGE_INTEGER due;
+    due.QuadPart = -(left * 10000000 / f.QuadPart);  // relative, 100 ns units
+    if (timer && due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+        WaitForSingleObject(timer, 50);
+    else
+        Sleep((DWORD)(left * 1000 / f.QuadPart));  // before Windows 10 1803: the system timer's steps (a slower, longer wait)
+}
+
+// ---- the finisher phase (game state 0xB, GS_FATALITY; matches with blood on) ----
+// After "Finish Him" the fight body stops (GameInfo+0x10 bit 0x400) and MK9's scripts load what follows, a fatality's
+// cinematic or the winner's ending, through its OnlineAsyncLoad handshake on the gamepad data: natives 1174
+// StartAsyncLoad (0x0087FEF0: +0x244 in progress), 1175 LocalAsyncLoadComplete (0x0087FFD0: +0x248 this game's load is
+// done; on the host first a countdown of 5 exchanges, +0x258), 1176 IsAsyncLoadComplete (0x008800E0: +0x24C) and 1177
+// EndAsyncLoad (0x00880140). +0x24C is set in one place, 0x00881CF0, the first call of the exchange 0x00885F80, from
+// flag bit 1 of the current outgoing and incoming gamepad records; the flag is put into the outgoing record by the
+// exchange's send path only (0x008858B7), and the host's countdown runs there too. With the exchange skipped, 1176
+// says "not yet" on both games until the session ends.
+// Two-PC evening of 2026-11-11: every match with blood on waited exactly 900 ticks (15 s) between the fight body's stop
+// and the results screen, and a fatality's input left the picture frozen for exactly 1800 ticks, after which the results
+// screen never ended (2026-11-03 the same): the scripts' own limits on that wait.
+// So the session ends FinisherRule::kHandBack frames after the fight body stopped, and MK9's exchange runs the handshake
+// and the rest of the match, as it does from the results screen on. Both games must end it at the same frame (the
+// exchange resumes on both from where both left it): whether a frame started with the body stopped is noted for every
+// simulated frame, live or replayed (NoteFrameStart), and only settled notes decide (FinisherRule.h, checked by the host
+// test finisher_test: this phase cannot run in the harness).
+constexpr uint32_t kFinisherState = 0xB, kBodyStopped = 0x400;
+FinisherRule::Notes gFinisherNotes;
+
+bool FinisherStopped() {
+    const uint32_t gi = *reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().gameInfoPtr);
+    return gi && *reinterpret_cast<const volatile uint32_t*>(gi + 0x4) == kFinisherState &&
+           (*reinterpret_cast<const volatile uint32_t*>(gi + 0x10) & kBodyStopped);
+}
+// The handshake's fields, for the log line of a session's end and of the results state.
+int AsyncLoadText(char* out, size_t cap) {
+    const volatile uint8_t* g = gGamepads;
+    if (!g || !Readable(g, 0x260)) return snprintf(out, cap, "no gamepad data");
+    return snprintf(out, cap, "in progress %u, this game's load done %u, both done %u, host countdown %d", (unsigned)U32(g, 0x244),
+                    (unsigned)U32(g, 0x248), (unsigned)U32(g, 0x24C), (int)U32(g, 0x258));
+}
+
 // Every tick of a running session (see kLockedTicksMin).
 void AdaptDelay(ULONGLONG now) {
     if (!(Input::ReadPad(0).inputLock && Input::ReadPad(1).inputLock)) {
@@ -454,7 +559,8 @@ int __cdecl SendHook(int type, const void* data, int size) {
 
 uint32_t __fastcall IdleHook(void* self, void*) {
     const uint32_t ms = reinterpret_cast<IdleFn>(gIdleTramp)(self);
-    if (ms > gIdlePeak) gIdlePeak = ms;  // what MK9 would have seen, also when the session hides it
+    // What MK9 would have seen, also when the session hides it.
+    if (IdleSocketReceived(self, ms) && ms > gIdlePeak) gIdlePeak = ms;
     // The grace after a session does not need gPeer (an 'online auto' re-arm outside a fight forgets the opponent until
     // it is found again).
     if (Online::SkipNative() || GetTickCount64() < gGraceUntil) return 0;
@@ -926,6 +1032,26 @@ void TestScan() {  // 'onlinescan': the fallback pass on demand (its log line gi
 
 bool SkipNative() { return gEngaged && (Rollback::NetplayStarting() || Rollback::NetplayRunning()); }
 
+void NoteFrameStart(uint32_t gameFrame) { gFinisherNotes.Note(gameFrame, FinisherStopped()); }
+
+void OnLoadedNative() {
+    const uint32_t gameFrame = GameFrameNow();
+    // Only where Tick runs (the online mode is on) and MK9 is loading an online fight: offline fights call 1182 too
+    // (about 300-450 frames in), with no online manager and outside the load state.
+    if ((!gPeer && !gAuto) || gLoadWait) return;
+    if (!*reinterpret_cast<const volatile uint32_t*>(kOnlineManager) || GameState() != kLoadState || FightActive()) return;
+    if (Rollback::NetplayStarting() || Rollback::NetplayRunning()) return;
+    gLoadWait = true;
+    gLoadWaitSince = GetTickCount64();
+    gLoadWaitGf = gameFrame;
+    gLoadWaitTicks = 0;
+    gLoadWaitNext = 0;
+    Logger::Info("ONLINE: this game has loaded the fight (native 1182 at gf %u) and waits for the other player's: MK9's script "
+                 "gives up after 2400 ticks, and the load ran at %u ticks per second (%.1f s); held to 60 per second from "
+                 "here (40 s)",
+                 (unsigned)gameFrame, (unsigned)gTickRate, gTickRate ? 2400.0 / gTickRate : 0.0);
+}
+
 uintptr_t ConnectionAddress(uint32_t* size) {
     const volatile uint8_t* g = gGamepads;
     *size = kConnToGamepads + 0x240;
@@ -933,6 +1059,7 @@ uintptr_t ConnectionAddress(uint32_t* size) {
 }
 
 void OnSessionStop(const char* why) {
+    gFinisherNotes.Clear();
     if (!gEngaged) return;
     gGraceUntil = GetTickCount64() + kGraceMs;
     // A session ends at every timeline restart. In an online match that is the normal end of a fight: MK9's
@@ -1001,6 +1128,8 @@ void Tick() {
     }
     if (gPingDelay && gOwnDelay < 0 && gPingCount >= kPingFinal) FinalizeDelay("before the fight");
     const bool active = FightActive();
+    ++gTicksThisSecond;
+    PaceLoadWait(active);
     // For the launcher (rc25): the status line already says when the opponent has no mod; the log says it once per match,
     // after the opponent has been known for 5 s without a hello from their MK9Rollback: none of any version or size (a
     // mod of another version or build has its own line, ReportVerdict), and none earlier in this match either.
@@ -1020,6 +1149,8 @@ void Tick() {
         LogMatchMode();
     }
     if (now - gIdleWindowAt >= 1000) {  // MK9's packet gaps, per second
+        gTickRate = (uint32_t)((uint64_t)gTicksThisSecond * 1000 / (now - gIdleWindowAt));
+        gTicksThisSecond = 0;
         gIdleWindowAt = now;
         const uint32_t peak = gIdlePeak;
         gIdlePeak = 0;
@@ -1074,13 +1205,24 @@ void Tick() {
         // on the same frame (lockstep: 1118 ticks after the last fight frame on both PCs), and this runs before that
         // tick's frame boundary, so neither waits for an input the other will not send. Not a failure: the rematch's
         // fight engages again at its own connection phase (state 8, fresh hello).
-        if (Rollback::NetplayRunning() && GameState() == kResultsState) {
+        // The finisher phase ends it earlier (FinisherRule, above): at the frame both games agree on.
+        const bool results = GameState() == kResultsState;
+        if (Rollback::NetplayRunning() && (results || gFinisherNotes.HandBackAt(GameFrameNow()))) {
             uint32_t median = 0;
             const uint32_t est = PingEstimate(&median);
-            Logger::Info("ONLINE: the match is over (results screen): the session ends and MK9's own netcode runs the results and "
+            char finisher[160] = "results screen";
+            if (!results) {
+                char load[120];
+                AsyncLoadText(load, sizeof load);
+                snprintf(finisher, sizeof finisher, "the fight is decided, gf %u, %u frames after the fight body stopped; MK9's load handshake: %s",
+                         (unsigned)GameFrameNow(), (unsigned)FinisherRule::kHandBack - 1, load);
+            }
+            Logger::Info("ONLINE: the match is over (%s): the session ends and MK9's own netcode runs %sthe results and "
                          "rematch screens; the next fight engages again (hello round trip this match: median %u ms, second-highest "
                          "%u ms; delay %d at the end, %u change(s) between rounds in %u stretch(es) with both inputs locked)",
-                         (unsigned)median, (unsigned)est, Rollback::SessionDelay(), (unsigned)gDelayChanges, (unsigned)gLockStretches);
+                         finisher, results ? "" : "the finisher, ", (unsigned)median, (unsigned)est, Rollback::SessionDelay(),
+                         (unsigned)gDelayChanges, (unsigned)gLockStretches);
+            gStateWaitLogged = true;  // (the hellos that follow arrive outside the fight's state: nothing to say about that)
             Disengage(kMatchOver);
             gGraceUntil = now + kGraceMs;  // MK9's exchange starts again on both games: its idle timer counts from now
             gLastHelloRx = 0;               // the next engagement needs a hello from after this point
@@ -1101,12 +1243,44 @@ void Tick() {
         }
         gModeMismatchLogged = false;
     }
+    // The results state, once a second while it lasts (about 2 s after a normal ending). 2026-11-11: after a fatality
+    // that did not play (MK9's finisher phase ran into its 1800-tick limit on both PCs) both games stayed in this state
+    // for 50 s, until the players quit, and the logs said nothing about that time. What MK9's own exchange returned in
+    // the second (0: no data from the other game yet; MK9 pauses the game then, its lockstep pause), the pause flag, the
+    // game's flags (GameInfo+0x10) and the longest gap between the other game's packets.
+    {
+        static ULONGLONG since = 0, logAt = 0;
+        static uint32_t lines = 0, zero0 = 0, one0 = 0, other0 = 0;
+        if (GameState() == kResultsState && *reinterpret_cast<const volatile uint32_t*>(kOnlineManager)) {
+            if (!since) {
+                since = logAt = now;
+                lines = 0;
+                zero0 = gExZero, one0 = gExOne, other0 = gExOther;
+            } else if (now - logAt >= 1000 && lines < 90) {
+                logAt = now;
+                ++lines;
+                const uint32_t gi = *reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().gameInfoPtr);
+                Logger::Info("ONLINE results state +%u s: MK9's exchange in this second: %u without the other game's data, %u "
+                             "with, %u other; pause flag %u; game flags %08X; data %s; longest packet gap %u ms",
+                             (unsigned)((now - since) / 1000), (unsigned)(gExZero - zero0), (unsigned)(gExOne - one0),
+                             (unsigned)(gExOther - other0), (unsigned)*reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().pauseFlag),
+                             gi ? (unsigned)*reinterpret_cast<const volatile uint32_t*>(gi + 0x10) : 0u, active ? "active" : "inactive",
+                             (unsigned)gIdlePeaks[(gIdlePeakPos + 7) % 8]);
+                zero0 = gExZero, one0 = gExOne, other0 = gExOther;
+            }
+        } else {
+            since = 0;
+        }
+    }
     if (!active) {
         // The writes around the close are logged by now; the gamepad data may be freed and its memory reused.
         if (gInactiveSince && now - gInactiveSince > 3000) DisarmConnectionWatch();
         // The online match is over: ready for the next one. Long enough to outlast a quiet stretch between rounds (a
-        // re-engagement after the next round's start would miss that round).
-        if (gInactiveSince && now - gInactiveSince > 20000) {
+        // re-engagement after the next round's start would miss that round). Not while MK9 loads the online fight or
+        // waits for the other player's load (up to 40 s now): the match is still on, and the fight's phase needs the
+        // opponent it knows (in auto mode a reset here cost a new search, ~2 s, at the fight's start).
+        const bool loading = gLoadWait || (GameState() == kLoadState && *reinterpret_cast<const volatile uint32_t*>(kOnlineManager));
+        if (gInactiveSince && now - gInactiveSince > 20000 && !loading) {
             if (gPeer) {  // still connected to them through Steam, and still hearing their mod?
                 char p2p[200], age[32];
                 DescribePeer(p2p, sizeof p2p);
@@ -1129,7 +1303,11 @@ void Tick() {
         if (gAuto && !gEngaged) gPeer = 0;     // auto: look again
         return;
     }
-    if (now - gLastHelloTx >= kHelloEveryMs) SendHello();
+    // Twice a second; ten times a second while this game's delay proposal still lacks round trips. 2026-11-11 18:46: the
+    // players left the character select 1 s after the opponent was found, with 3 round trips measured, and the match ran
+    // at the fallback delay 2 on a 33 ms link (delay 1 in the matches before and after).
+    const ULONGLONG every = gPingDelay && gOwnDelay < 0 && gPingCount < kPingFinal ? kHelloFastMs : kHelloEveryMs;
+    if (now - gLastHelloTx >= every) SendHello();
     // The connection, once per match: when the opponent's hello said its side, or 5 s after the opponent was known (no
     // mod, or one that does not say). The overlay reads the same three facts every tick (LocalOnWifi, ...).
     if (!gLinkLogged && gWifiState != 1 && gPeerKnownAt) {

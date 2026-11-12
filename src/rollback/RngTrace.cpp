@@ -16,6 +16,7 @@
 #include "../hook/ObjectHooks.h"
 #include "../hook/GameLoopHook.h"
 #include "../debug/Ue3Names.h"
+#include "../net/OnlineMode.h"
 #include "RollbackManager.h"
 #include "Snapshot.h"
 
@@ -131,8 +132,9 @@ const OnlineNative kOnlineNatives[] = {
     {0x008B6870, 456}, {0x008B68A0, 453}, {0x008B6900, 459}, {0x008B6920, 454}, {0x008B6950, 455},
     {0x008B6E60, 33}, {0x008B70A0, 66}, {0x008B70B0, 67}, {0x008B9670, 339}, {0x008BF950, 1144},
     {0x008BFAF0, 1156}, {0x008BFBC0, 1165}, {0x008BFBD0, 1166}, {0x008BFBE0, 1167}, {0x008BFBF0, 1168},
-    {0x008BFC00, 1169}, {0x008BFC10, 1170}, {0x008BFC20, 1171}, {0x008BFC30, 1172}, {0x008BFC50, 1174},
-    {0x008BFC80, 1177}, {0x008BFCB0, 1179}, {0x008BFCC0, 1180}, {0x008BFCE0, 1181}, {0x008BFD00, 1182},
+    {0x008BFC00, 1169}, {0x008BFC10, 1170}, {0x008BFC20, 1171}, {0x008BFC30, 1172}, {0x008BFC40, 1173},
+    {0x008BFC50, 1174}, {0x008BFC60, 1175}, {0x008BFC70, 1176}, {0x008BFC80, 1177}, {0x008BFC90, 1178},
+    {0x008BFCB0, 1179}, {0x008BFCC0, 1180}, {0x008BFCE0, 1181}, {0x008BFD00, 1182},
     {0x008BFD10, 1183}, {0x008BFD20, 1184}, {0x008BFD50, 1186}, {0x008BFD60, 1187}, {0x008BFD80, 1188},
     {0x008BFDA0, 1189}, {0x008BFDC0, 1190}, {0x008BFDD0, 1191}, {0x008BFDE0, 1192}, {0x008BFDF0, 1193},
     {0x008BFE00, 1194}, {0x008BFE10, 1195}, {0x008BFE20, 1196}, {0x008BFE60, 1204}, {0x008BFE70, 1205},
@@ -158,6 +160,17 @@ const OnlineNative kOnlineNatives[] = {
 };
 constexpr size_t kOnlineNativeCount = sizeof(kOnlineNatives) / sizeof(kOnlineNatives[0]);
 bool gOnlineSeen[kOnlineNativeCount];
+// The natives of a match's steps: the stage load (1179, 1192/1193, 1182 "loaded", the give-up 1209/1217/1144), the fight
+// connection's start (1204), the finisher (1211/1392 at "Finish Him", then MK9's OnlineAsyncLoad handshake: 1174 start,
+// 1175 this game's load is done, 1176 "are both done?" polled by the scripts, 1177 end; 1173 stops the gamepad data,
+// 3268), the results state (1217/1206/1350, 1352, 1378) and the character select's end (1375/1190/1386). "First call"
+// says nothing about the second match of a process: 2026-11-11 the ending that hung (a fatality, then the results state
+// never left) was a second match, and its log has none of them. These are logged per timeline: calls 1-3, then the 10th,
+// 100th, ... (one polled every tick shows as such).
+constexpr uint16_t kFlowNatives[] = {1144, 1173, 1174, 1175, 1176, 1177, 1178, 1179, 1182, 1190, 1192, 1193, 1204,
+                                     1206, 1209, 1211, 1217, 1350, 1352, 1375, 1378, 1386, 1392, 3268};
+uint32_t gFlowCalls[kOnlineNativeCount];
+bool FlowNative(uint16_t id) { return std::binary_search(std::begin(kFlowNatives), std::end(kFlowNatives), id); }
 void NoteOnlineNative(uint32_t fn, uint32_t exec) {
     size_t lo = 0, hi = kOnlineNativeCount;
     while (lo < hi) {
@@ -166,6 +179,16 @@ void NoteOnlineNative(uint32_t fn, uint32_t exec) {
         else hi = mid;
     }
     if (lo == kOnlineNativeCount || kOnlineNatives[lo].fn != fn) return;
+    const bool replay = gNatCur == &gNatResim;
+    if (kOnlineNatives[lo].id == 1182 && !replay) Online::OnLoadedNative();
+    if (!replay && FlowNative(kOnlineNatives[lo].id)) {
+        const uint32_t n = ++gFlowCalls[lo];
+        if (n <= 3 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000)
+            Logger::Info("ONLINEFLOW id %u native %08X call #%u of this timeline at gf %u (%s)", kOnlineNatives[lo].id, fn, n,
+                         (uint32_t)gCurGf, Rollback::GgpoActive() ? "in a GGPO session" : "no session");
+        gOnlineSeen[lo] = true;
+        return;
+    }
     // StartSendingGamepadData (1172) zeroes GameFrame online: every call (up to 20) tells whether fight scripts reach it
     // once per fight or once per round, even offline where 0x0081C080 finds no online engine and does nothing.
     static int startCalls = 0;
@@ -807,6 +830,7 @@ const std::vector<uint32_t>& ScriptContexts() {
     return gRecent;
 }
 void ClearScriptContexts() {
+    memset(gFlowCalls, 0, sizeof gFlowCalls);  // ONLINEFLOW counts per timeline
     gContexts.clear();
     gContextSeen.clear();
 }

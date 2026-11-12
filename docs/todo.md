@@ -1643,6 +1643,168 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         (the legacy P2P interface is deprecated); desync recovery; input recording for offline desync replay; VERSIONINFO;
         the phase target when the one-way trip exceeds the delay; clock-rate feed-forward and a rate cap instead of the
         150 ms session total; "connection too slow" from a 330 ms hello; MatchMode check; auto-mode opponent memory.
+    - **First two-PC evening on rc28 (2026-11-11 18:27-19:15, the player and a friend, Steam P2P direct, neither on
+      Wi-Fi, ping 33-50 ms). Logs: `results\field_20261111\` (mine_zip = the player's session 1, friend_zip = the
+      friend's session 1, mine_zip_184404 = session 2, mine_zip_194746 and friend_zip_194753 = both sides of session
+      3, 18:44-19:47; the friend's session 2 was not sent). Source changes below were written while the player was in
+      a match; built afterwards as `build\clang_rc29` (see the end of this entry).**
+      - **Session 3, both sides (22 matches played to the end, then one the player quit):** the same frame count on
+        both games in every match (4,248-12,941), 0 checksum mismatches, rollbacks rare (player's PC 0-12 loads a
+        match, friend's 0-65), 60.0 fps, LATENCY p50 19-20 ms. No start disconnect in 23 loads; the first match's
+        "loaded" (1182) came 18:46:33.657 on the player's PC and 18:46:36.671 on the friend's (whose clock is ~0.65 s
+        behind): the friend's load is ~3.7 s longer, against a give-up of 3.8-5.6 s on the player's PC. Match ends
+        from the frame log: 7 with blood on (GameInfo+0x14 = 4, state 0xB), every one exactly 900 ticks from the body's
+        stop to bit 0x1000 and state 9 at +1110..1128; 15 with blood off (+0x14 bit 0x20, no state 0xB), state 9 at
+        +200..217 (one +334). **The last match ended with a fatality's input again (f10 080C0D30): frozen picture, the
+        player closed the game 16.4 s into the 30 s: 3 of 3 fatalities froze.**
+        - Friend's PC, 835.4 and 843.7 ms in the engine tick at the first frame after the fight body stopped (gf 108276
+          at 19:01:04, gf 107001 at 19:31:48; 44 ms at 18:50:00 in the same place; the 351 ms "fatality's start" of
+          session 1 is the same stack): UE3's async-loading tick 0x005EDA30 called from 0x007F7FE7 with the frame's
+          dt, blocked in a file wait (00511CF0 <- 0051CDC6 <- 006096FB <- 0060C904 <- 0062795D <- 0062CB37 <-
+          0062CC9E). The game's own load of what the ending needs, from that PC's disk when the file is not cached;
+          the player's game waited 780 ms each time (stallhold). After the fight is decided. Not the mod's; a
+          background read of those files at the match's start would hide it (which files: not known yet).
+        - Player's PC, 147-238 ms outside boundary, world tick and engine tick in 5 of 22 matches (18:50:17, 18:52:22,
+          18:57:39, 19:38:42, 19:39:20; 1.4-39 s before the session's end, no fixed offset), and the friend's game
+          waited 137-176 ms each time. Not explained; rc29's 120 ms sampling shows the stack next time.
+        - "MK9's connection went N ms without a packet" printed 2,210,859 ms and counting on the player's game (a
+          socket that never receives): noise. Now a gap counts only on a socket that has ever had a packet
+          (OnlineMode.cpp `IdleSocketReceived`); one that received and then stopped still counts, as before.
+      - What worked: every match engaged; 0 checksum mismatches in every match (6,248-12,918 frames each, 9 matches
+        read); LATENCY p50 19-20 ms, p99 20-24 ms at delay 1 (p50 36 at delay 2); session 3 at delay 1 ran with 0
+        rollbacks at 60.0 fps. The hello's build agreement engaged every time.
+      - **"Disconnected on the start of the match" (session 2, three attempts in a row): MK9's stage-load script gives
+        up 2400 ticks after its own "loaded" (script native 1182), and the load wait is not paced.** The player's PC
+        ran it at 430-625 ticks a second, so the other PC got 3.8-5.6 s after this one's load instead of the 40 s the
+        count means at 60 a second. Failed: 1182 at gf 2772 (18:42:22.552), give-up natives 1209 / 1217 / 1144 at gf
+        5172 (18:42:26.392). Passed: session 1 (517 ticks waited), session 3 match 1 (1578 of 2400), match 2 (5178
+        ticks from the restart to the fight's connection). The 2026-10-31 diagnosis (the virtual script clock) was
+        incomplete: with the real clock since then the give-up still comes exactly 2400 ticks after 1182. Fix
+        (OnlineMode.cpp `PaceLoadWait`, `Online::OnLoadedNative` called from RngTrace's NoteOnlineNative): from 1182
+        until the load state (1) ends, an online match's ticks are held to 60 a second on a waitable timer (at most
+        60 s); the 20 s MatchReset no longer fires during an online load. Needs an online load to verify: the next
+        two-PC match (log lines "ONLINE: this game has loaded the fight ..." / "the wait for the other player's load
+        is over ...").
+      - **The fatality that froze the match's end, and "with blood enabled we wait a long time until the menu": one
+        cause, MK9's OnlineAsyncLoad handshake, which only runs inside the exchange the session skips.** With blood on,
+        the match ends through game state 0xB (GS_FATALITY; 8 GS_PLAY, 9 GS_GAME_OVER): "Finish Him" (natives 1211 /
+        1392), then the fight body stops (GameInfo+0x10 bit 0x400; bit 0x100 too after a fatality's input) and the
+        scripts load what follows through natives 1174 StartAsyncLoad (0x0087FEF0), 1175 LocalAsyncLoadComplete
+        (0x0087FFD0), 1176 IsAsyncLoadComplete (0x008800E0), 1177 EndAsyncLoad (0x00880140) on the gamepad data
+        (+0x244 in progress, +0x248 this game's load done, +0x24C both done, +0x250 / +0x254 own / other flag seen,
+        +0x258 the host's 5-exchange countdown). +0x24C is set only at 0x00881DD8 in 0x00881CF0, whose only caller is
+        the exchange 0x00885F80 (0x00885FB7), from flag bit 1 of the current outgoing and incoming records; the flag
+        goes into the outgoing record only at 0x008858B7 (send path 0x00885710), and the host's countdown is
+        decremented there too. So during a session 1176 answers 0 on both games (offline it answers 1, 0x0081C11E:
+        why no harness run showed it). Seen in every blood-on match: fight body stops at gf S (1177 at S - 1), 1174
+        at S + 111, then exactly 900 ticks to bit 0x1000 and ~220 more to state 9 (4 of 4); after a fatality's input
+        exactly 1800 ticks with the picture frozen, state 9 with 0x1000 never set, and state 9 never ended (both
+        players quit after ~50 s; 2026-11-03 the same). The 900 and 1800 are not in the exe (no such immediates):
+        the scripts' own limits on the wait (inferred; the scripts are not in the exe). Whether the stuck state 9 is
+        a poll of 1176 left behind is not confirmed.
+        Fix (src\net\FinisherRule.h, used by OnlineMode.cpp): the session ends 29 frames after the fight body stopped in state
+        0xB, with reason "match over" as at the results screen, and MK9's exchange runs the handshake, the finisher
+        or ending, and the results. The frame must be the same on both games: `Online::NoteFrameStart` (from
+        RollbackManager's NetplayFrameEvents, every session frame, live or replayed) notes whether the frame started
+        with the body stopped, and the rule reads only notes 16 or more frames old (GGPO predicts at most 8): body
+        running at F - 30, stopped from F - 29 through F - 16 = hand back at F. MK9's own desync check there is two
+        floats of a fighter per frame (OnlineDesync, reverse_engineering.md), with the fight stopped. Cannot run in
+        the harness (no online manager; `Online::Engaged` is false): the next two-PC match with blood on verifies it
+        (log: "ONLINE: the match is over (the fight is decided, gf ..., MK9's load handshake: ...)", then ONLINEFLOW
+        lines for 1174-1177; 1173, 1175, 1176, 1178 were missing from `kOnlineNatives` and are added).
+        reverse_engineering.md has the handshake's addresses now, and its "+0x18 is cleared only by the constructor
+        and destructor" is corrected: StopSendingGamepadData 0x0087FB70 (native 1173, and 0x0081C661) clears it too.
+      - **"Huge lag" in match 2 of session 1, three separate stalls:**
+        - Player's PC, gf 108923 and 109032: 684.8 and 568.2 ms in the boundary before its timed parts, game thread in
+          a COM call. **MK9's controller re-detection**: its window procedure (0x005758B0, WM_DEVICECHANGE, any
+          wParam) sets 0x00DE9934; the pad sampler 0x00424A50 (which the mod calls at the boundary, late sampling)
+          then skips one sample and, 300 ms later, runs 0x00422E10: release every DirectInput device, EnumDevices
+          (callback 0x00421AB0) and per DirectInput pad Microsoft's IsXInputDevice 0x004213D0, a blocking WMI query
+          over every Win32_PNPEntity. The PC has a DualSense; what changed in its device tree at that moment is not
+          known (two changes 1.8 s apart fit a pad reconnect or Steam Input rebuilding its virtual pad). The note
+          "after any >300 ms gap between polls" (Snapshot.cpp, the 13120 entry above) was wrong: the flag is needed.
+          Fix (Input.cpp `HoldDeviceChange`, `MK9R_IsXInputDevice` on the call at 0x00421B14): during capture the flag
+          is taken before the sampler sees it; 300 ms and 1.5 s after the message the HID game controllers of the raw
+          input list are compared with the last set; same set = MK9 gets the flag back when capture ends; another set
+          = MK9 re-detects in that sample, with each product's XInput answer taken from the last real query (one
+          re-detection is forced in the menus when the hook goes in, so the answers exist). Also: a pad of ours handed
+          to the sampler now keeps the device manager's live bits 0x21 (stale "attached" after a re-detection was the
+          null read at 0x00424B1E), and only an attached pad's record counts as hardware input. Online the fighters'
+          pads are slots 6 and 10 (0x00E245F0, 0x00E25E20), so those two only matter in local sessions.
+        - Friend's PC, gf 109279: 817.7 ms, live save 812.8 ms, eip in MK9R_SafeRead32 for all five samples, called
+          from ForeignVtable (Snapshot.cpp, classify): the read of another DLL's read-only page that had left the
+          working set, from that PC's disk; the same 0.8 s as the heap targets of 2026-11-08, whose cold check did
+          not cover this read. Fix: ForeignVtable keeps its verdict per address (`gForeignVerdict`, reset when the
+          module sections change) and, for an address without one, asks QueryWorkingSetEx first: a page that is not
+          resident is kept live unread and handed to the warming thread.
+        - Friend's PC, gf 110489 (the fatality's start): 351.4 ms in the engine tick, a blocking wait in game code
+          (00511CF0 <- 0051CDC6 <- 006096FB <- 0060C904 <- 0062795D <- 0062CB37 <- 0062CC9E <- 005EDA41 <- 007F7FEC),
+          probably the fatality's assets loaded synchronously on that disk. Not looked at further.
+        - Player's PC: one 150-230 ms hitch near each match's end (about 200 frames after the last fight frame: gf
+          105674 after the stop at 105471), outside boundary, world tick and engine tick, below the 250 ms sampling
+          threshold. Not explained (candidate: the host-only stats commit, native 3268 -> 0x0090E7E0, if this PC
+          hosted). `DefaultStallSample` is now 120 ms (10 ms steps, samples 30 ms apart), the
+          sampler copies 4096 stack dwords and counts own (game, this DLL) and other return addresses apart (18 + 12),
+          so a wait deep in Windows code still shows its caller.
+      - Session 3's first match ran at delay 2: character select lasted 5 s, the opponent was found after 3.5 s and
+        only 3 hello round trips existed. Hellos now go every 100 ms until 8 round trips are measured (`kHelloFastMs`).
+      - "MK9's connection went N ms without a packet" reads the largest value over all sockets (60-97 s on the friend's
+        game while its exchange worked): not a disconnect signal.
+      - The display note stands for the player's PC: fullscreen 1920x1200, vsync on at 165 Hz.
+      - **Built 2026-11-11 20:33 as `build\clang_rc29` (DLL 94546798, injector 40C70A46, GGPO `build\ggpo_r3` as rc28)
+        and checked without the game while the player used the PC. The player then said "PC is free now" and "Run the
+        gate": `build\clang` and `clang2` hold rc29 (rc28's binaries are in `build\clang_rc28`), and the gate passed
+        20:44-21:16 (results\gate_20261111_rc29.txt): online smoke, regression, auto re-arm (3 re-arms per game),
+        delay changes (21 applied), menu walk (306 key presses, no hang); every regression 3 fights, 6 checksum
+        reports, 0 mismatching, 0 failed saves, 0 crashes, 0 cut sessions. Zip:
+        `dist\MK9Rollback-netplay-20261111-2115.zip` (SHA-256 DEFAAE84..., its .sha256 matches; contents scanned for
+        the user's name, profile paths and SteamIDs before and after packaging: only the repository name, the SteamID
+        base constant and the scrubber's `C:\Users\<user>` text). The player said yes to publishing once the two extra
+        checks below passed: published 2026-11-11 22:03 as release v20261111-2115 (Latest; the downloaded asset has
+        the zip's SHA-256). The source of rc29 is not committed.**
+        - Extra checks before publishing, from `build\clang_rc29` / `build\clang_rc29b` (results\batch_rc29x.txt):
+          the Safe-mode regression (lockstep, delay 3): 3 fights, 6 checksum reports, 0 mismatching, 0 crashes, 0 cut
+          sessions. The stage sweep `rc29xst` (ns15, delay 1, all 28 stages, 21:23-22:02): 0 crashes, no hang but game
+          B's usual one at process start (in every sweep's B log since 2026-11-08), `desync_digest`: 0 fights with
+          life or meter apart. 16 of 28 fights mismatched in the attract-demo start classes (12 RNG-only with the same
+          fight, DeadPool positions, PitDay and BellTower offset 0.339, Street a 0.002 intro height at frame 9 and the
+          same fight after, STGardensN a frame-0 stop), the rate and classes of rc22's all-stage b39 (30 of 56).
+        - The gate's logs: no CRASH / HANG / DESYNC / LOGGER line; the IsXInputDevice call patch went in on every
+          game; the 120 ms stall sampling caught the slowed game B's map change after each fight (350-400 ms at gf 0,
+          stacks in the game's own load: OpenMP, PhysX), which is between fights and as before.
+        - Host tests (`tests\host\run.ps1 -GgpoLib build\ggpo_r3\libggpo.a`): hello 85 / 85, GGPO 14 / 14, logger, and the
+          new `finisher` 17 / 17; launcher selftest passes.
+        - `finisher` (tests\host\finisher_test.cpp on src\net\FinisherRule.h, the rule moved out of OnlineMode.cpp so the
+          test runs the game's code): two simulated games play the same fight with different rollback histories (what
+          each notes for its unconfirmed frames is wrong at random, then replayed) and must end the session at the same
+          frame: a stop at S gives S + 29 with 0 %, 50 % and 100 % wrong predictions; 14 stopped frames decide, 13 do
+          not; 4000 random fights (601,035 wrong unconfirmed notes, 1,201,691 replayed frames), no disagreement. With
+          the rule changed to read notes 4 frames old the test fails, as it should. The notes are now cleared at every
+          session's end (`OnSessionStop`): the next session of a match must not read the last, never confirmed frames
+          of the one before.
+        - Logger: the first run of the evening failed once ("exit children: 3 gaps", frame log only, main log complete),
+          with another game running on the PC; Logger.cpp was the released one. The frame log drops lines by design
+          while more than 16 MB of its text waits for the disk, and the test's longest children write about that much
+          in their 0.25 s, so a writer held up for most of a child's life gives exactly this, one gap per thread (not
+          proven for that run: its files were deleted). Now: the counts of dropped / lost lines stay with the text they
+          were taken with until the main log says them (`gNoteDropped`, `NoteLosses`), also when the writer died in a
+          write and on the paths that write without the buffer lock (they used to say nothing); the test accepts a
+          missing frame line only when the main log reports it, and a second build with a 64 KB cap
+          (`MK9R_LOG_PENDING_FRAME_CAP`) runs the exits again so the report itself is tested (24,288,414 lines dropped
+          in 60 of 60 children, every absent line reported).
+        - Logger, a second failure the new report made visible: about 1 exit in 100 on the busy PC lost both lines
+          written in DLL_PROCESS_DETACH ("1 main-log line(s) lost: no memory for the log buffer", twice; 3 of 540
+          exits; the test now keeps a failed child's files and the marks of its exit). The writer's swap handed the
+          callers a buffer without memory (the out buffer it had just freed for being over 4 MB, or the never used
+          one after Open), and a thread killed by ExitProcess inside that first allocation left the buffer lock taken
+          with nothing to append to: at exit a line can only go into memory that is already there. Now a buffer is
+          never without memory while the log is open (`Shrink`, and Open reserves all four): 420 exits in a row, then
+          the full suite, without a failure. In the game this window was a few microseconds ten times a second; the
+          stress test hits it because three threads log flat out. Ruled out by a probe in the test: threads still
+          logging after the process's shutdown flag is set (0 rounds in 600 exits).
+        - Still unverified, and not verifiable in the harness or by the gate: the load wait's pacing, the finisher
+          hand-back, and the controller re-detection hold. The next two-PC evening on rc29 (blood on, one fatality,
+          both log zips) is their test.
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as
