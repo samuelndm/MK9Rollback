@@ -65,6 +65,10 @@ void OnLoadedNative();
 bool ScanRunning();
 void TestScan();                         // 'onlinescan': run that pass now (logs size and time)
 const char* StatusText();                // in an online fight on MK9's netcode: why (for the status line); else null
+// Before a fight of an online match (character select, stage load): what the fight will run on, for the HUD's badge.
+// Returns an Overlay::Pre. kPreReady: both mods answered each other with the same build in a one-on-one Player/Private
+// match, *rttMs = the hellos' median round trip (-1: none measured yet). kPreBlocked: *why = the status text.
+int PreFight(int* rttMs, const char** why);
 // Connection facts for the status line; game thread, plain reads of values kept up to date elsewhere (the Wi-Fi look
 // runs on its own thread once per match, the opponent's side comes with its hellos, the relay state is read from Steam
 // with every hello sent, twice a second). All false while unknown.

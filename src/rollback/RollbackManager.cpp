@@ -56,6 +56,7 @@
 #include "OnlineKeep.h"
 #include "../net/HelloProto.h"
 #include "../net/OnlineMode.h"
+#include "../net/StartSync.h"
 #include "../net/SteamBridge.h"
 
 extern "C" int ggpo_prediction_frames_override;  // patched GGPO (tools/build_ggpo.ps1); kept 0
@@ -2091,6 +2092,13 @@ double gStallHeldMs = 0;      // and the time they added
 // Wait shift (WaitShift, below StallHold): 'waitshift 0' leaves the limiter's catch-up after a wait as it was (rc27).
 bool gWaitShift = true;
 int gWaitShifts = 0, gWaitShiftFrames = 0;  // this session
+// Start alignment (StartSyncBegin, below WaitShift; src/net/StartSync.h): 'startsync 0' leaves the start barrier's shift
+// as it was through rc29 (whole frames, the one-way trip guessed from the handshake's round trip).
+bool gStartSync = true;
+StartSync::Session gSs;
+double gSsWaitedMs = 0;  // this game's wait at the start barrier (0: the other game's first input was already in)
+int gSsFrameAt = -1;     // the last frame whose boundary read the other game's start datagrams
+int gSsMovedUs = 0, gSsTripUs = StartSync::kNone;  // this session: the deadline moved at the start; the measured one-way trip
 // Handshake polls ('handshakepoll 0|1', round 3; off). Until GGPO runs the game is paused and the boundary polls once a
 // frame: each game answers the other's sync packets up to a frame late and reads the answers up to a frame late, so the
 // handshake's round trip (ggpo_sync_rtt_ms, from which the start barrier's WaitShift takes the one-way trip) reads 0-2
@@ -2528,6 +2536,11 @@ void CsOpen(const char* ip, unsigned short localPort, unsigned short remotePort)
     gCsPeer.sin_addr.s_addr = inet_addr(ip);
     if (loopback && connect(gCsSock, reinterpret_cast<const sockaddr*>(&gCsPeer), sizeof gCsPeer))
         Logger::Info("NETPLAY checksum channel: connect failed (%d); datagrams from other local ports are not filtered", WSAGetLastError());
+    // No "connection reset" on a read after a datagram found the peer's port not open yet (SIO_UDP_CONNRESET off, as on
+    // the Steam bridge's sockets): the start alignment reads this socket from frame 0 on, in a loop that a failed read ends.
+    BOOL resetReports = FALSE;
+    DWORD ioctlBytes = 0;
+    WSAIoctl(gCsSock, 0x9800000C /* SIO_UDP_CONNRESET */, &resetReports, sizeof resetReports, nullptr, 0, &ioctlBytes, nullptr, nullptr);
     gCsMismatchRun = 0;
     gDesyncStop = false;
     gCsStartGf = GameFrame();
@@ -2694,6 +2707,9 @@ void CsPump(uint32_t liveGf) {
             PhaseOnPeer((int)in[1], (int)in[2], (int)in[3]);
             continue;
         }
+        // A start-alignment datagram that came after this game stopped reading them (frame StartSync::kFrames): nothing
+        // to do with it, and it must not end this read as an unknown datagram does.
+        if (got == (int)sizeof(StartSync::Packet) && in[0] == StartSync::kMagic) continue;
         if (got != 12 || in[0] != kCsMagic) break;
         const CsRec& own = gCs[in[1] % 128];
         if (own.rel != in[1]) continue;  // not (or no longer) recorded here
@@ -2846,6 +2862,11 @@ void GgpoStop(const char* why) {
                      "(waitshift %d)",
                      gPhaseCorrections, gPhaseShiftedMs, gPhaseMyQ, gPhasePeerQ, (unsigned)gRepolls, (unsigned)gRepollHits,
                      gTimesyncIgnored, ggpo_rtt_min_ms, gWaitShifts, gWaitShiftFrames, (int)gWaitShift);
+        if (gSs.Begun())
+            Logger::Info("STARTSYNC this session: the deadline moved %.1f ms at the start; one-way trip %.1f ms (-1: not measured); "
+                         "%u datagram(s) read, %u sent, decided %d (startsync %d)", gSsMovedUs / 1000.0,
+                         gSsTripUs == StartSync::kNone ? -1.0 : gSsTripUs / 1000.0, gSs.Reads(), gSs.Sends(), (int)gSs.Decided(),
+                         (int)gStartSync);
         SoundDedupe::LogSession();
         RenderTag::LogSession();
         {
@@ -2956,6 +2977,11 @@ bool GgpoStartP2P(const P2PConfig& c) {
     gStallHolds = 0;
     gStallHeldMs = 0;
     gWaitShifts = gWaitShiftFrames = 0;
+    gSs = StartSync::Session();
+    gSsWaitedMs = 0;
+    gSsFrameAt = -1;
+    gSsMovedUs = 0;
+    gSsTripUs = StartSync::kNone;
     gXrayLockUntil = -1;
     gXrayLockOn = false;
     gXrayLocks = gXrayLockFrames = gXrayLockCineFrames = gXrayLockWaits = 0;
@@ -3091,6 +3117,146 @@ void WaitShift(double waitedMs, double oneWayMs, const char* what) {
     if (gWaitShifts <= 12)
         Logger::Info("WAITSHIFT gf=%u (%s): this boundary waited %.1f ms for the peer (one-way trip %.1f ms); the frame "
                      "deadline moves %d frame(s) later, nothing is caught up", GameFrame(), what, waitedMs, oneWayMs, frames);
+}
+
+// The start barrier's shift without the other game's timing: through rc29 the only one, now for 'startsync 0' and for a
+// start in which nothing usable arrived from the other game. The handshake's round trip (no quality report yet at frame
+// 0, and those are read at one poll a frame). Polled once a frame it is 0-2 frames more than the wire's, a frame on
+// average (r3smoke: 50 and 53 ms on the harness link whose trip is one frame; half of that left a frame of lead, which
+// the phase alignment took 8 s to remove): less that frame, half of it is within half a frame of the trip. Polled every
+// millisecond on both games ('handshakepoll 1'; the two games of a session are the same build) it is the wire's.
+// Field evening 2026-11-11: the frame polls read the wire's own 27-28 ms in 6 of 14 starts, the guess was then 5-6 ms
+// for a 13.5 ms trip and the shift one frame too many (StartSync.h).
+void StartBarrierGuess(double waitedMs) {
+    const int rtt = ggpo_sync_rtt_ms >= 0 ? ggpo_sync_rtt_ms : ggpo_rtt_min_ms;
+    const double pollMs = gHandshakePoll && ggpo_sync_rtt_ms >= 0 ? 0 : 1000.0 / 60;
+    const double oneWay = rtt > pollMs ? (rtt - pollMs) / 2 : 0;
+    WaitShift(waitedMs, oneWay, "start barrier");
+}
+
+// Start alignment (2026-11-12; the rule and its reasons: src/net/StartSync.h). From its frame-0 boundary each game tells
+// the other, on the checksum channel, how long until its own frame 1; from the two games' readings the one whose frame 1
+// comes first moves its deadline later by the measured difference, to the millisecond, instead of by whole frames of
+// (wait - guessed trip). Timing only: both games simulate the same frames.
+// The frame limiter's clock in microseconds (FramePace.cpp, "limiter wait": the deadline 0x00E0AB10 is in seconds of
+// QueryPerformanceCounter x [0x00E42FF0]).
+int64_t LimiterNowUs() {
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return (int64_t)((double)q.QuadPart * *reinterpret_cast<const double*>(0x00E42FF0) * 1e6);
+}
+// The other game's start datagrams waiting on the checksum socket, all taken as read at one time. Another kind of
+// datagram from the peer ends the read and stays for CsPump (none is sent before the sender's frame 24, but a game can
+// be that far ahead of this one's frame 12 at a long frame delay).
+int StartSyncRead(bool prompt) {
+    if (gCsSock == INVALID_SOCKET) return 0;
+    const int64_t now = LimiterNowUs();
+    int n = 0, resets = 0;
+    for (int k = 0; k < 1024; ++k) {
+        uint32_t in[16];
+        sockaddr_in from{};
+        int fromLen = sizeof from;
+        const int got = recvfrom(gCsSock, reinterpret_cast<char*>(in), sizeof in, MSG_PEEK, reinterpret_cast<sockaddr*>(&from), &fromLen);
+        if (got < 0) {
+            // "Connection reset" (a system that reports it although CsOpen turned the reports off): the report of an
+            // earlier datagram that found no listener; taken off the queue, the datagrams behind it are fine.
+            if (WSAGetLastError() != WSAECONNRESET || ++resets > 8) break;
+            recvfrom(gCsSock, reinterpret_cast<char*>(in), sizeof in, 0, nullptr, nullptr);
+            continue;
+        }
+        const bool peer = from.sin_addr.s_addr == gCsPeer.sin_addr.s_addr;
+        if (peer && (got != (int)sizeof(StartSync::Packet) || in[0] != StartSync::kMagic)) break;
+        recvfrom(gCsSock, reinterpret_cast<char*>(in), sizeof in, 0, nullptr, nullptr);
+        if (!peer) continue;  // a direct-IP session's socket takes datagrams from the whole network (CsPump)
+        StartSync::Packet p;
+        memcpy(&p, in, sizeof p);
+        gSs.OnPacket(p, now, prompt);
+        ++n;
+    }
+    return n;
+}
+void StartSyncSend() {
+    const StartSync::Packet p = gSs.Make(LimiterNowUs());
+    sendto(gCsSock, reinterpret_cast<const char*>(&p), sizeof p, 0, reinterpret_cast<const sockaddr*>(&gCsPeer), sizeof gCsPeer);
+    SteamBridge::PumpOut();  // over the Steam bridge: on its way now, not at the next poll (the time in it is this moment's)
+}
+// Decides as soon as both games' gaps are known, or at `final` with what there is, and moves the deadline. true: decided.
+bool StartSyncDecide(bool final) {
+    if (!gSs.Begun() || gSs.Decided()) return true;
+    int rtt = ggpo_sync_rtt_ms;
+    if (ggpo_rtt_min_ms >= 0 && (rtt < 0 || ggpo_rtt_min_ms < rtt)) rtt = ggpo_rtt_min_ms;
+    const StartSync::Verdict v = gSs.Decide(final, (int64_t)(gSsWaitedMs * 1000), rtt > 0 ? rtt * 500 : 0);
+    if (v.kind == StartSync::Verdict::kWait) return false;
+    char gaps[96];
+    if (gSs.Mine() == StartSync::kNone) snprintf(gaps, sizeof gaps, "own gap none, theirs %s", gSs.Peer() == StartSync::kNone ? "none" : "known");
+    else if (gSs.Peer() == StartSync::kNone) snprintf(gaps, sizeof gaps, "own gap %.1f ms%s, theirs none", gSs.Mine() / 1000.0, gSs.MinePrompt() ? "" : " (read late)");
+    else snprintf(gaps, sizeof gaps, "gaps %.1f%s and %.1f ms", gSs.Mine() / 1000.0, gSs.MinePrompt() ? "" : " (read late)", gSs.Peer() / 1000.0);
+    if (v.kind == StartSync::Verdict::kUnknown) {
+        Logger::Info("STARTSYNC gf=%u (frame %d): no usable timing from the other game (%s; %u datagram(s) read, %u sent); this "
+                     "game waited %.1f ms at frame 0%s", GameFrame(), gP2PFrames, gaps, gSs.Reads(), gSs.Sends(), gSsWaitedMs,
+                     gSsWaitedMs > 0 ? ": the wait and the handshake's round trip decide (rc29)" : "");
+        if (gSsWaitedMs > 0) StartBarrierGuess(gSsWaitedMs);
+        return true;
+    }
+    const bool move = v.kind == StartSync::Verdict::kShift && gWaitShift;
+    if (move) {
+        *reinterpret_cast<volatile double*>(0x00E0AB10) += v.shiftUs / 1e6;
+        gSsMovedUs = v.shiftUs;
+        gBalanceRestart = true;  // the frame-advantage samples describe the games before the shift
+    }
+    gSsTripUs = v.tripUs;
+    char trip[112];
+    if (v.tripUs != StartSync::kNone)
+        snprintf(trip, sizeof trip, "one-way trip %.1f ms measured (round trip %.1f)%s", v.tripUs / 1000.0, v.tripUs / 500.0,
+                 v.exact ? "" : ", a gap read late");
+    else if (v.guessed) snprintf(trip, sizeof trip, "their gap did not arrive: trip taken as %.1f ms from the round trips", rtt > 0 ? rtt / 2.0 : 0.0);
+    else snprintf(trip, sizeof trip, "their gap did not arrive: this game's own says it is the later one");
+    Logger::Info("STARTSYNC gf=%u (frame %d): the other game's frame 1 starts %s%.1f ms %s this game's (%s; %s; %u datagram(s) read, "
+                 "%u sent; this game waited %.1f ms at frame 0): %s", GameFrame(), gP2PFrames, v.bound ? "more than " : "",
+                 (v.aheadUs < 0 ? -v.aheadUs : v.aheadUs) / 1000.0, v.aheadUs < 0 ? "before" : "after", trip, gaps, gSs.Reads(),
+                 gSs.Sends(), gSsWaitedMs,
+                 move ? "this game's frame deadline moves that much later, nothing is caught up"
+                      : v.kind == StartSync::Verdict::kShift ? "not moved (waitshift 0)" : "this game's frames stay where they are");
+    return true;
+}
+// Frame 0's boundary, right after this game's first input left.
+void StartSyncBegin() {
+    gSs = StartSync::Session();
+    gSsWaitedMs = 0;
+    gSsFrameAt = 0;
+    if (gCsSock == INVALID_SOCKET) return;
+    if (!(*reinterpret_cast<const double*>(0x00E42FF0) > 0)) return;
+    const int64_t now = LimiterNowUs();
+    const int64_t frame1 = (int64_t)(*reinterpret_cast<const volatile double*>(0x00E0AB10) * 1e6);
+    // The limiter keeps its deadline within three frames of now (the 1/60 s grid); anything else is not that wait.
+    if (frame1 - now > 100000 || now - frame1 > 100000) {
+        Logger::Info("STARTSYNC gf=%u: the frame deadline is %.0f ms from now, not a 60 Hz grid: the start barrier's own "
+                     "estimate decides (rc29)", GameFrame(), (frame1 - now) / 1000.0);
+        return;
+    }
+    gSs.Begin(now, frame1);
+    // What the other game sent while it waited for this one: all of it, the newest counts (the bridge passes 64 a call).
+    for (int round = 0; round < 8; ++round) {
+        SteamBridge::Pump();
+        if (!StartSyncRead(true)) break;
+    }
+    StartSyncSend();
+    StartSyncSend();  // twice: the datagrams are unreliable, and the waiting game decides when it reads one of these
+}
+// In the start barrier's wait loop, after each 1 ms poll.
+void StartSyncLoopPoll() {
+    if (!gSs.Begun()) return;
+    StartSyncRead(true);
+    if (gSs.WantSend(LimiterNowUs())) StartSyncSend();
+}
+// At the boundary of frames 1 .. StartSync::kFrames, after the boundary's first poll: the other game's gap when it was
+// still on the way at frame 0 (both games waited), and the datagrams repeated for lost ones.
+void StartSyncAtFrame() {
+    if (!gSs.Begun() || gP2PFrames == gSsFrameAt) return;  // not twice for a boundary that advanced no frame
+    gSsFrameAt = gP2PFrames;
+    StartSyncRead(false);
+    if (gSs.WantSendAtFrame(gP2PFrames)) StartSyncSend();
+    StartSyncDecide(gP2PFrames >= StartSync::kFrames);
 }
 
 // X-ray lock (2026-11-08, rc14). The X-ray desyncs of the online matrix (batch 22: all four, one-frame shifts with the
@@ -3266,10 +3432,14 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         if (earlyAdded) {
             SteamBridge::Pump();
             ++gEarlyAdds;
+            // Start alignment: frame 0's input has just left; this game's time to its frame 1 goes after it, with what
+            // the other game's datagrams say if it got here first (StartSyncBegin).
+            if (gP2PFrames == 0 && gStartSync && gStartBarrier && gWaitShift && !gLockstep) StartSyncBegin();
         }
     }
     SteamBridge::Pump();
     ggpo_idle(gGgpo, 0);
+    if (gGgpoRunning && gP2PFrames > 0 && gP2PFrames <= StartSync::kFrames) StartSyncAtFrame();
     // The paused wait for the session (gHandshakePoll): the handshake's packets answered and read within a millisecond.
     while (gHandshakePoll && gNetplayWaitRunning && !gGgpoRunning && QpcMs(FramePace::Now() - boundaryT0) < kHandshakePollMs) {
         BarrierWait();
@@ -3465,20 +3635,27 @@ void GgpoBoundaryP2P(void* engine, float dt) {
                         BarrierWait();
                         SteamBridge::Pump();
                         ggpo_idle(gGgpo, 0);
+                        if (gP2PFrames == 0) StartSyncLoopPoll();  // start alignment: read within this millisecond, sent on every poll
                     }
                     if (xrayLock && waited) XrayLockWaited(QpcMs(FramePace::Now() - tw));
                     if (ggpo_last_confirmed_frame < gP2PFrames) break;  // stopped below (gSyncValid stays false)
-                    if (waited && !gLockstep && !xrayLock && gP2PFrames == 0) {
-                        // The handshake's round trip (no quality report yet at frame 0, and those are read at one
-                        // poll a frame). Polled once a frame it is 0-2 frames more than the wire's, a frame on
-                        // average (r3smoke: 50 and 53 ms on the harness link whose trip is one frame; half of that
-                        // left a frame of lead, which the phase alignment took 8 s to remove): less that frame, half
-                        // of it is within half a frame of the trip. Polled every millisecond on both games
-                        // ('handshakepoll 1'; the two games of a session are the same build) it is the wire's.
-                        const int rtt = ggpo_sync_rtt_ms >= 0 ? ggpo_sync_rtt_ms : ggpo_rtt_min_ms;
-                        const double pollMs = gHandshakePoll && ggpo_sync_rtt_ms >= 0 ? 0 : 1000.0 / 60;
-                        const double oneWay = rtt > pollMs ? (rtt - pollMs) / 2 : 0;
-                        WaitShift(QpcMs(FramePace::Now() - boundaryT0), oneWay, "start barrier");
+                    if (!gLockstep && !xrayLock && gP2PFrames == 0) {
+                        const double waitedMs = waited ? QpcMs(FramePace::Now() - boundaryT0) : 0;
+                        if (gSs.Begun()) {
+                            // Start alignment. The game that waited decides here when it has both games' gaps (the other
+                            // game's datagram left with its first input; read a poll later than that input it gets up to
+                            // 3 polls more). A game whose partner's gap is still on the way decides at one of its next
+                            // boundaries (StartSyncAtFrame), without waiting here.
+                            gSsWaitedMs = waitedMs;
+                            for (int k = 0; !StartSyncDecide(false) && waited && k < 3; ++k) {
+                                BarrierWait();
+                                SteamBridge::Pump();
+                                ggpo_idle(gGgpo, 0);
+                                StartSyncLoopPoll();
+                            }
+                        } else if (waited) {
+                            StartBarrierGuess(waitedMs);
+                        }
                     }
                 }
                 int disconnected = 0;
@@ -3781,6 +3958,12 @@ void SetWaitShift(bool on) {
     gWaitShift = on;
     Logger::Info("WAITSHIFT %s", on ? "on: a boundary that waited for the peer moves the frame deadline by the wait (whole frames)"
                                     : "off: the limiter catches up after a wait (rc27)");
+}
+void SetStartSync(bool on) {
+    gStartSync = on;
+    Logger::Info("STARTSYNC %s", on ? "on: at a session's start the two games measure how far apart their frames start and the "
+                                      "earlier one moves by that much"
+                                    : "off: the start barrier's wait and the handshake's round trip decide, in whole frames (rc29)");
 }
 void SetStartBarrier(bool on) {
     gStartBarrier = on;
@@ -4637,6 +4820,20 @@ void PublishOverlay() {
     if (Online::Engaged()) {
         s.wifi = (uint8_t)((Online::LocalOnWifi() ? 1 : 0) | (Online::PeerOnWifi() ? 2 : 0));
         s.relayed = Online::LinkRelayed() ? 1 : 0;
+    }
+    // The HUD display (Hud.h): where the game is, which side this PC plays, and what the next fight will run on.
+    const uint32_t gi = *reinterpret_cast<const uint32_t*>(kGameInfoPtr);
+    const uint32_t state = gi ? *reinterpret_cast<const uint32_t*>(gi + 0x4) : 0xFFFFFFFFu;
+    s.phase = state == 7 ? Overlay::kPhaseSelect : state == 1 ? Overlay::kPhaseLoad : state == 8 ? Overlay::kPhaseFight
+              : state == 9 ? Overlay::kPhaseResults : state == 0xB ? Overlay::kPhaseFinisher : Overlay::kPhaseOther;
+    s.hudHidden = s.phase == Overlay::kPhaseFinisher ? 1 : 0;  // the game takes its HUD away for a finisher
+    s.localSide = running ? (uint8_t)(gGgpoLocal + 1) : 0;
+    if (s.phase == Overlay::kPhaseSelect || s.phase == Overlay::kPhaseLoad) {
+        int rtt = -1;
+        const char* why = nullptr;
+        s.pre = (uint8_t)Online::PreFight(&rtt, &why);
+        s.preRttMs = (int16_t)rtt;
+        if (s.pre == Overlay::kPreBlocked && why) snprintf(s.stopWhy, sizeof s.stopWhy, "%s", why);
     }
     Overlay::Publish(s);
 }

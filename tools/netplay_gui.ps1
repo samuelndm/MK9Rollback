@@ -197,14 +197,15 @@ function UpdateDelayUi {
         elseif (-not (IsOnline)) { 'Local Versus uses a fixed delay of 2 frames.' }
         else { 'Auto: 1 frame up to a 50 ms ping, then 2+. The larger choice of the two players is used.' }
 }
-# The in-game network display (src\debug\Overlay.cpp): a compact line with a quality marker, all the numbers (F9 switches
-# between the two in the game), or nothing. Sent to the game as 'overlay 1|2|0'.
+# The in-game network display: part of the fight's HUD (src\debug\Hud.cpp: connection bars, ping, frames rolled back and
+# input delay under the round timer), the boxed line with all the numbers at the top left (src\debug\Overlay.cpp; F9
+# switches between the two in the game), or nothing. Sent to the game as 'overlay 1|2|0'.
 Label 'Network display:' 20 250 120 | Out-Null
 $overlayBox = New-Object System.Windows.Forms.ComboBox
 $overlayBox.DropDownStyle = 'DropDownList'
 $overlayBox.Location = New-Object System.Drawing.Point(140, 247); $overlayBox.Size = New-Object System.Drawing.Size(300, 26)
-[void]$overlayBox.Items.Add('Compact (ping and connection quality)')
-[void]$overlayBox.Items.Add('Detailed (all numbers)')
+[void]$overlayBox.Items.Add('In the HUD (ping, rollback, delay)')
+[void]$overlayBox.Items.Add('Detailed (all numbers, top left)')
 [void]$overlayBox.Items.Add('Off')
 $overlayLevels = @(1, 2, 0)
 $overlayBox.SelectedIndex = 0
@@ -276,7 +277,7 @@ $troubleLines = @(
     'Close browsers and other heavy apps (downloads, streaming, launchers).',
     'Use a wired (Ethernet) connection instead of Wi-Fi.',
     'Both players need the same version ("Check for updates" at the bottom).',
-    'In a fight, F9 shows or hides the network details.'
+    'In a fight, F9 switches between the HUD display and the detailed network line.'
 )
 function ShowTrouble {
     [void][System.Windows.Forms.MessageBox]::Show("If the game stutters, freezes or will not connect:`n`n- $($troubleLines -join "`n- ")", 'Having trouble?', 'OK', 'Information')

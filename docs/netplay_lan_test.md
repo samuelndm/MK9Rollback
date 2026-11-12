@@ -155,13 +155,17 @@ Then use the same `ggpo netplay ...` / `ggpo steamnetplay ...` commands as above
 
 ## Network display and troubleshooting
 
-In a fight the top left shows `ROLLBACK  22 ms  delay 1` and a three-bar marker: green (round trip up to 60 ms, little rollback, no
-stalls), yellow (61-120 ms, 3-4 frames of rollback, or a wait of 150 ms or more for the opponent) or red (above 120 ms, 5+ frames
-of rollback, a wait of 500 ms or more, or an opponent that stopped responding). A second line explains a hiccup for a few seconds
-("Connection hiccup", "This PC hitched" when the freeze came from this PC, "Opponent not responding..."). F9 switches to the detailed
-line (rtt, ping, rollback depths, loads, kbps, queue, waits) and back; the window's "Network display" box chooses the start state
-(Compact, Detailed or Off, sent to the game as `overlay 1|2|0`). When a session stops, the line says why in plain words and that MK9's own
-netcode plays the rest of the match.
+In a fight the display is part of the HUD, under the round timer: three connection bars, the round trip (`22 MS`), `R` with the
+most frames rolled back in the last second (not in Safe mode) and `D` with the input delay. The bars are green (round trip up to
+60 ms, little rollback, no stalls), yellow (61-120 ms, 3-4 frames of rollback, or a wait of 150 ms or more for the opponent) or red
+(above 120 ms, 5+ frames of rollback, a wait of 500 ms or more, or an opponent that stopped responding). A Wi-Fi mark stands at the
+side of each player whose PC is on Wi-Fi. A note under the group explains a hiccup for a few seconds ("Connection hiccup", "This PC
+hitched" when the freeze came from this PC, "Opponent not responding"). Before the fight (character select, loading) a badge says
+`ROLLBACK READY` with the ping, or why MK9's own netcode will play. In a fight on MK9's netcode a small `MK9 NETCODE` tag stands in
+the group's place, with the reason for the first seconds. The display hides with the game's HUD in a finisher. F9 switches to the
+detailed line at the top left (rtt, ping, rollback depths, loads, kbps, queue, waits) and back; the window's "Network display" box
+chooses the start state (In the HUD, Detailed or Off, sent to the game as `overlay 1|2|0`). When a session stops, a note says why in
+plain words and that MK9's own netcode plays the rest of the match.
 
 If the game stutters, freezes or will not connect:
 - Allow MKKE.exe through the Windows firewall (Windows Security > Firewall > Allow an app).
@@ -171,4 +175,4 @@ If the game stutters, freezes or will not connect:
 - Close browsers and other heavy apps (downloads, streaming, launchers).
 - Use a wired (Ethernet) connection instead of Wi-Fi.
 - Both players need the same version ("Check for updates" in the window).
-- In a fight, F9 shows or hides the network details.
+- In a fight, F9 switches between the HUD display and the detailed network line.

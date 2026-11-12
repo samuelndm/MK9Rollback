@@ -376,6 +376,21 @@ void Execute(const std::string& line) {
         Overlay::SetLevel(value);
         if (value > 0) Overlay::EnsureInstalled();
         Logger::Info("OVERLAY level %d", Overlay::Level());
+    } else if (!strcmp(verb, "huddemo") && sscanf(line.c_str(), "huddemo %d", &value) == 1) {
+        // The HUD display's canned states (Hud::Demo), for screenshots without an online match: 0 = off. The counters
+        // are logged first: the draw time of the state that was on screen until now.
+        Overlay::LogCounters();
+        Overlay::SetDemo(value);
+        if (value > 0) Overlay::EnsureInstalled();
+        Logger::Info("HUDDEMO %d (0: off, the published state is shown)", Overlay::Demo());
+    } else if (!strcmp(verb, "hudshot")) {
+        // The next finished frame as a BMP (the harness looks at the display's place; works with the PC locked).
+        char path[MAX_PATH] = "";
+        if (sscanf(line.c_str(), "hudshot %259[^\r\n]", path) == 1) {
+            Overlay::EnsureInstalled();
+            Overlay::RequestShot(path);
+            Logger::Info("HUDSHOT wanted");
+        }
     } else if (!strcmp(verb, "framelatency") && sscanf(line.c_str(), "framelatency %d", &value) == 1) {
         Overlay::SetFrameLatency(value);
         Logger::Info("FRAMELATENCY %d (0: the game's own; applied at the next drawn frame)", Overlay::FrameLatencyWanted());
@@ -1356,6 +1371,8 @@ void Execute(const std::string& line) {
         Rollback::SetCanonClock(value != 0);
     } else if (!strcmp(verb, "startbarrier") && sscanf(line.c_str(), "startbarrier %d", &value) == 1) {
         Rollback::SetStartBarrier(value != 0);
+    } else if (!strcmp(verb, "startsync") && sscanf(line.c_str(), "startsync %d", &value) == 1) {
+        Rollback::SetStartSync(value != 0);
     } else if (!strcmp(verb, "desyncstop") && sscanf(line.c_str(), "desyncstop %d", &value) == 1) {
         Rollback::SetDesyncStop(value);
     } else if (!strcmp(verb, "handshakepoll") && sscanf(line.c_str(), "handshakepoll %d", &value) == 1) {

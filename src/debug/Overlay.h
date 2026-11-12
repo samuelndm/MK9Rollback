@@ -8,6 +8,10 @@
 namespace Overlay {
 
 enum Mode : uint8_t { kOff = 0, kWaiting, kRollback, kLockstep, kSyncTest, kStopped, kInfo };  // kInfo: stopWhy as is
+// Where the game is (GameInfo+0x4), for the HUD display: it draws its fight group in a fight and its badge before one.
+enum Phase : uint8_t { kPhaseOther = 0, kPhaseSelect, kPhaseLoad, kPhaseFight, kPhaseResults, kPhaseFinisher };
+// Before an online fight (character select, loading): what the next fight will run on (Online::PreFight).
+enum Pre : uint8_t { kPreNone = 0, kPreReady, kPreNoMod, kPreBlocked };  // kPreBlocked: the reason is in stopWhy
 
 struct Stats {  // plain data, no pointers
     uint8_t mode = kOff;
@@ -26,6 +30,12 @@ struct Stats {  // plain data, no pointers
     // The connection's kind (round 3, an online match's hellos): shown because the players can act on it.
     uint8_t wifi = 0;              // bit 0: this PC's route is Wi-Fi, bit 1: the opponent's
     uint8_t relayed = 0;           // Steam carries the match through its relay, not directly
+    // The HUD display (Hud.h; feature plan 4.1).
+    uint8_t phase = kPhaseOther;   // Phase
+    uint8_t hudHidden = 0;         // the game's own HUD is off the screen (a finisher): ours hides with it
+    uint8_t localSide = 0;         // the fighter this PC plays, 1 or 2 (the Wi-Fi marks' sides); 0 unknown
+    uint8_t pre = kPreNone;        // Pre
+    int16_t preRttMs = -1;         // kPreReady: the hellos' round trip in ms; -1 not measured yet
 };
 
 bool Install();          // verifies the 16 bytes at 0x00667106 first (fail closed); idempotent
@@ -33,8 +43,17 @@ void EnsureInstalled();  // game thread, now and then: re-applies the patch if a
 void Disable();          // unload: the stub becomes a pass-through (call before CodePatch::RestoreAll)
 void RequestDisplayLog();  // the render thread logs the display mode at its next frame (DISPLAY line; each session's start)
 long InFlight();         // render-thread calls inside the draw
-void SetLevel(int level);  // 0 off, 1 on (only while netplay is armed, starting, running or just stopped), 2 verbose
+// 0 off; 1 the display that belongs to the game's HUD (Hud.h: a group under the round timer in a fight, a badge before
+// one, nothing otherwise); 2 the boxed line with every number, top left, always (F9 in the game switches 1 <-> 2).
+void SetLevel(int level);
 int Level();
+// 'huddemo N' (test harness, screenshots): the HUD display shows canned state N of Hud::Demo instead of the published
+// stats, wherever the game is; 0 = off. Drawing only: nothing in the game or a session changes.
+// 'hudshot <file>' (the test harness): the next finished frame, with the display on it, is written to this file as a
+// BMP by the rendering thread. The log says "HUDSHOT written" or why not.
+void RequestShot(const char* path);
+void SetDemo(int n);
+int Demo();
 void Publish(const Stats& s);  // game thread, live frames only
 void LogCounters();            // game thread: draws, draws while resimulating, max draw time
 // Render latency: 'framelatency N' asks the IDirect3DDevice9Ex for at most N frames queued ahead of the GPU

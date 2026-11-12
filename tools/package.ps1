@@ -70,10 +70,11 @@ HOW TO PLAY
 3. Press Play. The window starts Mortal Kombat with the mod. No codes to swap.
 4. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.
    If your opponent also started the game with "Play Online.bat" (this same zip), the mod's netcode takes
-   over by itself at the fight start; the top left of the screen then shows ROLLBACK (LOCKSTEP in Safe
-   mode), the ping, the input delay and a three-bar connection marker (green good, yellow so-so, red
-   bad). F9 shows or hides the network details; the window's "Network display" box picks Compact,
-   Detailed or Off. After the last round, the results and rematch screens run on
+   over by itself at the fight start; under the round timer the game then shows three connection bars
+   (green good, yellow so-so, red bad), the ping in ms, R (frames rolled back, not in Safe mode) and D
+   (input delay). Before the fight the screen says ROLLBACK READY. F9 switches to a line with every
+   number and back; the window's "Network display" box picks In the HUD, Detailed or Off. After the
+   last round, the results and rematch screens run on
    MK9's own netcode; the mod takes over again at the next fight.
    Against anyone without the mod, MK9's own netcode plays. Ranked is never touched by the mod.
 5. When you are done, or if something goes wrong, press "Save logs to the Desktop" and send the zip it
@@ -88,7 +89,7 @@ HAVING TROUBLE? (the window has a "Having trouble?" button with the same list)
 - Close browsers and other heavy apps (downloads, streaming, launchers).
 - Use a wired (Ethernet) connection instead of Wi-Fi.
 - Both players need the same version ("Check for updates" at the bottom of the window).
-- In a fight, F9 shows or hides the network details.
+- In a fight, F9 switches between the HUD display and the detailed network line.
 6. Updates: the window checks for a new version when it opens. If it says one is available, close the
    game and press "Update now" at the bottom; the window restarts on the new version. Both players need
    the same version. (The files it replaced are kept in the previous_version folder; the window's "Go back

@@ -12,6 +12,7 @@
 #include "../hook/ObjectHooks.h"
 #include "../rollback/FramePace.h"
 #include "../rollback/RollbackManager.h"
+#include "Hud.h"
 #include "Logger.h"
 
 // Site (docs\status_overlay_plan.md 2.3, checked against the disassembly 2026-10-29): RHIEndDrawingViewport 0x00666F20,
@@ -28,7 +29,10 @@ volatile LONG gEnabled = 0;   // the stub draws (else it only performs the repla
 volatile LONG gWanted = 0;    // Install succeeded once and Disable was not called: EnsureInstalled may re-apply
 volatile LONG gInFlight = 0;
 volatile LONG gLevel = 1;
+volatile LONG gDemo = 0;      // 'huddemo N': the HUD display shows canned state N (Hud::Demo) instead of the published one
 volatile LONG gDraws = 0, gResimDraws = 0, gMaxUs = 0;
+volatile LONG gHudDraws = 0, gHudMaxVerts = 0, gHudDropped = 0;
+volatile LONG gWinDraws = 0, gWinSumUs = 0, gWinMaxUs = 0;  // since the last LogCounters (at most a few thousand draws)
 volatile LONG gFirstLogged = 0;
 
 Overlay::Stats gBuf[2];
@@ -88,11 +92,9 @@ bool BuildGlyphs() {
     return lit > 95;  // most glyphs have pixels
 }
 
-struct Vtx {
-    float x, y, z, rhw;
-    DWORD color;
-};
-constexpr int kMaxV = 24000;
+using Vtx = Hud::Vtx;  // x, y, z, rhw, colour
+// The HUD display's largest frame in tests\host\hud_test.cpp is about half of this (two long notes at 1440 lines).
+constexpr int kMaxV = 96000;
 Vtx gV[kMaxV];  // render thread only
 int gN = 0;
 
@@ -129,35 +131,9 @@ float Text(const char* s, float x, float y, float scale, DWORD c) {
 
 constexpr DWORD kWhite = 0xFFF2F2F2, kGreen = 0xFF40E060, kYellow = 0xFFFFD040, kRed = 0xFFFF4040, kGrey = 0xFFC0C0C0, kDim = 0xFF505050;
 
-// Connection quality from the network inputs only (not the mode): 0 good, 1 so-so, 2 bad.
-int Quality(const Overlay::Stats& s) {
-    const int rtt = s.rttMs >= 0 ? s.rttMs : s.ping;  // GGPO's ping is quantized to frames: only a fallback
-    const bool stallRecent = s.netStallAgoS <= 5;
-    if ((rtt > 120) || s.maxDepth >= 5 || s.peerInterrupted || (stallRecent && s.netStallMs >= 500)) return 2;
-    if ((rtt > 60) || s.maxDepth >= 3 || s.loadsPerSec > 20 || (stallRecent && s.netStallMs >= 150)) return 1;
-    return 0;
-}
-
-// Short player text for a raw stop reason (GgpoStop / Disengage); anything unknown is shown as it is.
-const char* StopText(const char* why) {
-    struct Map {
-        const char* key;
-        const char* text;
-    };
-    static const Map kMap[] = {
-        {"peer disconnected", "Opponent disconnected"},
-        {"did not join", "Opponent's game did not start the session"},
-        {"not starting the session", "Opponent's game did not start the session"},
-        {"environment mismatch", "Different mod version or game files"},
-        {"frame 0 differs", "Games started out of sync"},
-        {"different states", "Games started out of sync"},
-        {"Safe/Rollback", "Different Safe/Rollback setting"},
-        {"script VM was busy", "Internal timing problem"},
-    };
-    for (const Map& m : kMap)
-        if (strstr(why, m.key)) return m.text;
-    return why;
-}
+// The connection quality rule and the stop reasons' player texts are shared with the HUD display: Hud.cpp.
+using Hud::Quality;
+using Hud::StopText;
 
 // The main line for the current stats. a: state text in color ca; b: an explicit suffix (DESYNC), drawn red, else empty.
 // bars: connection quality marker (3 = good .. 1 = bad), -1 none.
@@ -347,56 +323,89 @@ void Draw(IDirect3DDevice9* dev) {
     PollToggle();
     Overlay::Stats s = gBuf[gFront & 1];
     s.stopWhy[sizeof s.stopWhy - 1] = 0;
-    const int level = gLevel;
-    if (level <= 0 || (level == 1 && s.mode == Overlay::kOff)) return;
-    static char la[256], lb[256], lw[96];  // render thread only (Format writes la and lb with the same size)
-    DWORD color;
-    int bars;
-    Format(s, level, la, lb, sizeof la, &color, &bars);
+    int level = gLevel;
+    const int demo = gDemo;
+    if (demo > 0 && Hud::Demo(demo, &s) && level <= 0) level = 1;
     D3DVIEWPORT9 vp{};
     if (FAILED(dev->GetViewport(&vp)) || vp.Width < 64 || vp.Height < 64) return;
-    const float scale = (float)std::max(1, (int)((double)vp.Height / 540.0 + 0.5));
-    const float x = (float)vp.X + 8 * scale, y = (float)vp.Y + 6 * scale, right = (float)vp.X + (float)vp.Width - 8 * scale;
-    const float step = (kCH + 4) * scale;
-    const bool live = s.mode == Overlay::kRollback || s.mode == Overlay::kLockstep;
+    // The faces of the display that belongs to the game's HUD (Hud.cpp) are built once per picture size: at the first
+    // frame after the DLL loaded (the game's start) or after a resolution change, whatever the level is then, so that
+    // the tens of milliseconds never fall into a fight (F9 can bring the display in at any moment).
+    const Hud::View view{(int)vp.X, (int)vp.Y, (int)vp.Width, (int)vp.Height};
+    static int builds = 0;
+    bool wait = false;
+    const bool faces = Hud::Prepare(view, &wait);
+    if (Hud::Builds() != builds) {
+        builds = Hud::Builds();
+        LARGE_INTEGER tb, tf;
+        QueryPerformanceCounter(&tb);
+        QueryPerformanceFrequency(&tf);
+        char text[200];
+        Hud::Describe(text, sizeof text);
+        Logger::Info("HUD display: faces %s, %.1f ms%s", text, (double)(tb.QuadPart - t0.QuadPart) * 1000.0 / (double)(tf.QuadPart ? tf.QuadPart : 1),
+                     faces ? "" : "; the status line is drawn the old way");
+        t0 = tb;  // the one-time build is not a draw time
+    }
+    if (level <= 0) return;
+    if (level == 1 && wait) return;  // the picture size has just changed: nothing until the faces for it are built
     gN = 0;
-    float ly = y;
-    DrawLine(la, color, lb, bars, x, ly, scale, right);
-    ly += step;
-    // Transient warnings (a few seconds after the event; the stats are published only while the game runs).
-    DWORD wc = kYellow;
-    lw[0] = 0;
-    if (live) {
-        if (s.peerInterrupted) {
-            snprintf(lw, sizeof lw, "Opponent not responding...");
-            wc = kRed;
-        } else {
-            const bool stall = s.netStallMs >= 150 && s.netStallAgoS <= 5;
-            const bool hitch = s.localHitchMs >= 100 && s.localHitchAgoS <= 5;
-            if (hitch && (!stall || s.localHitchMs >= s.netStallMs))
-                snprintf(lw, sizeof lw, "This PC hitched: %u ms frame", (unsigned)s.localHitchMs);
-            else if (stall)
-                snprintf(lw, sizeof lw, "Connection hiccup: waited %.1f s for the opponent", s.netStallMs / 1000.0);
-        }
-    } else if (s.mode == Overlay::kStopped) {
-        snprintf(lw, sizeof lw, "MK9 netcode plays the rest of this match");
-        wc = kWhite;
-    }
-    if (lw[0]) {
-        DrawLine(lw, wc, nullptr, -1, x, ly, scale, right);
+    // Level 1: the HUD display. Without a usable face from Windows, the old line below is drawn instead.
+    const bool hud = level == 1 && faces;
+    if (hud) {
+        gN = Hud::Build(s, view, GetTickCount64(), gV, kMaxV);
+        if (gN > gHudMaxVerts) InterlockedExchange(&gHudMaxVerts, gN);
+        if (const int dropped = Hud::Dropped()) InterlockedExchangeAdd(&gHudDropped, dropped);
+        if (gN >= 3) InterlockedIncrement(&gHudDraws);
+    } else {
+        if (level == 1 && s.mode == Overlay::kOff) return;
+        static char la[256], lb[256], lw[96];  // render thread only (Format writes la and lb with the same size)
+        DWORD color;
+        int bars;
+        Format(s, level, la, lb, sizeof la, &color, &bars);
+        const float scale = (float)std::max(1, (int)((double)vp.Height / 540.0 + 0.5));
+        const float x = (float)vp.X + 8 * scale, y = (float)vp.Y + 6 * scale, right = (float)vp.X + (float)vp.Width - 8 * scale;
+        const float step = (kCH + 4) * scale;
+        const bool live = s.mode == Overlay::kRollback || s.mode == Overlay::kLockstep;
+        float ly = y;
+        DrawLine(la, color, lb, bars, x, ly, scale, right);
         ly += step;
-    }
-    // Hint for the first ~8 s of the first session after the DLL loaded.
-    static ULONGLONG hintStart = 0;
-    if (live && !hintStart) hintStart = GetTickCount64();
-    if (level == 1 && hintStart && !gHintDone) {
-        if (GetTickCount64() - hintStart < 8000) {
-            static char lh[] = "F9: network details";
-            DrawLine(lh, kGrey, nullptr, -1, x, ly, scale, right);
-        } else {
-            gHintDone = true;
+        // Transient warnings (a few seconds after the event; the stats are published only while the game runs).
+        DWORD wc = kYellow;
+        lw[0] = 0;
+        if (live) {
+            if (s.peerInterrupted) {
+                snprintf(lw, sizeof lw, "Opponent not responding...");
+                wc = kRed;
+            } else {
+                const bool stall = s.netStallMs >= 150 && s.netStallAgoS <= 5;
+                const bool hitch = s.localHitchMs >= 100 && s.localHitchAgoS <= 5;
+                if (hitch && (!stall || s.localHitchMs >= s.netStallMs))
+                    snprintf(lw, sizeof lw, "This PC hitched: %u ms frame", (unsigned)s.localHitchMs);
+                else if (stall)
+                    snprintf(lw, sizeof lw, "Connection hiccup: waited %.1f s for the opponent", s.netStallMs / 1000.0);
+            }
+        } else if (s.mode == Overlay::kStopped) {
+            snprintf(lw, sizeof lw, "MK9 netcode plays the rest of this match");
+            wc = kWhite;
+        }
+        if (lw[0]) {
+            DrawLine(lw, wc, nullptr, -1, x, ly, scale, right);
+            ly += step;
+        }
+        // Hint for the first ~8 s of the first session after the DLL loaded (only where the old line stands in for the
+        // HUD display: the Play Online window names F9 beside its choice).
+        static ULONGLONG hintStart = 0;
+        if (live && !hintStart) hintStart = GetTickCount64();
+        if (level == 1 && hintStart && !gHintDone) {
+            if (GetTickCount64() - hintStart < 8000) {
+                static char lh[] = "F9: network details";
+                DrawLine(lh, kGrey, nullptr, -1, x, ly, scale, right);
+            } else {
+                gHintDone = true;
+            }
         }
     }
+    if (gN < 3) return;  // nothing on screen this frame: the device is not touched
     IDirect3DStateBlock9* sb = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
@@ -425,7 +434,7 @@ void Draw(IDirect3DDevice9* dev) {
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
     dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
-    if (gN >= 3) dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, gN / 3, gV, sizeof(Vtx));
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, gN / 3, gV, sizeof(Vtx));
     sb->Apply();
     sb->Release();
     InterlockedIncrement(&gDraws);
@@ -434,6 +443,9 @@ void Draw(IDirect3DDevice9* dev) {
     QueryPerformanceFrequency(&fq);
     const LONG us = (LONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (fq.QuadPart ? fq.QuadPart : 1));
     if (us > gMaxUs) InterlockedExchange(&gMaxUs, us);
+    InterlockedIncrement(&gWinDraws);
+    InterlockedExchangeAdd(&gWinSumUs, us > 100000 ? 100000 : us);  // capped: the sum stays far inside a LONG
+    if (us > gWinMaxUs) InterlockedExchange(&gWinMaxUs, us);
 }
 }  // namespace
 
@@ -517,6 +529,63 @@ void LatencyProbe(IDirect3DDevice9* dev) {
     if (SUCCEEDED(q->Issue(D3DISSUE_END))) gQueryPending[gQueryNext] = true;
     gQueryNext = (gQueryNext + 1) % kQueries;
 }
+
+// ---- 'hudshot <file>': the finished frame, with the display on it, written as a BMP ----
+// For the test harness: the HUD display's place in a real fight, in the back buffer's own pixels, also while the PC is
+// locked (a screenshot of the screen shows the lock screen then). The surfaces are created and released inside the one
+// frame that takes the picture; nothing stays on the device.
+volatile LONG gShotWanted = 0;
+wchar_t gShotPath[MAX_PATH];  // the game thread writes it, then sets gShotWanted
+
+void Capture(IDirect3DDevice9* dev) {
+    IDirect3DSurface9 *rt = nullptr, *plain = nullptr, *sys = nullptr;
+    const char* why = nullptr;
+    D3DSURFACE_DESC d{};
+    HRESULT hr = dev->GetRenderTarget(0, &rt);
+    if (FAILED(hr) || !rt) why = "GetRenderTarget";
+    else if (FAILED(hr = rt->GetDesc(&d))) why = "GetDesc";
+    else if (d.Format != D3DFMT_X8R8G8B8 && d.Format != D3DFMT_A8R8G8B8) why = "the back buffer is not 32-bit BGRA";
+    IDirect3DSurface9* src = rt;
+    if (!why && d.MultiSampleType != D3DMULTISAMPLE_NONE) {  // a multisampled target is resolved first
+        if (FAILED(hr = dev->CreateRenderTarget(d.Width, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &plain, nullptr))) why = "CreateRenderTarget";
+        else if (FAILED(hr = dev->StretchRect(rt, nullptr, plain, nullptr, D3DTEXF_NONE))) why = "StretchRect";
+        src = plain;
+    }
+    if (!why && FAILED(hr = dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr))) why = "CreateOffscreenPlainSurface";
+    if (!why && FAILED(hr = dev->GetRenderTargetData(src, sys))) why = "GetRenderTargetData";
+    D3DLOCKED_RECT lr{};
+    if (!why && FAILED(hr = sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) why = "LockRect";
+    if (!why) {
+        const HANDLE f = CreateFileW(gShotPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            why = "the file could not be created";
+            hr = HRESULT_FROM_WIN32(GetLastError());
+        } else {
+            BITMAPFILEHEADER fh{};
+            BITMAPINFOHEADER ih{};
+            ih.biSize = sizeof ih;
+            ih.biWidth = (LONG)d.Width;
+            ih.biHeight = (LONG)d.Height;  // bottom-up
+            ih.biPlanes = 1;
+            ih.biBitCount = 32;
+            ih.biCompression = BI_RGB;
+            fh.bfType = 0x4D42;
+            fh.bfOffBits = sizeof fh + sizeof ih;
+            fh.bfSize = fh.bfOffBits + d.Width * d.Height * 4;
+            DWORD n = 0;
+            WriteFile(f, &fh, sizeof fh, &n, nullptr);
+            WriteFile(f, &ih, sizeof ih, &n, nullptr);
+            for (UINT y = d.Height; y-- > 0;) WriteFile(f, static_cast<const uint8_t*>(lr.pBits) + (size_t)y * lr.Pitch, d.Width * 4, &n, nullptr);
+            CloseHandle(f);
+        }
+        sys->UnlockRect();
+    }
+    if (sys) sys->Release();
+    if (plain) plain->Release();
+    if (rt) rt->Release();
+    if (why) Logger::Info("HUDSHOT failed: %s (%08lX), back buffer %ux%u format %d multisample %d", why, (unsigned long)hr, d.Width, d.Height, (int)d.Format, (int)d.MultiSampleType);
+    else Logger::Info("HUDSHOT written: %ux%u, format %d, multisample %d", d.Width, d.Height, (int)d.Format, (int)d.MultiSampleType);
+}
 }  // namespace
 
 extern "C" void __cdecl MK9R_OverlayDraw(IDirect3DDevice9* dev) {
@@ -527,6 +596,7 @@ extern "C" void __cdecl MK9R_OverlayDraw(IDirect3DDevice9* dev) {
     if (gEnabled && dev) {
         if (!InterlockedExchange(&gFirstLogged, 1)) FirstCall(dev);
         if (gEnabled) Draw(dev);
+        if (gEnabled && InterlockedExchange(&gShotWanted, 0)) Capture(dev);
     }
     InterlockedDecrement(&gInFlight);
 }
@@ -589,6 +659,14 @@ void RequestDisplayLog() { InterlockedExchange(&gDisplayLogWanted, 1); }
 
 void SetLevel(int level) { InterlockedExchange(&gLevel, level < 0 ? 0 : level > 2 ? 2 : level); }
 int Level() { return gLevel; }
+void SetDemo(int n) { InterlockedExchange(&gDemo, n < 0 || n > Hud::kDemos ? 0 : n); }
+int Demo() { return gDemo; }
+
+void RequestShot(const char* path) {
+    if (gShotWanted) return;  // the previous one is not taken yet
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, gShotPath, MAX_PATH)) return;
+    InterlockedExchange(&gShotWanted, 1);
+}
 
 void Publish(const Stats& s) {
     const LONG back = (gFront & 1) ^ 1;
@@ -597,8 +675,14 @@ void Publish(const Stats& s) {
 }
 
 void LogCounters() {
-    Logger::Info("OVERLAY draws %ld, while resimulating %ld, max draw time %ld us, level %ld%s", gDraws, gResimDraws, gMaxUs, gLevel,
-                 gEnabled ? "" : " (disabled)");
+    // The draw time since the previous report (every ten seconds of a session, and at each 'huddemo'): the maximum over
+    // the whole run says nothing about the usual cost, one slow frame at the start sets it for the evening.
+    const LONG wn = InterlockedExchange(&gWinDraws, 0), wsum = InterlockedExchange(&gWinSumUs, 0);
+    const LONG wmax = InterlockedExchange(&gWinMaxUs, 0);
+    Logger::Info("OVERLAY draws %ld, while resimulating %ld, max draw time %ld us, level %ld%s; HUD display: %ld of them, largest "
+                 "frame %ld vertices of %d, %ld rectangles dropped; since the last report %ld draws, average %ld us, max %ld us",
+                 gDraws, gResimDraws, gMaxUs, gLevel, gEnabled ? "" : " (disabled)", gHudDraws, gHudMaxVerts, kMaxV, gHudDropped, wn,
+                 wn ? wsum / wn : 0, wmax);
     const LONG n = InterlockedExchange(&gQueueFrames, 0), sum = InterlockedExchange(&gQueueSum, 0);
     const LONG mx = InterlockedExchange(&gQueueMax, 0), full = InterlockedExchange(&gQueueFull, 0);
     if (n)

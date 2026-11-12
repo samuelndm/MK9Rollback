@@ -1039,6 +1039,32 @@ const char* StatusText() {  // game thread (overlay publish); null outside an on
     return Fits("MK9 NETCODE  (both run the mod: rollback from the next fight)");
 }
 
+int PreFight(int* rttMs, const char** why) {  // game thread (overlay publish)
+    *rttMs = -1;
+    *why = nullptr;
+    if ((!gPeer && !gAuto) || gEngaged || !*reinterpret_cast<const volatile uint32_t*>(kOnlineManager)) return Overlay::kPreNone;
+    const uint32_t state = GameState();
+    if (state != 7 && state != kLoadState) return Overlay::kPreNone;  // 7: character select
+    if (gFailedThisMatch || !gPeer) return Overlay::kPreNone;
+    const ULONGLONG now = GetTickCount64();
+    // "No mod" as in Tick: the opponent known for 5 s and no hello of any kind in this match.
+    if (!HeardPeer()) return gPeerKnownAt && now - gPeerKnownAt >= 5000 ? Overlay::kPreNoMod : Overlay::kPreNone;
+    if (const char* text = HelloProto::StatusText(gVerdict)) {
+        *why = text;
+        return Overlay::kPreBlocked;
+    }
+    if (gVerdict != HelloProto::Match::kSame || now - gAnyHelloRx > kHelloFreshMs) return Overlay::kPreNone;
+    // The fight's own check (Tick) refuses anything but a one-on-one Player/Private match: no promise before those.
+    uint32_t type = 0, matchType = 0;
+    if (gMatchRefused || !OneOnOneMatch(&type, &matchType)) return Overlay::kPreNone;
+    if (gPingCount && gPingPeer == gPeer) {
+        uint32_t median = 0;
+        PingEstimate(&median);
+        *rttMs = (int)(median < 9999 ? median : 9999);
+    }
+    return Overlay::kPreReady;
+}
+
 void TestScan() {  // 'onlinescan': the fallback pass on demand (its log line gives size and time); results unused
     if (gWideState == 1) return;
     const uint64_t self = SteamBridge::SelfId();

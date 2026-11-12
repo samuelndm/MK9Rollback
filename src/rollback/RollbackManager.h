@@ -43,6 +43,7 @@ void SetHandshakePoll(bool on);  // 'handshakepoll 0|1': the paused wait for a s
 void SetPhaseGrowAfter(int decisions);  // 'phasegrow N': the phase search's step grows from decision N+1 in a row with one leader (default 2; 1 = rc27)
 void SetWaitShift(bool on);      // 'waitshift 0|1': a boundary that waited for the peer moves the frame deadline by the wait (default 1)
 void SetStartBarrier(bool on);   // 'startbarrier 0|1': rollback frame 0 waits for the peer's first input (default 1)
+void SetStartSync(bool on);      // 'startsync 0|1': the games measure their start offset and the earlier one moves by it (default 1; 0 = rc29)
 void SetEarlyInput(bool on);     // 'earlyinput 0|1': P2P local input added and sent at the boundary's start (default 1)
 void SetLateSample(bool on);     // 'latesample 0|1': P2P controllers sampled at the boundary, after MK9's frame wait (default 1)
 void SetSkipLive(bool on);       // 'skiplive 0|1': no live save for a frame whose remote input is already in (default 1)

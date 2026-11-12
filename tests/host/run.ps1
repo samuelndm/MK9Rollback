@@ -1,9 +1,12 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,codewrite,strappend,guardpage,ggpo,logger] [-Seconds 25]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,codewrite,strappend,guardpage,hud,ggpo,logger] [-Seconds 25]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
 #   finisher  src\net\FinisherRule.h: the frame where a session is handed back to MK9's netcode in the finisher phase;
 #           two simulated games with different rollback histories must pick the same one.
+#   startsync  src\net\StartSync.h: the start alignment of a session's two games; two simulated games that reach frame 0
+#           at different moments exchange their timing over simulated links (trips of 0.1-80 ms, jitter, loss, the
+#           harness's loopback channel) and must end with their frame grids together, only the earlier game moving.
 #   codewrite  src\hook\CodePatch + src\common\ThreadWalk.h: code patched while 48 threads run (all suspended for a write
 #           and running after it, a write under a running thread refused), and 56 writes (what arming makes in one game
 #           frame) inside half a second. The program is not called "codepatch": Windows takes a 32-bit program with
@@ -11,6 +14,10 @@
 #   strappend  src\common\StrAppend.h: AppendF never writes past its buffer and always leaves it terminated.
 #   guardpage  src\common\GuardPage.h: a guarded read of another thread's stack guard page puts the guard back, so
 #           that thread can still grow its stack (a child process shows the crash without it).
+#   hud    src\debug\Hud.cpp: the network display that belongs to the game's HUD, without the game. For eight picture
+#           sizes and twelve canned states: whole rectangles inside the picture, none dropped, gone half a second after
+#           the state ends, hidden with the game's HUD, a full buffer reported and never overrun; the build time of a
+#           frame and of the faces. Each case is also drawn into build\hosttests\hud\hud_<size>_<state>.bmp.
 #   ggpo   the patched GGPO library (tools\build_ggpo.ps1) against a hand-made remote on 127.0.0.1 (ggpo_raw_peer.cpp):
 #           a valid 60 Hz session with malformed datagrams of every kind in between; after each kind the peer must still
 #           take the stream. Needs a library with the round 3 exports (ggpo_bye_on_close, ggpo_bind_failed). Then the
@@ -23,10 +30,10 @@
 #           lines early, for the report of dropped lines.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'codewrite', 'strappend', 'guardpage', 'ggpo', 'logger'), [int]$Seconds = 25)
+      [string[]]$Only = @('hello', 'finisher', 'startsync', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'), [int]$Seconds = 25)
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'codewrite', 'strappend', 'guardpage', 'ggpo', 'logger'
+$known = 'hello', 'finisher', 'startsync', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -66,15 +73,30 @@ if ($Only -contains 'finisher') {
     if (-not $ok) { $failed += 'finisher' }
 }
 
+if ($Only -contains 'startsync') {
+    Write-Host '== start alignment'
+    $net = Join-Path $root 'src\net'
+    $ok = Build 'startsync_test.exe' @('-std=c++20', '-O2', '-fno-exceptions', '-fno-rtti', '-static', '-Wall', '-I', $net,
+                                       (Join-Path $PSScriptRoot 'startsync_test.cpp'))
+    if ($ok) {
+        & (Join-Path $out 'startsync_test.exe') | Where-Object { $_ -match '^FAIL|^ +\S.*: (A moved|B''s frame)|checks,' } | ForEach-Object { Write-Host "  $_" }
+        $ok = $LASTEXITCODE -eq 0
+    }
+    if (-not $ok) { $failed += 'startsync' }
+}
+
 # One-file tests of the DLL's own building blocks: built with the DLL's flags, run with a time limit (a test that hangs
 # is a failure, not a stuck run), their summary lines shown.
-function RunSmall([string]$name, [string]$title, [string[]]$sources, [string[]]$extraFlags, [int]$limitSeconds) {
+function RunSmall([string]$name, [string]$title, [string[]]$sources, [string[]]$extraFlags, [int]$limitSeconds, [string[]]$libs = @(),
+                  [string[]]$exeArgs = @()) {
     Write-Host "== $title"
     $flags = @('-std=c++20', '-O2', '-fno-exceptions', '-fno-rtti', '-static', '-DUNICODE', '-D_UNICODE', '-DWIN32_LEAN_AND_MEAN', '-Wall') +
-             $extraFlags + $sources
+             $extraFlags + $sources + $libs
     if (-not (Build "$name.exe" $flags)) { return $false }
     $log = Join-Path $out "$name.txt"
-    $p = Start-Process (Join-Path $out "$name.exe") -NoNewWindow -PassThru -RedirectStandardOutput $log
+    $start = @{ FilePath = (Join-Path $out "$name.exe"); NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $log }
+    if ($exeArgs.Count) { $start.ArgumentList = $exeArgs }
+    $p = Start-Process @start
     $null = $p.Handle  # keeps the exit code readable after the process has gone
     if (-not $p.WaitForExit($limitSeconds * 1000)) {
         $p.Kill()
@@ -82,7 +104,7 @@ function RunSmall([string]$name, [string]$title, [string[]]$sources, [string[]]$
         return $false
     }
     $lines = @(Get-Content $log)
-    $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm' } | ForEach-Object { Write-Host "  $_" }
+    $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm|^largest frame' } | ForEach-Object { Write-Host "  $_" }
     return $p.ExitCode -eq 0 -and ($lines -contains 'ALL CHECKS PASSED')
 }
 
@@ -100,6 +122,13 @@ if ($Only -contains 'strappend') {
 if ($Only -contains 'guardpage') {
     $ok = RunSmall 'guardpage_test' 'stack guard page after a guarded read' @((Join-Path $PSScriptRoot 'guardpage_test.cpp')) @('-municode') 60
     if (-not $ok) { $failed += 'guardpage' }
+}
+
+if ($Only -contains 'hud') {
+    # The pictures (one per picture size and state) stay in build\hosttests\hud for a look.
+    $ok = RunSmall 'hud_test' 'HUD display: rectangles, fades, sizes' @((Join-Path $PSScriptRoot 'hud_test.cpp'),
+                   (Join-Path $root 'src\debug\Hud.cpp')) @() 120 @('-lgdi32') @((Join-Path $out 'hud'))
+    if (-not $ok) { $failed += 'hud' }
 }
 
 if ($Only -contains 'ggpo') {

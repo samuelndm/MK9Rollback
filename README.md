@@ -10,9 +10,9 @@ players run the mod, and leaves every other match (and Ranked) to the game's own
 2. Double-click **Play Online.bat**. (If Windows says it protected your PC: "More info", then "Run anyway".)
 3. Press **Play**. The window starts the game with the mod.
 4. In the game: Online > Player Match, a 1 vs 1 room. Against another player who started the game the same way,
-   rollback takes over at the fight start (the top left of the screen shows ROLLBACK, the ping, the input delay and a
-   three-bar connection marker: green is good, yellow so-so, red bad). F9 shows or hides the network details; the
-   window's "Network display" box picks Compact, Detailed or Off.
+   rollback takes over at the fight start (under the round timer the game shows three connection bars, green is good,
+   yellow so-so, red bad, then the ping, R for the frames rolled back and D for the input delay). F9 switches to a
+   line with every number and back; the window's "Network display" box picks In the HUD, Detailed or Off.
 
 Both players need the same version. The Play Online window checks for a new release when it opens; press
 **Update now** (with the game closed) to install it; **Go back to the previous version** undoes the last update. If
@@ -31,7 +31,7 @@ The window has a "Having trouble?" button with the same list:
 - Close browsers and other heavy apps (downloads, streaming, launchers).
 - Use a wired (Ethernet) connection instead of Wi-Fi.
 - Both players need the same version ("Check for updates" at the bottom of the window).
-- In a fight, F9 shows or hides the network details.
+- In a fight, F9 switches between the HUD display and the detailed network line.
 
 ## What it does
 

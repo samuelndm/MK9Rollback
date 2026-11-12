@@ -1973,6 +1973,102 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         folder name inside the debug strings differ), and so does the injector. The host tests and the launcher
         selftest pass from that checkout. No file of the shared folder was written: what `git status` shows there
         afterwards is the other two pieces of work.
+    - **Start alignment by measurement, 2026-11-12 (performance audit of the online netcode, "check all we can do to
+      improve"; its first finding, user: "Yes, fix it"). Host-tested, built and run in the two-instance harness (batch
+      ss, below): `build\clang_startsync` (DLL B8A938EB, GGPO `build\ggpo_rc30\libggpo.a` 1967E134), from the working
+      tree as it stood at 01:41, which also holds the code audit's fixes above (checked at 01:46: no source file is
+      newer than the DLL, and the HUD display is not in it: that had left the tree for `..\MK9Rollback_hud` by 01:37
+      and came back at 08:38, after this build). Not in rc30 (DB95DB0C). Part of rc31 (bullet below), which passed
+      the gate and was published 2026-11-12 as v20261112-1043. Not played on two PCs, not committed.**
+      - The finding (both players' logs of the 2026-11-11 evening, session 3, 14 starts): 159 of the friend's 279
+        rollbacks fell into the first ~10 s of six matches. In those six the player's game, waiting at the start
+        barrier, took the one-way trip as 5.2-5.7 ms (the handshake had read the wire's own round trip, 27-28 ms, and a
+        frame of assumed poll latency was taken off; the other eight starts read 41-46 ms and guessed 12.2-14.7 ms for
+        a ~13.5 ms trip), so (wait - trip) rounded to one frame too many (waits of 31.6, 15.8, 16.8, 35.2 ms moved
+        2, 1, 1, 2 frames; right were 1, 0, 0, 1). The friend's game then measured itself exactly one frame ahead:
+        BALANCE gave a frame 1.4-2.1 s in (4 starts) or the phase search moved 16.5 ms over 10-88 s (2 starts).
+      - The change (`src\net\StartSync.h`, `StartSync*` in RollbackManager.cpp, 'startsync 0|1', default 1): from its
+        frame-0 boundary each game sends 20-byte datagrams on the checksum channel that say how long until its own
+        frame 1 (the limiter's deadline 0x00E0AB10); a reader's gap = theirs - its own = offset + trip, each game
+        reports its smallest gap, and with both gaps offset = (mine - theirs) / 2, trip = (mine + theirs) / 2. The
+        game whose frame 1 comes first moves its deadline by the offset itself (ms, not whole frames); the other one
+        stays. The waiting game polls every ms and sends on every poll, so it reads the other's datagram within a ms
+        and the later game finds a row of datagrams whose newest is one send interval old: no extra wait for either.
+        When both wait, the gap still on the way is read at a later boundary (frames 1-12) and the move is made
+        then. Nothing usable by frame 12 (or 'startsync 0', lockstep, 'earlyinput 0'): the rc29 estimate, unchanged
+        (`StartBarrierGuess`). Log: one STARTSYNC line per game and start with the offset and the measured one-way
+        trip (the first round trip in the logs that is not quantized to frames), one more at the session's end.
+        CsOpen turns "connection reset" reports off on the checksum socket; CsPump skips late start datagrams.
+      - Host test (`tests\host\startsync_test.cpp`, `run.ps1 -Only startsync`, 32 checks): two simulated games making
+        the DLL's calls end with their grids within 0.75 ms of each other for trips of 0.1-80 ms and starts up to 80 ms
+        apart (2.4 ms for starts up to 0.9 s apart, 1.4 ms with 2 ms of jitter), the four waits above move 18.1, 2.3,
+        3.3, 21.7 ms; a trip that differs by direction leaves half the difference (not visible to any such measure);
+        with 30-60% of the datagrams lost the error stays under 8.6 ms and never do both games move; a silent partner
+        gives "no usable timing". The harness's checksum channel is plain loopback while GGPO's packets take the
+        netsim's delay: covered as its own case.
+      - **Batch ss (user: "Yes, run it"; 08:46-09:21, `results\batch_ss.txt`, `results\scenarios\ss*`; B8A938EB in
+        `build\clang_startsync` / `clang_startsync2`, build\clang untouched). Timed netsim, the same build with
+        'startsync 1' and 'startsync 0': stages ns15 d1 (6 starts each: `tools\scenario_matrix.ps1 -Set stages -Only
+        stages_ns15_d1_combo -StageList 1,3,7,13,15,23 -Setup 'netsimtimed 1'[,'startsync 0'] -Dirs ... -Tag ss1a /
+        ss0a`) and ns30 d2 (3 starts each: `-Set delay -Only ns30_d2_combo`, tags ss1b / ss0b).**
+        - 'startsync 1': a STARTSYNC line on both games in all 9 starts, none "no usable timing"; the two games'
+          answers agree within 0.7 ms (15.8-16.8 ms at ns15, 32.3-39.1 ms at ns30, and 0.5 ms in the one start where
+          both waited, 13.5 and 12.4 ms); the earlier game moved by it at frame 0 (it had waited 27-33 ms at ns15,
+          53-71 ms at ns30), the later one answered "stay" at frame 1. **In the 7 fights that ran: 0 BALANCE gives, 0
+          phase corrections, 0 rollbacks, the first 2 s window 1000/1000 on both games in every one.**
+        - 'startsync 0' (rc29's estimate), 8 fights that ran: 6 as clean; ns15 fight 1 waited 42.2 ms, moved 2 frames
+          (by ss1a's starts, where the wait was the offset plus 10-16 ms, about 29 ms apart: 4 ms too far) and left
+          the other game at 133/1000 (6 ms of phase moves, 9 rollbacks in its first 10 s); ns30 fight 1 waited 65.7
+          ms, moved 3 frames (by ss1b's fight 1, 71.0 ms waited for 39.1 ms, about 34 ms apart: a frame too many) and
+          the other game gave a BALANCE frame at 2 s (6 ms of phase moves, 3 rollbacks). **Totals: 1 BALANCE frame, 12
+          ms of phase moves, 12 rollbacks against 0 / 0 / 0.** LATENCY p50/p99 19-20/19-22 at d1 and 36/37-38 at d2
+          in both, but 25 and 39-40 in those two fights.
+        - Not from this change: 3 of the 18 fights stopped at frame 0 (DeadPool once, PitDay twice: one with
+          'startsync 0'), 5 had the RNG-only mismatches of every batch; `tools\desync_digest.ps1 -Filter 'ss1*'` and
+          `'ss0*'`: 0 fights with life or meter apart. 0 crash or assertion lines. One "GGPO disconnected from peer"
+          on game B at ss1a's frame-0 stop (A had stopped 15 ms before).
+        - What this run does not show: (1) the trip. On one PC the measuring datagrams go over plain loopback (0.1-
+          1.0 ms measured) while only GGPO's packets take the netsim's delay, so cancelling a real 13 ms trip is covered
+          by the host test alone. (2) The field's failure itself (the handshake reading the wire's round trip): the
+          harness's starts are far more regular (5 of 6 ns15 waits were 27.6-28.7 ms). 9 starts a side is a small
+          sample. (3) The PACE lines of the two games' logs (the same frame, one PC clock) are 0 ms apart in most
+          fights of both runs and of batch r3f: no measure of a difference under a few ms.
+      - **rc31 (user: "Yes, build and gate"; gate and local zip only): the working tree of 10:05 = rc30 (released that
+        morning as v20261112-0150) + this start alignment + the HUD display merged at 08:38. `build\clang_rc31`, DLL
+        FB5EEBE8, injector 19837B89, GGPO `build\ggpo_rc30\libggpo.a` 1967E134; no source file changed during or after
+        the build. All nine host tests and the launcher selftest pass on that tree. Gate 10:12-10:43
+        (`results\gate_20261112_rc31.txt`, `results\batch_rc31.txt`): PASS, zip `dist\MK9Rollback-netplay-20261112-
+        1043.zip` (SHA-256 45446044..., its files scanned: nothing personal). `build\clang` / `clang2` hold rc31;
+        rc30's binaries are in `build\clang_rc30`. Published 2026-11-12 11:47 as v20261112-1043 (user: "Yes,
+        publish"): Latest, and the zip downloaded back from GitHub has the gated zip's SHA-256. The release tag sits
+        on f1dfa52 (the rc30 source): rc31's own part of the source, this start alignment and the HUD display, is
+        not committed. rc31 does not start a rollback session against rc30, so both players update.**
+        - The start alignment in the gate's 9 starts (delay 0, no netsim, game B on one core at low priority): both
+          games decided in every start, none without timing, no rc29 estimate used; B moved 5.4-39.9 ms each time
+          (in one start B had not waited at all and was simply behind its own frame grid).
+        - **A BALANCE give in the first 2 s in 3 of those 9 starts (frames 41, 131, 81; always game A, the one not
+          slowed), and in 2 of 2 starts of the HUD session's two-game run of that morning (delay 2, B slowed, the same
+          source). Not from this change as far as the kept logs tell:** the same in earlier builds whenever B was
+          slowed (2026-11-08 cpu11a / cpu11b: 3 of 3 starts each; 2026-11-07 delaychange56: 3 of 3; the HUD side
+          folder's run of 02:28 without this change: 1 of 2), and frame 41 is BALANCE's first decision. The slowed
+          game falls behind in its first frames and the other one waits for it. No controlled run ('startsync 0'
+          against 1 with B slowed) was made: 9+ starts a side, about 40 minutes of games.
+        - The HUD display in the gate's fights: drawn in every overlay draw, 0 rectangles dropped, draw time under 5
+          ms except once in the delay-change run's last fight (52.7 ms on A and 15.3 ms on B inside the same 10 s:
+          both games at once; rc27's gate had one unexplained 54 ms draw too). Attract fights show no game HUD, so
+          how the display sits in a real online match is still unseen.
+      - Still to do: a two-PC evening on the published rc31 (the friend's rollbacks in each match's first 10 s were
+        57% of that evening's): one STARTSYNC line per game and start with the measured one-way trip, whether a
+        BALANCE give still follows a start when one PC is the slower one, and how the HUD display looks in a real
+        online match. And the user's word on committing rc31's source.
+      - The audit's other findings, by gain for the risk (none started): the player's 147-238 ms stalls at round ends
+        (lead: the overlay's draw time, 199 ms in the interval of one stall; rc29's stall sampler should name it);
+        the display path (both PCs fullscreen with vertical sync on, the DISPLAY note never shown by the launcher);
+        0-3 ms of arrival margin at delay 1 inside the phase search's deadband (margin-driven phase control, or
+        sampling and sending a few ms before the boundary); polling and rolling back in the limiter's idle wait;
+        rollback cost (about 90% of the 11.8 MB master image copied per save and load is free sub-heap space); the
+        delay chosen from arrival margins instead of the frame-quantized hello ping; smaller ones (game-thread
+        priority, a re-poll after a rollback, loss counters, checksum batching).
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as
