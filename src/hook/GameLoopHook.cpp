@@ -4,6 +4,7 @@
 
 #include <cstring>
 
+#include "../common/StrAppend.h"
 #include "../debug/CommandChannel.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Lab.h"
@@ -130,10 +131,10 @@ void LogFightFrame() {
 
     StateHash::Result h;
     StateHash::Compute(&h);
-    char regions[400];
+    char regions[400] = "";
     int len = 0;
     for (int i = 0; i < h.count && len < (int)sizeof regions - 24; ++i)
-        len += snprintf(regions + len, sizeof regions - len, " %s=%08X", h.names[i], h.hashes[i]);
+        len = AppendF(regions, sizeof regions, len, " %s=%08X", h.names[i], h.hashes[i]);
     Logger::Frame("  HASH %llu all=%08X rng=%08X draws=%d newobj=%u depth=%d%s",
                   (unsigned long long)GameLoopHook::gSimulationFrame, h.combined, h.rngState, h.rngDraws,
                   h.objectsCreated, h.scriptDepth, regions);

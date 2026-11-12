@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "../common/GuardPage.h"
+#include "../common/StrAppend.h"
 #include "../hook/CodePatch.h"
 #include "Logger.h"
 #include "Ue3Names.h"
@@ -171,7 +173,7 @@ void DumpTouchList(const CONTEXT* c) {
     const uint32_t* e = reinterpret_cast<const uint32_t*>(elem);
     char line[400];
     int n = 0;
-    for (int i = 0; i < 24; ++i) n += snprintf(line + n, sizeof line - n, " %08X", e[i]);
+    for (int i = 0; i < 24; ++i) n = AppendF(line, sizeof line, n, " %08X", e[i]);
     Logger::Info("CRASH? 0x7794A0 entry copy %08X:%s", elem, line);
     DescribePtr("entry[0] component", e[0]);
     const uint32_t self = e[12];
@@ -230,7 +232,7 @@ void DescribeWriter(const CONTEXT* c, char* chain, int chainCap, char* stack, in
     for (int i = 0; i < 48 && shown < 8 && n < stackCap - 10; ++i) {
         const DWORD v = sp[i];
         if (v >= 0x00401000 && v < 0x00F9C000) {
-            n += snprintf(stack + n, stackCap - n, " %08lX", v);
+            n = AppendF(stack, stackCap, n, " %08lX", v);
             ++shown;
         }
     }
@@ -239,7 +241,7 @@ void DescribeWriter(const CONTEXT* c, char* chain, int chainCap, char* stack, in
     int cn = 0;
     uintptr_t fp = c->Ebp;
     for (int k = 0; k < 18 && cn < chainCap - 10 && fp >= lo && fp + 8 <= hi && !(fp & 3); ++k) {
-        cn += snprintf(chain + cn, chainCap - cn, " %08lX", reinterpret_cast<const DWORD*>(fp)[1]);
+        cn = AppendF(chain, chainCap, cn, " %08lX", reinterpret_cast<const DWORD*>(fp)[1]);
         const uintptr_t next = reinterpret_cast<const DWORD*>(fp)[0];
         if (next <= fp) break;
         fp = next;
@@ -286,10 +288,10 @@ DWORD WINAPI ChangeWatchProc(void*) {  // a helper thread, so the arming thread 
         Logger::Info("WATCH disarmed on %d threads", armed);
         return 0;
     }
-    char what[200];
+    char what[200] = "";
     int n = 0;
     for (int s = 0; s < 4 && n < (int)sizeof what - 40; ++s)
-        if (gChangeAddr[s]) n += snprintf(what + n, sizeof what - n, " %s %08X = %08lX;", gChangeName[s], (unsigned)gChangeAddr[s], gChangeLast[s]);
+        if (gChangeAddr[s]) n = AppendF(what, sizeof what, n, " %s %08X = %08lX;", gChangeName[s], (unsigned)gChangeAddr[s], gChangeLast[s]);
     Logger::Info("WATCH armed on %d threads:%s", armed, what);
     return 0;
 }
@@ -381,7 +383,7 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
             for (int i = 0; i < 48 && shown < 8; ++i) {
                 const DWORD v = sp[i];
                 if (v >= 0x00401000 && v < 0x00F9C000) {
-                    n += snprintf(line + n, sizeof line - n, " %08lX", v);
+                    n = AppendF(line, sizeof line, n, " %08lX", v);
                     ++shown;
                 }
             }
@@ -393,7 +395,7 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
             int cn = 0;
             uintptr_t fp = c->Ebp;
             for (int k = 0; k < 18 && fp >= lo && fp + 8 <= hi && !(fp & 3); ++k) {
-                cn += snprintf(chain + cn, sizeof chain - cn, " %08lX", reinterpret_cast<const DWORD*>(fp)[1]);
+                cn = AppendF(chain, sizeof chain, cn, " %08lX", reinterpret_cast<const DWORD*>(fp)[1]);
                 const uintptr_t next = reinterpret_cast<const DWORD*>(fp)[0];
                 if (next <= fp) break;
                 fp = next;
@@ -413,6 +415,12 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
     // unhandled, STATUS_GUARD_PAGE_VIOLATION on another thread's stack guard would end the process.
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == STATUS_GUARD_PAGE_VIOLATION) &&
         ep->ContextRecord->Eip == reinterpret_cast<DWORD>(&MK9R_SafeReadInsn)) {
+        // The read took the page's guard protection away with it (GuardPage.h): put it back, or the thread whose stack
+        // guard this is cannot grow its stack any more. The address is the exception's (a read across a page boundary
+        // faults on its second page), else the one the read used.
+        if (code == STATUS_GUARD_PAGE_VIOLATION)
+            GuardPage::Rearm(ep->ExceptionRecord->NumberParameters >= 2 ? ep->ExceptionRecord->ExceptionInformation[1]
+                                                                        : ep->ContextRecord->Ecx);
         ep->ContextRecord->Eip = reinterpret_cast<DWORD>(&MK9R_SafeReadFail);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -441,7 +449,7 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
                 if (!VirtualQuery(sp + i, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
                 const DWORD v = sp[i];
                 if (v >= 0x00401000 && v < 0x00F9C000) {
-                    n += snprintf(line + n, sizeof line - n, " %08lX", v);
+                    n = AppendF(line, sizeof line, n, " %08lX", v);
                     ++shown;
                 }
             }
@@ -457,7 +465,15 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     // A fault inside our purecall / out-of-memory handlers would go on into MK9's handlers and hang: close now.
-    if (gFatalTid && gFatalTid == GetCurrentThreadId()) TerminateProcess(GetCurrentProcess(), 0xC0000409);
+    if (gFatalTid && gFatalTid == GetCurrentThreadId()) {
+        // Never without a line: the game closed here with nothing in the log. Once only (a fault inside the line's own
+        // logging comes back here).
+        static volatile LONG said = 0;
+        if (!InterlockedExchange(&said, 1))
+            Logger::TryInfo("CRASH: exception %08lX at %08lX inside the mod's pure-call / out-of-memory handler (thread %lu); "
+                            "closing the game", code, ep->ContextRecord->Eip, GetCurrentThreadId());
+        TerminateProcess(GetCurrentProcess(), 0xC0000409);
+    }
     // Only faults that can stop the game: on its thread, or in MKKE's own code (a driver or overlay DLL may fault and
     // handle it on its own threads). The watchdog clears the mark if the game thread keeps ticking.
     if (!gFatalAt && (GetCurrentThreadId() == gWatchThread || (ep->ContextRecord->Eip >= 0x00401000 && ep->ContextRecord->Eip < 0x00F9C000))) {
@@ -481,7 +497,7 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
         if (!VirtualQuery(sp + i, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
         const DWORD v = sp[i];
         if ((v >= 0x00401000 && v < 0x00F9C000) || (v >= gSelfLo && v < gSelfHi)) {
-            n += snprintf(line + n, sizeof line - n, " %08lX", v);
+            n = AppendF(line, sizeof line, n, " %08lX", v);
             ++shown;
         }
     }
@@ -507,7 +523,7 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
             if (!CrashLog::SafeRead32((uintptr_t)(sp + i), &v)) break;
             char d[160];
             if (v >= 0x10000 && modOf(v, d, sizeof d)) {
-                k += snprintf(ml + k, sizeof ml - k, " %s", d);
+                k = AppendF(ml, sizeof ml, k, " %s", d);
                 ++shownm;
             }
         }
@@ -533,9 +549,9 @@ LONG CALLBACK Handler(EXCEPTION_POINTERS* ep) {
             for (unsigned d = 0; d < kN; ++d) {
                 uint32_t live = 0;
                 const bool ok = CrashLog::SafeRead32(at + d * 4, &live);
-                k += snprintf(line + k, sizeof line - k, ok && live == saved[d] ? " %08X" : " %08X>%s", saved[d],
+                k = AppendF(line, sizeof line, k, ok && live == saved[d] ? " %08X" : " %08X>%s", saved[d],
                               ok ? "" : "?");
-                if (ok && live != saved[d]) k += snprintf(line + k, sizeof line - k, "%08X", live);
+                if (ok && live != saved[d]) k = AppendF(line, sizeof line, k, "%08X", live);
             }
             Logger::Info("CRASH?     %s +0..+0x2C saved[>live]:%s", rn[i], line);
         }
@@ -609,7 +625,7 @@ void __cdecl PurecallHandler() {
     for (int i = 0; i < 256 && shown < 16 && sp + i < top; ++i) {
         const DWORD v = sp[i];
         if (v >= 0x00401000 && v < 0x00F9C000) {
-            n += snprintf(line + n, sizeof line - n, " %08lX", v);
+            n = AppendF(line, sizeof line, n, " %08lX", v);
             ++shown;
         }
     }
@@ -683,6 +699,10 @@ void __cdecl MemFatal(uint32_t a1, uint32_t size, uint32_t heap, uint32_t kind, 
         TerminateProcess(GetCurrentProcess(), 0xC0000017);  // STATUS_NO_MEMORY
     }
     reinterpret_cast<MemFatalFn>(gMemFatalTramp)(a1, size, heap, kind, spin);
+    // MK9's handler came back (a request its caller can do without): this thread has left the fatal path. The mark
+    // used to stay for the rest of the run, and the thread's next exception of any kind, one the game handles itself
+    // included, closed the game.
+    if (gFatalTid == GetCurrentThreadId()) gFatalTid = 0;
 }
 
 void InstallMemFatal() {
@@ -732,7 +752,7 @@ void LogStack(const char* tag) {
     for (int shown = 0; sp + 1 <= top && shown < 32; ++sp) {
         const DWORD v = *sp;
         if ((v >= 0x00401000 && v < 0x00F9C000) || (v >= gSelfLo && v < gSelfHi)) {
-            n += snprintf(line + n, sizeof line - n, " %08lX", v);
+            n = AppendF(line, sizeof line, n, " %08lX", v);
             ++shown;
         }
     }
@@ -820,7 +840,8 @@ BOOL CALLBACK LogProcessWindow(HWND h, LPARAM) {
             if (got) {
                 MEMORY_BASIC_INFORMATION smbi;
                 const DWORD* sp = reinterpret_cast<const DWORD*>(c.Esp);
-                if (VirtualQuery(sp, &smbi, sizeof smbi) && smbi.State == MEM_COMMIT) {
+                // Not a guard or no-access page (a stack pointer just moved down can sit in one): see FramePace's Capture.
+                if (VirtualQuery(sp, &smbi, sizeof smbi) && smbi.State == MEM_COMMIT && !(smbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
                     const DWORD* end = reinterpret_cast<const DWORD*>(reinterpret_cast<uintptr_t>(smbi.BaseAddress) + smbi.RegionSize);
                     count = end > sp ? (uint32_t)(end - sp) : 0;
                     if (count > 0x2000) count = 0x2000;
@@ -846,7 +867,7 @@ BOOL CALLBACK LogProcessWindow(HWND h, LPARAM) {
                         !_stricmp(base, "KERNELBASE.dll") || !_stricmp(base, "KERNEL32.DLL") || !_stricmp(base, "apphelp.dll") ||
                         !_stricmp(base, "winmmbase.dll") || !_stricmp(base, "GDI32.dll") || !_stricmp(base, "gdi32full.dll"))
                         continue;  // window-system frames of the message box
-                    n += snprintf(line + n, sizeof line - n, " %s+%lX", base,
+                    n = AppendF(line, sizeof line, n, " %s+%lX", base,
                                   (unsigned long)(stack[i] - reinterpret_cast<uintptr_t>(m)));
                     ++shown;
                 }
@@ -920,7 +941,7 @@ DWORD WINAPI Watchdog(LPVOID) {
                     if (!VirtualQuery(sp + i, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
                     const DWORD v = sp[i];
                     if ((v >= 0x00401000 && v < 0x00F9C000) || (v >= gSelfLo && v < gSelfHi)) {
-                        n += snprintf(line + n, sizeof line - n, " %08lX", v);
+                        n = AppendF(line, sizeof line, n, " %08lX", v);
                         ++shown;
                     }
                 }
@@ -955,9 +976,10 @@ DWORD WINAPI Watchdog(LPVOID) {
                 }
                 std::sort(seen.begin(), seen.end(), [](auto& a, auto& b) { return a.second > b.second; });
                 char sum[400];
+                sum[0] = 0;  // printed as is when the stack held no code address
                 int sn = 0;
                 for (size_t i = 0; i < seen.size() && i < 16; ++i)
-                    sn += snprintf(sum + sn, sizeof sum - sn, " %08lX x%d", seen[i].first, seen[i].second);
+                    sn = AppendF(sum, sizeof sum, sn, " %08lX x%d", seen[i].first, seen[i].second);
                 Logger::Info("HANG? game thread stack summary (64 KB):%s", sum);
                 // rc25 SyncTest soaks (b44/b45): two hangs in UE3's purge loop 0x00516E70 (IncrementalPurgeGarbage, called
                 // from 0x005F225E at a fight's end), which with no time limit retries the current object until its
@@ -983,10 +1005,11 @@ DWORD WINAPI Watchdog(LPVOID) {
                                  "IsReadyForFinishDestroy %08X", idx, cnt, obj, on, cls, cn, outer, oun, vt, ready);
                     if (obj) {  // its nonzero dwords (fence counters, flags), to compare with the class layout
                         char dw[1100];
+                        dw[0] = 0;  // an object that could not be read, or all zeros
                         int dn = 0;
                         for (uint32_t o = 0; o < 0x200 && dn < (int)sizeof dw - 24; o += 4) {
                             uint32_t v = 0;
-                            if (SafeRead32(obj + o, &v) && v) dn += snprintf(dw + dn, sizeof dw - dn, " +%X=%08X", o, v);
+                            if (SafeRead32(obj + o, &v) && v) dn = AppendF(dw, sizeof dw, dn, " +%X=%08X", o, v);
                         }
                         Logger::Info("HANG? purge object dwords:%s", dw);
                     }
@@ -1158,7 +1181,7 @@ void TraceDump(uint32_t gf) {
         int n = 0;
         const uint32_t fn = f.n < 32 ? f.n : 32;
         for (uint32_t j = i > 2 ? i - 2 : 0; j < fn && j < i + 4; ++j)
-            n += snprintf(line + n, sizeof line - n, " #%u s%u@%08X=%08X(%08X<%08X<%08X)", j, f.r[j].slot, f.r[j].eip, f.r[j].val,
+            n = AppendF(line, sizeof line, n, " #%u s%u@%08X=%08X(%08X<%08X<%08X)", j, f.r[j].slot, f.r[j].eip, f.r[j].val,
                           f.r[j].ret[0], f.r[j].ret[1], f.r[j].ret[2]);
         line[n] = 0;
         Logger::Info("LOCTRACE   %s:%s", pass ? "resim" : "live ", line);
@@ -1177,7 +1200,7 @@ void TraceLog(uint32_t gf, bool resim, const char* tag) {
     for (uint32_t j = 0; j < fn && n < (int)sizeof line - 80; ++j) {
         float v;
         memcpy(&v, &f.r[j].val, 4);
-        n += snprintf(line + n, sizeof line - n, " #%u s%u@%08X=%.3f(%08X<%08X<%08X)", j, f.r[j].slot, f.r[j].eip, v, f.r[j].ret[0],
+        n = AppendF(line, sizeof line, n, " #%u s%u@%08X=%.3f(%08X<%08X<%08X)", j, f.r[j].slot, f.r[j].eip, v, f.r[j].ret[0],
                       f.r[j].ret[1], f.r[j].ret[2]);
     }
     line[n] = 0;
@@ -1235,7 +1258,7 @@ void LogProcessExit() {
     for (int shown = 0; sp + 1 <= top && shown < 32; ++sp) {
         const DWORD v = *sp;
         if ((v >= 0x00401000 && v < 0x00F9C000) || (v >= gSelfLo && v < gSelfHi)) {
-            n += snprintf(line + n, sizeof line - n, " %08lX", v);
+            n = AppendF(line, sizeof line, n, " %08lX", v);
             ++shown;
         }
     }

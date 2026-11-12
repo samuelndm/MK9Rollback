@@ -6,7 +6,7 @@ Update (2026-10-25): consecutive rounds now stay in sync too. Round 2 used to sp
 
 **Copying to the second PC:** `tools\package.ps1` builds `dist\MK9Rollback-netplay-<date>.zip` with the DLL, the injector, the scripts and this page, plus a README with the commands. Extract it anywhere on both PCs.
 
-**Untested part, needs you:** until 2026-10-18 21:10 a real controller never reached a netplay session; only the test harness's scripted input did. The DLL now reads every local controller and the keyboard during a session, and sends them as the local player's input. That still needs a person pressing buttons. Quick check on one PC: arm netplay and move. If the fighter does not respond, send the log. Its `INPUT capture:` lines show which pads are read. Before that, the path was tested on loopback against a stand-in peer (`tools/ggpo_peer.exe`). This page is the procedure for the first test with two real PCs. It needs two PCs on the same network, each with MK Komplete Edition (Steam) and this repository's build.
+**Untested part, needs you:** until 2026-10-18 21:10 a real controller never reached a netplay session; only the test harness's scripted input did. The DLL now reads every local controller and the keyboard during a session, and sends them as the local player's input. That still needs a person pressing buttons. Quick check on one PC: arm netplay and move. If the fighter does not respond, send the logs (see "What to send back"). The `INPUT capture:` lines show which pads are read. Before that, the path was tested on loopback against a stand-in peer (`tools/ggpo_peer.exe`). This page is the procedure for the first test with two real PCs. It needs two PCs on the same network, each with MK Komplete Edition (Steam) and this repository's build.
 
 ## What runs where
 
@@ -17,25 +17,16 @@ Each PC runs a **local Versus** match: the same characters, stage and round sett
 
 ## Easiest: the Play Online window (over Steam)
 
-The package has `Play Online.bat` at the top (in the repository: `tools\Play Online.bat`, which runs `tools\netplay_gui.ps1`). Each player:
-1. opens it;
-2. sends the code from box 1 (their Steam friend code, the account ID from `HKCU\Software\Valve\Steam\ActiveProcess\ActiveUser`);
-3. pastes the other player's code (a friend code or a SteamID64);
-4. presses Play.
+The package has `Play Online.bat` at the top (in the repository: `tools\Play Online.bat`, which runs `tools\netplay_gui.ps1`). Each player opens it and presses Play; the window starts the game, injects the DLL, arms the mod and shows the log as plain status lines. "Where you fight" has two choices:
 
-The window does the rest:
-- It starts the game and injects the DLL.
-- It arms a Steam session: rollback with 2 frames of input delay, or lockstep at delay 3 with "Safe mode".
-- It picks the sides without asking: the lower code is player 1.
-- It re-arms after every fight.
-- It shows the log as plain status lines.
-- "Save logs to the Desktop" zips the logs for a bug report (send it together with your opponent's zip). Steam IDs become steam-self / steam-peer1, ..., IP addresses lan-ip-N / ip-N, and the Windows user and PC names `<user>` / `<pc>`; PRIVACY.txt in the zip lists what was replaced. "Having trouble?" lists the usual fixes for stutter and connection problems.
+- **MK9 Online: Player Match (recommended)**, the default. No codes: both players go to Online > Player Match in the game (next section). "Input delay" is Auto (from the ping) or a fixed 0 to 3 frames; "Safe mode" is lockstep instead of rollback (both players must choose the same).
+- **Local Versus over Steam (older test mode)**. Each player sends the code from box 1 (the Steam friend code, the account ID from `HKCU\Software\Valve\Steam\ActiveProcess\ActiveUser`) and pastes the other player's code in box 2 (a friend code or a 17-digit SteamID64, nothing else). The window arms a Steam session (rollback with 2 frames of input delay, or lockstep at delay 3 with "Safe mode"), picks the sides without asking (the lower code is player 1) and re-arms after every fight. The players still pick the same Versus fight in the game (see Playing).
 
-The players still pick the same Versus fight in the game.
+"Save logs to the Desktop" zips the logs for a bug report (send it together with your opponent's zip). Steam IDs become steam-self / steam-peer1, ..., IP addresses lan-ip-N / ip-N, and the Windows user and PC names `<user>` / `<pc>`; PRIVACY.txt in the zip lists what was replaced. "Having trouble?" lists the usual fixes for stutter and connection problems.
 
 ## Inside MK9's own online mode (the main mode of "Play Online.bat")
 
-"Where you fight: MK9 Online" in the window arms `online auto <delay>` instead of a Versus session. Then:
+"MK9 Online: Player Match" in the window arms `online auto ping` (or `online auto <frames>` with a fixed input delay) instead of a Versus session. Then:
 - **Meeting:** the two players meet through MK9's own Online menu, in a **1 vs 1** Player Match (invite or private room). King of the Hill rooms and Ranked matches always use MK9's own netcode: in King of the Hill, spectators receive the fighters' inputs through the exchange the mod replaces.
 - **Handshake:** when an online fight is active and the game's own Steam P2P connection is with the opponent, each DLL sends a hello on Steam channel 79.
 - **Takeover:** once both hellos arrive, rollback starts at the first fight frame of the current fight, or of the next one if the current fight has already started.
@@ -55,15 +46,19 @@ The players still pick the same Versus fight in the game.
 - the order of MK9's exchange and our input override within a tick;
 - which online script natives the fights call (logged as `ONLINENATIVE`).
 
-The log lines to send back are those starting with `ONLINE`, plus the usual NETPLAY/GGPO lines.
+The log lines of interest are those starting with `ONLINE`, plus the usual NETPLAY/GGPO lines (see "What to send back").
 
 ## Quick start (one command per PC)
 
-`tools\netplay.ps1` starts the game through Steam if needed, injects the DLL, arms the session and then prints the session status:
+`tools\netplay.ps1` starts the game through Steam if needed, injects the DLL, arms the session and then prints the session status. From a Command Prompt in the extracted folder, with the same PowerShell options as `Play Online.bat` (a plain `tools\netplay.ps1 ...` is refused where Windows does not allow scripts, its default):
 
+PC A (its peer is PC B):
 ```
-tools\netplay.ps1 -Peer 192.168.x.B -Player 1      # PC A
-tools\netplay.ps1 -Peer 192.168.x.A -Player 2      # PC B
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\netplay.ps1 -Peer 192.168.x.B -Player 1
+```
+PC B:
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\netplay.ps1 -Peer 192.168.x.A -Player 2
 ```
 
 - Over Steam, pass the other player's SteamID64 as `-Peer`; the steps to find it are below.
@@ -107,7 +102,7 @@ The manual steps follow, for reference.
 
 ## What to send back
 
-`build\clang\MK9Rollback.log` and `MK9Rollback_frames.log` from both PCs. Of interest:
+From both PCs: open `Play Online.bat` (the game need not run) and press "Save logs to the Desktop", then send the zip it makes. It holds `build\clang\MK9Rollback.log`, `MK9Rollback_frames.log` and the logs of the session before, with Steam IDs, IP addresses and the Windows user and PC names replaced; the files in `build\clang` themselves are not cleaned, so do not post those. Of interest:
 - `GGPO p2p stopped: N frames, N loads, ...`
 - any `CRASH?` / `HANG?` lines;
 - `NETPLAY checksums: N frames matched the peer, M did not`, plus any `NETPLAY DESYNC: frame ...` lines. Each peer sends the gameplay checksum (life, meter, positions, RNG) of every frame 24 frames after it, when it can no longer be rolled back. The other peer compares it with its own.
@@ -136,7 +131,7 @@ The manual steps follow, for reference.
 
 GGPO's packets and the checksums go through Steam's P2P networking, using Steam's NAT traversal and relays. This uses the game's own steam_api.dll on private channels (77, 78); MK's online mode and matchmaking are not involved.
 
-1. Each player writes `steamid` into `MK9Rollback_cmd.txt` and reads `STEAM: ... SteamID64 = 7656119...` from `MK9Rollback.log`. Exchange these numbers.
+1. Each player writes `steamid` into `MK9Rollback_cmd.txt` and reads `STEAM: ... SteamID64 = <17 digits>` from `MK9Rollback.log`. Exchange these numbers.
 2. Instead of `ggpo netplay ...`, arm with the peer's SteamID64:
    - PC A (player 1): `ggpo steamnetplay <SteamID64 of B> 1 0`
    - PC B (player 2): `ggpo steamnetplay <SteamID64 of A> 2 0`

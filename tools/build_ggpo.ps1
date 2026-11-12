@@ -8,7 +8,10 @@
 #    frame advantage from half the minimum round trip (ggpo_rtt_min_ms), ggpo_after_send, logging decided once
 #    (ggpo_log_on), ggpo_bind_loopback and no WSAECONNRESET on GGPO's socket (blocks marked rc25 below);
 #  - round 3 (2026-11-10 review): ggpo_bye_on_close, validation of what the peer sends (a malformed packet is dropped
-#    instead of closing the game), socket errors (ggpo_bind_failed, no assertion in sendto) (blocks marked round 3 below).
+#    instead of closing the game), socket errors (ggpo_bind_failed, no assertion in sendto) (blocks marked round 3 below);
+#  - rc30 (2026-11-12 review and sanitizer fuzz): quality replies out of range, sequence numbers of sync messages, Poll's
+#    event handle, the running state's timers, zeroed messages, magic numbers and sync randoms from a seeded generator,
+#    late sync replies, input packets limited to the frames that fit (block marked rc30 below).
 # Output: build\clang\libggpo.a (-Out build\x: build\x\libggpo.a, for a test build: .\build.ps1 -GgpoLib build\x\libggpo.a).
 # GGPO is built without -DUNICODE (platform_windows.cpp uses char buffers).
 param([string]$Out = '')
@@ -870,6 +873,176 @@ $t = Set-Once $t "         UdpMsg *msg = (UdpMsg *)recv_buf;`n         _callback
     "         }`n" +
     "         UdpMsg *msg = (UdpMsg *)recv_buf;`n         _callbacks->OnMsg(recv_addr, msg, len);") 'timed netsim: hold'
 [IO.File]::WriteAllText($ud, $t)
+# rc30 (2026-11-12): a read-only review and a sanitizer fuzz run (ggpo_raw_peer's random datagrams against a ggpo_peer
+# built with -fsanitize=address,undefined). One block; it reopens the copies patched above. Tests (tests\host):
+# ggpo_session_test.cpp (1, 3-7), ggpo_raw_peer.cpp 'seqjump' (2), 'slowack' / 'noack' against ggpo_peer churn=1 (8),
+# ggpo_relay.cpp between two ggpo_peer (7).
+#  1. OnQualityReply computed the round trip from the pong the peer sent, whatever it was: a pong the peer made up gave a
+#     ping of minutes or a negative one, entered the ring behind ggpo_rtt_min_ms, and (ggpo_rtt_min_ms * 60 + 500) / 2000
+#     in SetLocalFrameNumber overflowed (UBSan, random datagrams). A reply whose round trip is negative or above
+#     MK9R_RTT_MAX (5000 ms; MK9Rollback disconnects after 3000) is dropped: ping, the ring and its minimum keep theirs.
+#  2. OnMsg stored a packet's sequence number for sync requests and replies too, which pass neither the magic nor the
+#     order check: one 12-byte sync datagram from the peer's address with a sequence number 20000 ahead made every real
+#     packet "out of order", and the session ended in the disconnect timeout. Stored only after both checks now, and
+#     from the one sync reply that ends the handshake (as stock did: the peer's packets before it were not taken, so
+#     the count starts there; a later sync message no longer moves it).
+#  3. Poll's constructor creates an event handle and stock had no destructor: one kernel handle stayed open per session.
+#  4. UdpProtocol::_state is a union: when the handshake ended, running.last_network_stats_interval still held the
+#     handshake's random and was read as a time, so with the clock of rc25 (it starts at 1000 ms per process) a process's
+#     first session had no network statistics for up to 33 s (65 s with the 16-bit randoms of 6). The running part is
+#     zeroed where the state becomes Running, the only place; its other two members were 0 there already (the
+#     handshake's counter has just reached 0, and no input packet is taken before).
+#  5. UdpMsg's constructor set the type only, so the bytes no field owns left as the heap had them: a sync request's
+#     remote_magic and remote_endpoint (nothing sets them), the bits after num_bits in an input packet's last byte
+#     (earlier packets' bits). The whole message is zeroed, 4128 bytes per sent packet: measured in a loop (i686 -O2),
+#     new + delete took 34 ns and 50 ns with the memset, so about 2 us per second at 60-120 packets a second.
+#  6. Magic numbers and sync randoms came from rand(), which nothing seeds (GGPO's srand is in the DllMain that is renamed
+#     below and never runs): every process's first session had magic number 41 and sync random 18467 (ucrt). They now
+#     come from a generator of udp_proto.cpp, seeded once per process from the performance counter, the system time and
+#     the process and thread ids; the host's rand() sequence is no longer touched by the handshake (the network
+#     simulator, test only, still uses rand()).
+#  7. The handshake's round trip (ggpo_sync_rtt_ms, MK9Rollback's start barrier) is that of the first reply that matches
+#     one of the last 8 requests. Over the Steam bridge the peer's game may start reading later: the requests wait, the
+#     first reply measures that wait plus the round trip, and the replies to the fresher requests (the sync kick's among
+#     them, sent when the peer's own request shows that it reads now) arrive once the state is Running, where they were
+#     ignored. Such a reply still changes nothing but the measurement: with the peer's magic number and a request of the
+#     ring, a smaller round trip (>= 0) replaces the stored one.
+#  8. SendPendingOutput asserted (the game closes) when the unacknowledged inputs took 4096 bits or more: 63 frames
+#     (MK9R_PENDING_MAX) fit only while fewer than 7 input bits change per frame on average (10 bits a change, 1 a
+#     frame); reachable with a peer that sends inputs but acknowledges nothing and a local input that changes that much
+#     (ggpo_raw_peer noack / slowack against ggpo_peer churn=1: assertion after about 25 frames). The packet now ends at
+#     the last frame that fits (the first always does: at most 1441 bits); the receiver acknowledges that frame and the
+#     next packet starts there, as after any loss. peer_connect_status still names the newest local frame: a frame is
+#     confirmed from the frames received (_local_connect_status), not from it.
+$t = [IO.File]::ReadAllText($up)
+$t = Set-Once $t 'static const int MK9R_PENDING_MAX = 63;   // unacknowledged inputs _pending_output holds (RingBuffer<GameInput, 64>)' (
+    'static const int MK9R_PENDING_MAX = 63;   // unacknowledged inputs _pending_output holds (RingBuffer<GameInput, 64>)' + "`n" +
+    'static const int MK9R_RTT_MAX = 5000;     // MK9Rollback (rc30): ms; a quality reply with a round trip above it (or negative) is dropped') 'rc30 quality reply: limit'
+$t = Set-Once $t '   _round_trip_time = Platform::GetCurrentTimeMS() - msg->u.quality_reply.pong;' (
+    "   {  // MK9Rollback (rc30): pong is whatever the peer sent; a round trip no link has is not taken`n" +
+    "      const int mk9r_rtt = (int)(Platform::GetCurrentTimeMS() - msg->u.quality_reply.pong);`n" +
+    "      if (mk9r_rtt < 0 || mk9r_rtt > MK9R_RTT_MAX) {`n" +
+    "         Log(`"dropping a quality reply with a round trip of %d ms.\n`", mk9r_rtt);`n" +
+    "         return false;`n" +
+    "      }`n" +
+    "      _round_trip_time = mk9r_rtt;`n" +
+    "   }") 'rc30 quality reply: range'
+$t = Set-Once $t "   _next_recv_seq = seq;`n   LogMsg(`"recv`", msg);" "   LogMsg(`"recv`", msg);" 'rc30 sequence number: not for sync messages'
+$t = Set-Once $t ("         Log(`"dropping out of order packet (seq: %d, last seq:%d)\n`", seq, _next_recv_seq);`n" +
+    "         return;`n      }`n   }`n") (
+    "         Log(`"dropping out of order packet (seq: %d, last seq:%d)\n`", seq, _next_recv_seq);`n" +
+    "         return;`n      }`n" +
+    "      // MK9Rollback (rc30): stored here, for a packet that passed the magic and the order check (stock: below, for sync`n" +
+    "      // messages too, which pass neither)`n" +
+    "      _next_recv_seq = seq;`n   }`n") 'rc30 sequence number: after the order check'
+$t = Set-Once $t "      _remote_magic_number = msg->hdr.magic;`n" (
+    "      _remote_magic_number = msg->hdr.magic;`n" +
+    "      // MK9Rollback (rc30): the peer's stream is counted from the reply that ended the handshake, as stock did (its`n" +
+    "      // packets before it were not taken, and may be more than MAX_SEQ_DISTANCE if the handshake took minutes)`n" +
+    "      _next_recv_seq = msg->hdr.sequence_number;`n") 'rc30 sequence number: from the handshake''s last reply'
+$t = Set-Once $t "      _current_state = Running;`n" (
+    "      _current_state = Running;`n" +
+    "      // MK9Rollback (rc30): _state is a union; its running part still held the handshake's counter and random, and the`n" +
+    "      // random was read as the time of the last statistics update`n" +
+    "      memset(&_state.running, 0, sizeof _state.running);`n") 'rc30 running state zeroed'
+$t = Set-Once $t 'extern "C" { int ggpo_sync_rtt_ms = -1; }  // MK9Rollback (round 3): the handshake''s round trip in ms, -1 before a reply' (
+    'extern "C" { int ggpo_sync_rtt_ms = -1; }  // MK9Rollback (round 3): the handshake''s round trip in ms, -1 before a reply' + "`n" +
+    "// MK9Rollback (rc30): magic numbers and sync randoms. Stock took them from rand(), which nothing seeds in this build:`n" +
+    "// every process started with the same ones. xorshift32, seeded once per process (see build_ggpo.ps1, rc30, 6).`n" +
+    "static uint32`nmk9r_random()`n{`n" +
+    "   static uint32 s = 0;`n" +
+    "   if (!s) {`n" +
+    "      LARGE_INTEGER t;`n" +
+    "      FILETIME ft;`n" +
+    "      QueryPerformanceCounter(&t);`n" +
+    "      GetSystemTimeAsFileTime(&ft);`n" +
+    "      s = (uint32)t.LowPart ^ ((uint32)t.HighPart * 0x9E3779B1u) ^ (uint32)ft.dwLowDateTime ^`n" +
+    "          ((uint32)GetCurrentProcessId() * 0x85EBCA6Bu) ^ ((uint32)GetCurrentThreadId() * 0xC2B2AE35u);`n" +
+    "      s ^= s >> 16;`n" +
+    "      s *= 0x7FEB352Du;`n" +
+    "      s ^= s >> 15;`n" +
+    "      s *= 0x846CA68Bu;`n" +
+    "      s ^= s >> 16;`n" +
+    "      if (!s) {`n" +
+    "         s = 0x9E3779B9u;`n" +
+    "      }`n" +
+    "   }`n" +
+    "   s ^= s << 13;`n" +
+    "   s ^= s >> 17;`n" +
+    "   s ^= s << 5;`n" +
+    "   return s;`n" +
+    "}") 'rc30 random: generator'
+$t = Set-Once $t '      _magic_number = (uint16)rand();' (
+    '      _magic_number = (uint16)(mk9r_random() >> 8);  // MK9Rollback (rc30): stock rand(), never seeded') 'rc30 random: magic number'
+$t = Set-Once $t '   _state.sync.random = rand() & 0xFFFF;' (
+    '   _state.sync.random = (mk9r_random() >> 8) & 0xFFFF;  // MK9Rollback (rc30): stock rand(), never seeded') 'rc30 random: sync random'
+$t = Set-Once $t ("      Log(`"Ignoring SyncReply while not synching.\n`");`n" +
+    "      return msg->hdr.magic == _remote_magic_number;") (
+    "      Log(`"Ignoring SyncReply while not synching.\n`");`n" +
+    "      // MK9Rollback (rc30): the reply to a fresher request than the one that ended the handshake still improves the`n" +
+    "      // measured round trip (the first reply may have waited for the peer's game to start reading); nothing else changes`n" +
+    "      if (msg->hdr.magic == _remote_magic_number && ggpo_sync_rtt_ms >= 0) {`n" +
+    "         for (int j = 0; j < 8 && j < mk9r_sync_ring_n; j++) {`n" +
+    "            const int r = (mk9r_sync_ring_n - 1 - j) % 8;`n" +
+    "            if (mk9r_sync_ring_random[r] == (int)msg->u.sync_reply.random_reply) {`n" +
+    "               const int mk9r_sample = (int)(Platform::GetCurrentTimeMS() - mk9r_sync_ring_ms[r]);`n" +
+    "               if (mk9r_sample >= 0 && mk9r_sample < ggpo_sync_rtt_ms) {`n" +
+    "                  Log(`"late sync reply: the handshake's round trip was %d ms, not %d.\n`", mk9r_sample, ggpo_sync_rtt_ms);`n" +
+    "                  ggpo_sync_rtt_ms = mk9r_sample;`n" +
+    "                  if (mk9r_sample < mk9r_sync_rtt_ms) {`n" +
+    "                     mk9r_sync_rtt_ms = mk9r_sample;`n" +
+    "                  }`n" +
+    "               }`n" +
+    "               break;`n" +
+    "            }`n" +
+    "         }`n" +
+    "      }`n" +
+    "      return msg->hdr.magic == _remote_magic_number;") 'rc30 late sync reply'
+$t = Set-Once $t "         GameInput &current = _pending_output.item(j);`n" (
+    "         GameInput &current = _pending_output.item(j);`n" +
+    "         // MK9Rollback (rc30): the frame's size in the packet (10 bits per changed input bit, 1 to end it). Stock wrote`n" +
+    "         // every pending frame and asserted below at MAX_COMPRESSED_BITS; the packet now ends at the last frame that`n" +
+    "         // fits, and the rest goes out once that frame is acknowledged. The first frame always fits.`n" +
+    "         int mk9r_cost = 1;`n" +
+    "         if (memcmp(current.bits, last.bits, current.size) != 0) {`n" +
+    "            for (i = 0; i < current.size * 8; i++) {`n" +
+    "               if (current.value(i) != last.value(i)) {`n" +
+    "                  mk9r_cost += 2 + BITVECTOR_NIBBLE_SIZE;`n" +
+    "               }`n" +
+    "            }`n" +
+    "         }`n" +
+    "         if (offset + mk9r_cost >= MAX_COMPRESSED_BITS) {`n" +
+    "            Log(`"input packet full at %d bits: frames %d-%d go out, %d more wait for an acknowledgement.\n`",`n" +
+    "                offset, msg->u.input.start_frame, current.frame - 1, _pending_output.size() - j);`n" +
+    "            break;`n" +
+    "         }`n") 'rc30 input packet: the frames that fit'
+[IO.File]::WriteAllText($up, $t)
+$um = Join-Path $work 'lib\ggpo\network\udp_msg.h'
+$t = [IO.File]::ReadAllText($um).Replace("`r`n", "`n")
+$t = Set-Once $t '#define UDP_MSG_MAX_PLAYERS          4' ('#define UDP_MSG_MAX_PLAYERS          4' + "`n`n" +
+    '#include <string.h>  // MK9Rollback (rc30): memset in the constructor') 'rc30 zeroed message: include'
+$t = Set-Once $t '   UdpMsg(MsgType t) { hdr.type = (uint8)t; }' (
+    "   // MK9Rollback (rc30): zeroed. Stock set the type only, and the bytes no field owns left as the heap had them.`n" +
+    '   UdpMsg(MsgType t) { memset(this, 0, sizeof(*this)); hdr.type = (uint8)t; }') 'rc30 zeroed message: constructor'
+[IO.File]::WriteAllText($um, $t)
+$ph = Join-Path $work 'lib\ggpo\poll.h'
+$t = [IO.File]::ReadAllText($ph).Replace("`r`n", "`n")
+$t = Set-Once $t "   Poll(void);`n" ("   Poll(void);`n" +
+    "   ~Poll(void);  // MK9Rollback (rc30): closes the constructor's event handle`n") 'rc30 poll handle: poll.h'
+[IO.File]::WriteAllText($ph, $t)
+$pc = Join-Path $work 'lib\ggpo\poll.cpp'
+$t = [IO.File]::ReadAllText($pc).Replace("`r`n", "`n")
+$t = Set-Once $t "   _handles[_handle_count++] = CreateEvent(NULL, true, false, NULL);`n}`n" (
+    "   _handles[_handle_count++] = CreateEvent(NULL, true, false, NULL);`n}`n`n" +
+    "// MK9Rollback (rc30): stock had no destructor, and every session left this event handle open. Handles a sink registers`n" +
+    "// (none does in this build) stay their owner's.`n" +
+    "Poll::~Poll(void)`n{`n" +
+    "   if (_handles[0]) {`n" +
+    "      CloseHandle(_handles[0]);`n" +
+    "      _handles[0] = NULL;`n" +
+    "   }`n" +
+    "}`n") 'rc30 poll handle: destructor'
+[IO.File]::WriteAllText($pc, $t)
 # main.cpp's DllMain (GGPO is normally a DLL) would clash with MK9Rollback's: renamed to a plain
 # init function (it only seeds rand()).
 $mainCpp = Join-Path $work 'lib\ggpo\main.cpp'

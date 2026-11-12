@@ -4,7 +4,11 @@
 // frames moves on) and still sends its own frames.
 //   raw_peer <myport> <peerport> <my player 1|2> <seconds> <case[,case...]|all|none> [seed]
 // Cases: size numbits button unterminated halfrecord gap farstart status trunc type oversize random bitfuzz validfuzz flood
+//        seqjump (a sync request with a foreign magic and a far sequence number: the real stream must still be taken)
+//        slowack (45 frames without acknowledging anything new, then on: the peer's stream must go on without a gap)
 //        presync (magic 0 input before the handshake) noack (never acknowledge: expects the peer to disconnect us)
+//        churncheck (the peer runs with churn=1, delay 0: every decoded frame must be Churn(frame), see ggpo_peer.cpp)
+// 'all' is every case of the first line and seqjump except validfuzz.
 #include <winsock2.h>
 #include <windows.h>
 
@@ -35,6 +39,22 @@ bool gSynced = false, gPeerBye = false, gNoAck = false;
 uint32_t gMyRandom = 0;
 int gPeerPackets = 0, gPeerInputPackets = 0, gGaps = 0, gSent = 0;
 uint32_t gRng = 0x1234567;
+int gAckFreeze = 0, gAckFrozen = -1;  // slowack: ticks left without a new acknowledgement, and the frame acknowledged meanwhile
+bool gChurn = false;                  // churncheck
+int gMismatch = 0, gFirstMismatch = -1;
+
+// The input ggpo_peer adds for a frame with churn=1 (the same function there): about 16 of 32 bits change every frame.
+uint32_t Churn(int frame) {
+    uint32_t x = (uint32_t)frame * 2654435761u + 0x9E3779B9u;
+    x ^= x >> 15;
+    x *= 2246822519u;
+    x ^= x >> 13;
+    x *= 3266489917u;
+    x ^= x >> 16;
+    return x;
+}
+// The peer frame this side acknowledges now.
+int AckFrame() { return gNoAck ? -1 : gAckFreeze > 0 ? gAckFrozen : gPeerLast; }
 
 uint32_t Rnd() {
     gRng ^= gRng << 13;
@@ -83,9 +103,9 @@ void InputHead(uint8_t* p, int start, int numBits, int size) {
     Header(p, T_INPUT, gMagic);
     for (int i = 0; i < 4; ++i) W32(p + 5 + 4 * i, 0xFFFFFFFEu);  // last_frame -1, connected
     W32(p + 5 + 4 * gMe, (uint32_t)(gMyFrame - 1) << 1);
-    W32(p + 5 + 4 * gOther, (uint32_t)(gNoAck ? -1 : gPeerLast) << 1);
+    W32(p + 5 + 4 * gOther, (uint32_t)AckFrame() << 1);
     W32(p + 21, (uint32_t)start);
-    W32(p + 25, (uint32_t)(gNoAck ? -1 : gPeerLast) << 1);
+    W32(p + 25, (uint32_t)AckFrame() << 1);
     W16(p + 29, (uint16_t)numBits);
     p[31] = (uint8_t)size;
 }
@@ -138,7 +158,13 @@ void OnPeerInput(const uint8_t* p, int len) {
             for (int i = 0; i < 8; ++i) button |= rb() << i;
             if (use && button < 32) gPeerBits = on ? (gPeerBits | (1u << button)) : (gPeerBits & ~(1u << button));
         }
-        if (use) gPeerLast = cur;
+        if (use) {
+            gPeerLast = cur;
+            if (gChurn && gPeerBits != Churn(cur)) {
+                if (!gMismatch) gFirstMismatch = cur;
+                ++gMismatch;
+            }
+        }
         ++cur;
     }
 }
@@ -307,6 +333,23 @@ Pkts Case(const std::string& name) {
         std::vector<uint8_t> a(kInputFixed + 500, 0);
         InputHead(a.data(), gPeerAck + 1, 4000, 4);
         out.push_back(a);
+    } else if (name == "seqjump") {
+        // One sync request from our address with a foreign magic and a sequence number 20000 ahead (ours does not move).
+        // OnSyncRequest ignores it, but stock had stored its sequence number first (sync messages skip the magic and the
+        // order check): every real packet after it was "out of order" and the session ended in the disconnect timeout.
+        std::vector<uint8_t> a(12, 0);
+        W16(a.data(), (uint16_t)(gMagic ^ 0x5555));
+        W16(a.data() + 2, (uint16_t)(gSeq + 20000));
+        a[4] = T_SYNCREQ;
+        W32(a.data() + 5, Rnd() & 0xFFFF);
+        out.push_back(a);
+    } else if (name == "slowack") {
+        // Nothing malformed: for 45 frames this side acknowledges no new frame of the peer (its inputs keep arriving), then
+        // goes on. With an input that changes every frame (ggpo_peer churn=1) the peer's unacknowledged frames no longer
+        // fit one packet (4095 bits): stock asserted in SendPendingOutput; now it sends the frames that fit and the rest
+        // after the acknowledgement. The liveness check starts when the acknowledgements resume (see main).
+        gAckFrozen = gPeerLast;
+        gAckFreeze = 45;
     }
     return out;
 }
@@ -323,7 +366,7 @@ int main(int argc, char** argv) {
     const double seconds = atof(argv[4]);
     std::string spec = argv[5];
     if (argc > 6) gRng = (uint32_t)atoi(argv[6]) * 2654435761u + 1;
-    if (spec == "all") spec = "size,numbits,button,unterminated,halfrecord,gap,farstart,status,trunc,type,oversize,random,bitfuzz,flood";
+    if (spec == "all") spec = "size,numbits,button,unterminated,halfrecord,gap,farstart,status,trunc,type,oversize,random,bitfuzz,flood,seqjump";
     std::vector<std::string> cases;
     bool presync = false;
     for (size_t i = 0; spec != "none" && i <= spec.size();) {
@@ -331,6 +374,7 @@ int main(int argc, char** argv) {
         const std::string c = spec.substr(i, j == std::string::npos ? std::string::npos : j - i);
         if (c == "presync") presync = true;
         else if (c == "noack") gNoAck = true;
+        else if (c == "churncheck") gChurn = true;
         else if (!c.empty()) cases.push_back(c);
         if (j == std::string::npos) break;
         i = j + 1;
@@ -401,6 +445,7 @@ int main(int argc, char** argv) {
         }
         if (gSynced && now >= nextTick) {
             nextTick += 1000.0 / 60.0;
+            if (gAckFreeze > 0) --gAckFreeze;
             // The peer may have taken frames I never produced (a malformed packet that was well formed after all): adopt them.
             while (gMyFrame <= gPeerAck) {
                 gIn.push_back(gIn.empty() ? 0 : gIn.back());
@@ -431,7 +476,11 @@ int main(int argc, char** argv) {
                        (int)pk.size(), gMyFrame - 1, gPeerAck, gPeerLast);
             } else if (!checking.empty()) {
                 // alive: the peer acknowledged frames produced after the injection and sent 20 more of its own
-                if (gPeerAck >= checkAck + 5 && gPeerLast >= checkLast + 20) {
+                if (gAckFreeze > 0) {  // slowack: counted from the tick the acknowledgements resume
+                    checkAck = gPeerAck > gMyFrame ? gPeerAck : gMyFrame;
+                    checkLast = gPeerLast;
+                    checkUntil = now + 2500;
+                } else if (gPeerAck >= checkAck + 5 && gPeerLast >= checkLast + 20) {
                     printf("[%7.0f]      %-12s: peer alive, session kept (acked %d, peer frame %d)\n", now, checking.c_str(), gPeerAck, gPeerLast);
                     ++passed;
                     checking.clear();
@@ -447,9 +496,14 @@ int main(int argc, char** argv) {
         }
         Sleep(1);
     }
+    if (gChurn && (gMismatch || gGaps))
+        printf("churncheck: FAILED - %d of the peer's frames were not Churn(frame) (first: frame %d), stream gaps %d\n", gMismatch,
+               gFirstMismatch, gGaps);
+    else if (gChurn)
+        printf("churncheck: all %d decoded frames of the peer were Churn(frame), no gap\n", gPeerLast + 1);
     printf("raw_peer done: %d datagrams sent, %d received (%d inputs), my frames %d, peer acked %d, peer frame %d, peer bye %d, "
            "stream gaps %d; cases passed %d, failed %d%s\n",
            gSent, gPeerPackets, gPeerInputPackets, gMyFrame, gPeerAck, gPeerLast, gPeerBye ? 1 : 0, gGaps, passed, failures,
            !checking.empty() ? " (one still being checked)" : "");
-    return failures ? 1 : 0;
+    return failures || (gChurn && (gMismatch || gGaps)) ? 1 : 0;
 }

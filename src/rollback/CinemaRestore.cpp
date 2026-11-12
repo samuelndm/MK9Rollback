@@ -7,6 +7,7 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Logger.h"
 #include "../debug/Ue3Names.h"
@@ -378,14 +379,14 @@ void TraceDiff(const Frame& p, const Frame& f, uint32_t gf) {
             ++gTraceLines;
             continue;
         }
-        char buf[400];
+        char buf[400] = "";
         int n = 0, diffs = 0;
         for (uint32_t k = 0; k + 4 <= std::min(r.size, it->size) - 0x3C; k += 4) {
             uint32_t a, b;
             memcpy(&a, p.bytes.data() + it->at + k, 4);
             memcpy(&b, f.bytes.data() + r.at + k, 4);
             if (a == b) continue;
-            if (diffs++ < 8 && n < (int)sizeof buf - 40) n += snprintf(buf + n, sizeof buf - n, " +%X:%X>%X", 0x3C + k, a, b);
+            if (diffs++ < 8 && n < (int)sizeof buf - 40) n = AppendF(buf, sizeof buf, n, " +%X:%X>%X", 0x3C + k, a, b);
         }
         for (uint32_t k = 0; k < r.arrCount; ++k) {
             const ArrRec& ar = f.arrs[r.arrFirst + k];
@@ -397,7 +398,7 @@ void TraceDiff(const Frame& p, const Frame& f, uint32_t gf) {
                     memcpy(&a, p.bytes.data() + pa.at + q, 4);
                     memcpy(&b, f.bytes.data() + ar.at + q, 4);
                     if (a == b) continue;
-                    if (diffs++ < 8 && n < (int)sizeof buf - 40) n += snprintf(buf + n, sizeof buf - n, " [%X]+%X:%X>%X", ar.off, q, a, b);
+                    if (diffs++ < 8 && n < (int)sizeof buf - 40) n = AppendF(buf, sizeof buf, n, " [%X]+%X:%X>%X", ar.off, q, a, b);
                 }
             }
         }

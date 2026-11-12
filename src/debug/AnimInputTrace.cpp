@@ -11,6 +11,7 @@
 
 #include "Ue3Names.h"
 
+#include "../common/StrAppend.h"
 #include "../hook/CodePatch.h"
 #include "../game/MKHeap.h"
 #include <new>
@@ -160,12 +161,12 @@ int FormatIk(const IkRec& r, char* out, int len) {
     float f[2];
     for (uint32_t e = 0; e < r.n384 && e < 8 && n < len - 24; ++e) {
         memcpy(f, r.el[e], sizeof f);
-        n += snprintf(out + n, len - n, " %.3f/%.3f", f[0], f[1]);
+        n = AppendF(out, len, n, " %.3f/%.3f", f[0], f[1]);
     }
-    n += snprintf(out + n, len - n, " w");
+    n = AppendF(out, len, n, " w");
     for (uint32_t k = 0; k + 1 < r.n39c * 2 && k + 1 < 16 && n < len - 24; k += 2) {
         memcpy(f, &r.w[k], sizeof f);
-        n += snprintf(out + n, len - n, " %.3f/%.3f", f[0], f[1]);
+        n = AppendF(out, len, n, " %.3f/%.3f", f[0], f[1]);
     }
     return n;
 }
@@ -354,7 +355,7 @@ void __cdecl MK9R_OnSkelUpdate(uint32_t comp) {
         gFlags[gf % kRing][p] = 0;
         const uint8_t* now = reinterpret_cast<const uint8_t*>(comp);
         int n = 0, nTask = 0;
-        char line[400];
+        char line[400] = "";
         int ln = 0;
         for (uint32_t o = 0; o + 4 <= live.size; o += 4) {
             uint32_t a, b;
@@ -362,7 +363,7 @@ void __cdecl MK9R_OnSkelUpdate(uint32_t comp) {
             memcpy(&b, now + o, 4);
             if (a == b) continue;
             ++gDiffs[o]; if (o >= 0x658 && o < 0x680) ++nTask;
-            if (++n <= 8 && ln < 340) ln += snprintf(line + ln, sizeof line - ln, " +%X:%08X>%08X", o, a, b);
+            if (++n <= 8 && ln < 340) ln = AppendF(line, sizeof line, ln, " +%X:%08X>%08X", o, a, b);
         }
         bool nodesAny = false;
         // Node level, first replayed frames only: same node objects, which offsets differ.
@@ -416,7 +417,7 @@ void __cdecl MK9R_OnSkelUpdate(uint32_t comp) {
                 Logger::Info("IKDIFF gf=%u P%d first replayed skeleton update: live %s | replay %s | after the load (gf %u) %s", gf, p + 1, a, b,
                              gLoadIk[p].gf, c);
                 // Each table node's +0x40: the snapshot's saved value (span), after the load, now, and the original's.
-                char nl[1400];
+                char nl[1400] = "";
                 int nn = 0;
                 for (int k = 0; k < gLoadNodeN[p] && nn < 1250; ++k) {
                     const LoadNode& ld = gLoadNodes[p][k];
@@ -424,14 +425,14 @@ void __cdecl MK9R_OnSkelUpdate(uint32_t comp) {
                     CrashLog::SafeRead32(ld.node + 0x40, &now);
                     for (int i = 0; i < lnr.n; ++i)
                         if (lnr.ptr[i] == ld.node && lnr.size[i] >= 0x44) memcpy(&lv, lnr.bytes[i] + 0x40, 4);
-                    nn += snprintf(nl + nn, sizeof nl - nn, " %08X saved %08X(%s) load %08X now %08X live %08X", ld.node, ld.saved,
+                    nn = AppendF(nl, sizeof nl, nn, " %08X saved %08X(%s) load %08X now %08X live %08X", ld.node, ld.saved,
                                    ld.span ? ld.span : "no span", ld.after, now, lv);
                     if (ld.bound) {
                         CrashLog::SafeRead32(ld.bound + 0x20, &srcNow);
-                        nn += snprintf(nl + nn, sizeof nl - nn, " src %08X saved %08X(%s) load %08X now %08X", ld.bound + 0x20, ld.srcSaved,
+                        nn = AppendF(nl, sizeof nl, nn, " src %08X saved %08X(%s) load %08X now %08X", ld.bound + 0x20, ld.srcSaved,
                                        ld.srcSpan ? ld.srcSpan : "no span", ld.srcAfter, srcNow);
                     }
-                    nn += snprintf(nl + nn, sizeof nl - nn, ";");
+                    nn = AppendF(nl, sizeof nl, nn, ";");
                 }
                 Logger::Info("IKDIFF gf=%u P%d node +0x40:%s", gf, p + 1, nn ? nl : " no table nodes at the load");
                 // Slot 3's writes this frame (the strength source), original and replay so far (s0-s2: LOCTRACE's actor).
@@ -482,7 +483,7 @@ void __cdecl MK9R_OnSkelUpdate(uint32_t comp) {
             int tn = 0, shown = 0;
             for (auto it = gDiffs.begin(); it != gDiffs.end() && shown < 40; ++it)
                 if (it->second * 20 >= gDiffering || it->second >= 3) {
-                    tn += snprintf(top + tn, sizeof top - tn, " +%X:%u", it->first, it->second);
+                    tn = AppendF(top, sizeof top, tn, " +%X:%u", it->first, it->second);
                     ++shown;
                 }
             top[tn] = 0;
@@ -592,7 +593,7 @@ void __cdecl MK9R_OnRootMotion(uint32_t comp) {
                     char hist[600];
                     int hn = 0;
                     for (uint32_t g = gf - 4; g <= gf; ++g)
-                        hn += snprintf(hist + hn, sizeof hist - hn, " %u:exit %s objtick %s step %s[pages in %s out %s]", g,
+                        hn = AppendF(hist, sizeof hist, hn, " %u:exit %s objtick %s step %s[pages in %s out %s]", g,
                                        gImgLineGf[1][g % kRing] == g ? std::to_string(gImgLineN[1][g % kRing]).c_str() : "-",
                                        gImgLineGf[2][g % kRing] == g ? std::to_string(gImgLineN[2][g % kRing]).c_str() : "-",
                                        gImgLineGf[0][g % kRing] == g ? std::to_string(gImgLineN[0][g % kRing]).c_str() : "-",
@@ -885,7 +886,7 @@ void ImageCompare(int pt, uint32_t gf, bool resim) {
             uint32_t& cnt = gImgAddrDiff[pt][addr];
             ++cnt;
             if (gImgCmp[pt] >= 100 && cnt * 5 > gImgCmp[pt]) continue;
-            if (++nd <= 16 && ln < 520) ln += snprintf(line + ln, sizeof line - ln, " %08X:%08X>%08X", addr, a[i], c[i]);
+            if (++nd <= 16 && ln < 520) ln = AppendF(line, sizeof line, ln, " %08X:%08X>%08X", addr, a[i], c[i]);
         }
         at += gImgReg[k].size;
     }
@@ -1389,16 +1390,16 @@ void __cdecl MK9R_OnHit(uint32_t site, const uint32_t* args, uint32_t result) {
                     if (site == 5) {
                         uint32_t blk[2] = {0, 0};
                         const bool inBlock = CrashLog::SafeBlockInfo(reinterpret_cast<const void*>(h.vec[0][0]), blk);
-                        n += snprintf(s + n, sizeof s - n, " entry %08X (GMalloc %d %08X/%X, vt %08X %s)", h.vec[0][0], inBlock, blk[0], blk[1],
+                        n = AppendF(s, sizeof s, n, " entry %08X (GMalloc %d %08X/%X, vt %08X %s)", h.vec[0][0], inBlock, blk[0], blk[1],
                                       *reinterpret_cast<const uint32_t*>(h.vec[0][0]), ObjectHooks::TypeOf(h.vec[0][0]));
                     }
                     for (int a = 0; a < 6 && n < 600; ++a)
-                        if (l.args[a] != h.args[a]) n += snprintf(s + n, sizeof s - n, " arg%d %08X>%08X", a, l.args[a], h.args[a]);
+                        if (l.args[a] != h.args[a]) n = AppendF(s, sizeof s, n, " arg%d %08X>%08X", a, l.args[a], h.args[a]);
                     for (int v = 0; v < 2; ++v)
                         for (int k = 0; k < 4 && n < 600; ++k)
-                            if (l.vec[v][k] != h.vec[v][k]) n += snprintf(s + n, sizeof s - n, " vec%d[%d] %08X>%08X", v, k, l.vec[v][k], h.vec[v][k]);
+                            if (l.vec[v][k] != h.vec[v][k]) n = AppendF(s, sizeof s, n, " vec%d[%d] %08X>%08X", v, k, l.vec[v][k], h.vec[v][k]);
                     for (int k = 0; k < 16 && n < 600; ++k)
-                        if (l.target[k] != h.target[k]) n += snprintf(s + n, sizeof s - n, " tgt+%X %08X>%08X", k * 4, l.target[k], h.target[k]);
+                        if (l.target[k] != h.target[k]) n = AppendF(s, sizeof s, n, " tgt+%X %08X>%08X", k * 4, l.target[k], h.target[k]);
                     Logger::Info("%s", s);
                 }
             }
@@ -1669,11 +1670,11 @@ int Describe(uint32_t S, uint32_t gf, char* out, int len) {
             }
             f[p][k] = 0;
         }
-        n += snprintf(out + n, len - n, " %u:%s/%s", g, f[0], f[1]);
+        n = AppendF(out, len, n, " %u:%s/%s", g, f[0], f[1]);
         // Non-noise MK image dwords differing at FightUpdate entry / exit / MK object tick exit / P1's anim step.
         if (n < len - 48) {
             auto cnt = [&](int pt) { return gImgLineGf[pt][g % kRing] == g ? (int)gImgLineN[pt][g % kRing] : -1; };
-            n += snprintf(out + n, len - n, "[img %d/%d/%d/%d/%d/%d/%d]", cnt(4), cnt(5), cnt(3), cnt(1), cnt(2), cnt(0), cnt(6));
+            n = AppendF(out, len, n, "[img %d/%d/%d/%d/%d/%d/%d]", cnt(4), cnt(5), cnt(3), cnt(1), cnt(2), cnt(0), cnt(6));
         }
     }
     // The earliest point (frame order: entry, exit, object tick, anim step) where the image diverged: its addresses.
@@ -1708,10 +1709,10 @@ int Describe(uint32_t S, uint32_t gf, char* out, int len) {
             // It misses objects created before the hooks were installed, so the list is walked too.
             if (ObjectHooks::Installed()) ObjectHooks::ForEachLive(nearest, nr);
             ObjectHooks::ForEachListed(nearest, nr);
-            char o[600];
+            char o[600] = "";
             int on = 0;
             for (int k = 0; k < nn && on < 520; ++k)
-                on += snprintf(o + on, sizeof o - on, " %08X=%s+%X", nr[k].addr, nr[k].type ? nr[k].type : "?", nr[k].obj ? nr[k].addr - nr[k].obj : 0);
+                on = AppendF(o, sizeof o, on, " %08X=%s+%X", nr[k].addr, nr[k].type ? nr[k].type : "?", nr[k].obj ? nr[k].addr - nr[k].obj : 0);
             Logger::Info("ANIMTRACE FIRSTDIFF owners:%s", o);
         }
     return n;
@@ -1839,7 +1840,7 @@ void HitReplayFrameDone(uint32_t gf) {
                     int n = snprintf(s, sizeof s, "ANIMTRACE HIT gf=%u site %u: live made %u calls, the replay %u; unmatched live results:", gf,
                                      st, liveN[st], rep[st]);
                     for (uint32_t k = 0; k < pf.n && n < 280; ++k)
-                        if ((pf.r[k].site & 15) == st && pf.r[k].ord >= rep[st]) n += snprintf(s + n, sizeof s - n, " #%u=%u", pf.r[k].ord, pf.r[k].result);
+                        if ((pf.r[k].site & 15) == st && pf.r[k].ord >= rep[st]) n = AppendF(s, sizeof s, n, " #%u=%u", pf.r[k].ord, pf.r[k].result);
                     Logger::Info("%s", s);
                 }
             }

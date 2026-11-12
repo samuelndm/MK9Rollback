@@ -27,8 +27,14 @@ foreach ($f in $files) {
 }
 New-Item -ItemType Directory -Force "$stage\build\clang" | Out-Null
 Copy-Item "$bin\MK9Rollback.dll", "$bin\MK9RollbackInjector.exe" "$stage\build\clang"
+# The here-strings below take this file's line endings (LF); cmd.exe needs CRLF in a .bat (with LF only it can lose its
+# place in a block or a label), and Notepad showed the README as one line until Windows 10 1809.
+function CrLf([string]$text) { $text -replace "`r?`n", "`r`n" }
 # Opened from inside the zip (Explorer extracts only the .bat to a temporary folder), the script is missing: say so.
-@'
+# The window's PowerShell runs hidden, so on a PC that refuses to run the script (scripts forbidden by Group Policy,
+# PowerShell blocked) nothing appeared at all: the script is started once in this visible console first, where
+# -StartCheck makes it exit at once with code 0, and PowerShell's own message stays readable when it does not.
+CrLf @'
 @echo off
 rem Opens the MK9 Rollback netplay window (tools\netplay_gui.ps1).
 if not exist "%~dp0tools\netplay_gui.ps1" (
@@ -36,12 +42,24 @@ if not exist "%~dp0tools\netplay_gui.ps1" (
     pause
     exit /b 1
 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\netplay_gui.ps1" -StartCheck
+if %errorlevel% neq 0 goto :blocked
 start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0tools\netplay_gui.ps1" %*
+exit /b 0
+
+:blocked
+echo.
+echo MK9 Rollback cannot open its window: Windows PowerShell did not run its script on this PC.
+echo If PowerShell printed a message above, it says why. The usual cause is a rule set by whoever manages
+echo this PC - a company, a school, or security software - that forbids PowerShell scripts.
+echo Ask them to allow the scripts in the tools folder next to this file, or play from another PC.
+pause
+exit /b 1
 '@ | Set-Content -Encoding ascii "$stage\Play Online.bat"
 $hash = (Get-FileHash "$bin\MK9Rollback.dll" -Algorithm SHA256).Hash
 # The updater (tools\updater.ps1) compares this version with the latest GitHub release (tag v<stamp>).
 "version=$stamp`r`ndll=$hash" | Set-Content -Encoding ascii "$stage\version.txt"
-@"
+CrLf @"
 MK9Rollback netplay test build ($stamp)
 MK9Rollback.dll SHA-256: $hash
 Both players must use this same zip (the session start checks the DLL).
@@ -96,8 +114,11 @@ Advanced (LAN by IP address, other delays): tools\netplay.ps1, see docs\netplay_
 "@ | Set-Content -Encoding ascii "$stage\README.txt"
 # Every file must pass the updater's allow-list, or the players' updater would refuse this zip.
 . "$PSScriptRoot\updater.ps1"
+# And every file must be on its $kPackageFiles list, or the window would leave it blocked (the internet zone mark of a
+# downloaded zip) on the players' PCs.
 foreach ($rel in Get-TreeFiles $stage) {
     if (-not (Get-ReleaseEntryPath $rel)) { throw "$rel is not on tools\updater.ps1's `$kReleaseFiles list: add it there first" }
+    if ($kPackageFiles -notcontains $rel) { throw "$rel is not on tools\updater.ps1's `$kPackageFiles list: add it there first" }
 }
 New-Item -ItemType Directory -Force "$root\dist" | Out-Null
 Compress-Archive -Path "$stage\*" -DestinationPath $zip

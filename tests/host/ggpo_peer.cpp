@@ -1,6 +1,9 @@
 // Test peer for the round 3 GGPO patches, adapted from tools\ggpo_peer\ggpo_peer.cpp (no game involved).
 //   peer_test <localport> <remoteport> <player 1|2> <seconds> [bye=0|1] [timeout=ms] [delay=N] [norewind=0|1] [hashframes=N]
+//             [churn=0|1]
 //   peer_test bindtest <port>
+// churn=1: the local input of frame n is Churn(n), about 16 of its 32 bits change every frame (ggpo_raw_peer's churncheck
+// knows the function; use delay 0). The last line ends with the handshake's round trip (ggpo_sync_rtt_ms).
 // Everything runs on 127.0.0.1 (ggpo_bind_loopback = 1: no firewall prompt). Times are wall-clock milliseconds
 // (comparable between two processes). Build with -DOLDLIB against a library without the round 3 exports.
 #include <winsock2.h>
@@ -20,6 +23,7 @@ static void CountSend() { ++gAfterSend; }
 #ifndef OLDLIB
 extern "C" int ggpo_bye_on_close;
 extern "C" int ggpo_bind_failed;
+extern "C" int ggpo_sync_rtt_ms;
 #endif
 
 static double NowMs() {
@@ -91,6 +95,16 @@ bool __cdecl OnEvent(GGPOEvent* e) {
     }
     fflush(stdout);
     return true;
+}
+// churn=1: the same function as in ggpo_raw_peer.cpp.
+unsigned int Churn(int frame) {
+    unsigned int x = (unsigned int)frame * 2654435761u + 0x9E3779B9u;
+    x ^= x >> 15;
+    x *= 2246822519u;
+    x ^= x >> 13;
+    x *= 3266489917u;
+    x ^= x >> 16;
+    return x;
 }
 int Opt(int argc, char** argv, const char* key, int def) {
     const size_t n = strlen(key);
@@ -169,14 +183,15 @@ int main(int argc, char** argv) {
     if (argc == 3 && !strcmp(argv[1], "bindtest")) return BindTest((unsigned short)atoi(argv[2]));
 #endif
     if (argc < 5) {
-        printf("usage: peer_test <localport> <remoteport> <player 1|2> <seconds> [bye=0|1] [timeout=ms] [delay=N] [norewind=0|1]\n");
+        printf("usage: peer_test <localport> <remoteport> <player 1|2> <seconds> [bye=0|1] [timeout=ms] [delay=N] [norewind=0|1] "
+               "[hashframes=N] [churn=0|1]\n");
         return 2;
     }
     const unsigned short localPort = (unsigned short)atoi(argv[1]);
     const int remotePort = atoi(argv[2]), me = atoi(argv[3]);
     const double seconds = atof(argv[4]);
     const int bye = Opt(argc, argv, "bye", 0), timeout = Opt(argc, argv, "timeout", 3000), delay = Opt(argc, argv, "delay", 0);
-    const int hashFrames = Opt(argc, argv, "hashframes", 0);
+    const int hashFrames = Opt(argc, argv, "hashframes", 0), churn = Opt(argc, argv, "churn", 0);
     ggpo_no_disconnect_rewind = Opt(argc, argv, "norewind", 1);
 #ifndef OLDLIB
     ggpo_bye_on_close = bye;
@@ -239,6 +254,7 @@ int main(int argc, char** argv) {
             hold = 1 + rand() % 6;
         }
         if (gRunning) {
+            if (churn) mask = Churn(gFrame);  // the frame this input is added for (delay 0)
             const GGPOErrorCode rc = ggpo_add_local_input(gS, gLocal, &mask, sizeof mask);
             if (GGPO_SUCCEEDED(rc)) {
                 unsigned int in[2];
@@ -257,8 +273,9 @@ int main(int argc, char** argv) {
             GGPONetworkStats st{};
             for (int h = 1; h <= 2; ++h)
                 if (h != gLocal && GGPO_SUCCEEDED(ggpo_get_network_stats(gS, h, &st)))
-                    printf("t=%ds frame=%d ping=%dms behind local=%d remote=%d loads=%d barrier=%d\n", lastReport, gFrame, st.network.ping,
-                           st.timesync.local_frames_behind, st.timesync.remote_frames_behind, gLoads, barrier);
+                    printf("t=%ds frame=%d ping=%dms behind local=%d remote=%d loads=%d barrier=%d kbps=%d pending=%d\n", lastReport, gFrame,
+                           st.network.ping, st.timesync.local_frames_behind, st.timesync.remote_frames_behind, gLoads, barrier,
+                           st.network.kbps_sent, st.network.send_queue_len);
             fflush(stdout);
         }
     }
@@ -278,7 +295,12 @@ int main(int argc, char** argv) {
         printf("inputs of frames 0-%d (both players): hash %08X; frame %d = %08X %08X\n", hashFrames - 1, h, hashFrames - 1,
                gRec[hashFrames - 1][0], gRec[hashFrames - 1][1]);
     }
-    printf("done: %d frames, %d loads, %d barrier waits, remote input non-zero in %d frames, disconnected=%d\n", gFrame, gLoads, barrier,
-           remoteNonZero, gDisconnected ? 1 : 0);
+#ifndef OLDLIB
+    const int syncRtt = ggpo_sync_rtt_ms;
+#else
+    const int syncRtt = -1;
+#endif
+    printf("done: %d frames, %d loads, %d barrier waits, remote input non-zero in %d frames, disconnected=%d, sync_rtt=%dms\n", gFrame,
+           gLoads, barrier, remoteNonZero, gDisconnected ? 1 : 0, syncRtt);
     return 0;
 }

@@ -13,7 +13,10 @@
 # run in background runspaces, polled by a timer, so the window never freezes on the network.
 #   -NoUpdateCheck       no update check when the window opens
 #   -SnapshotPng <file>  saves a picture of the window 2.5 s after it opens, then closes it (layout check)
-param([switch]$NoUpdateCheck, [string]$SnapshotPng = '')
+#   -StartCheck          exits at once with code 0: "Play Online.bat" runs this first, in its visible console, to learn
+#                        whether this PC runs the script at all (where a policy forbids scripts, PowerShell says so there)
+param([switch]$NoUpdateCheck, [string]$SnapshotPng = '', [switch]$StartCheck)
+if ($StartCheck) { exit 0 }
 
 # Started hidden ("Play Online.bat"), so nothing may fail silently. A PC that forces PowerShell's Constrained Language
 # Mode (company or school policy, some security software) cannot run this window at all: say so in Notepad.
@@ -49,12 +52,20 @@ try {
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr hWnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, IntPtr title);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 '@
     }
     [void][MK9R.Native]::SetProcessDPIAware()
 } catch { }
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+# An error inside a button or timer handler does not reach the trap above: Windows Forms catches it and shows its own
+# ".NET Framework" error box, again at every tick when a timer step fails. It goes to the status box instead
+# (HandlerError). The mode must be set before the first control exists.
+try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch { }
+[System.Windows.Forms.Application]::add_ThreadException({ param($source, $e) try { HandlerError $e.Exception } catch { } })
 
 # One window at a time: a second one would fight the first over the game and the command file.
 $script:mutex = New-Object System.Threading.Mutex($false, 'Local\MK9RollbackLauncher')
@@ -82,10 +93,9 @@ foreach ($p in @($libPath, $updaterPath)) { if (-not (Test-Path -LiteralPath $p)
 . $libPath
 $installed = Get-InstalledVersion $root
 # Files extracted from a downloaded zip carry the internet zone mark; the injector and the DLL would then be blocked.
-# Only the folders a release holds (a developer tree has big result folders).
-@(Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue) +
-    @(foreach ($sub in 'tools', 'build\clang', 'docs') { Get-ChildItem -LiteralPath (Join-Path $root $sub) -File -ErrorAction SilentlyContinue }) |
-    Unblock-File -ErrorAction SilentlyContinue
+# Only the release's own files, by name (updater.ps1 $kPackageFiles): the zip has no top folder, so this folder may be
+# the player's Downloads or Desktop, and the other files there keep their mark.
+Unblock-PackageFiles $root
 # The DLL writes its log, and this window its settings and commands, next to the DLL. A read-only folder (or one
 # guarded by Windows' ransomware protection, "Controlled folder access", e.g. under Documents) cannot work.
 $script:readOnly = $false
@@ -98,16 +108,8 @@ function MyAccountId {
     $u = (Get-ItemProperty 'HKCU:\Software\Valve\Steam\ActiveProcess' -ErrorAction SilentlyContinue).ActiveUser
     if ($u) { [uint64]$u } else { [uint64]0 }
 }
-# A friend code (account ID) or a 17-digit SteamID64 -> account ID; 0 if neither.
-function ParseCode([string]$s) {
-    $s = ($s -replace '[^\d]', '')
-    if (-not $s) { return [uint64]0 }
-    $v = [uint64]0
-    if (-not [uint64]::TryParse($s, [ref]$v)) { return [uint64]0 }
-    if ($v -gt $kSteamBase) { return $v - $kSteamBase }
-    if ($v -lt 4294967296) { return $v }
-    [uint64]0
-}
+# A friend code (account ID), a 17-digit SteamID64 or a profile link -> account ID; 0 for anything else (launcher_lib).
+function ParseCode([string]$s) { ConvertTo-AccountId $s }
 # Commands to the DLL (launcher_lib Send-LauncherCommand: a file still waiting is merged, not overwritten).
 function Cmd([string[]]$lines) {
     if (-not (Send-LauncherCommand $dir $lines)) { Say 'Could not pass the command to the game (its folder is busy). Press the button again.' }
@@ -244,6 +246,26 @@ if ($form.Height -gt $work.Height) { $form.AutoScroll = $true; $form.Height = $w
 function Say([string]$s) {
     $status.AppendText("$(Get-Date -Format 'HH:mm:ss')  $s`r`n")
 }
+# An error no handler caught (the ThreadException handler at the top): one status line and the error file, not a .NET
+# error box. The same error again within a minute is not repeated (launcher_lib Update-ErrorWatch).
+$script:errorWatch = New-ErrorWatch
+function HandlerError($ex) {
+    try {
+        $text = ("$($ex.Message)".Trim() -split "`r?`n")[0]
+        if (Update-ErrorWatch $script:errorWatch $text) {
+            $errFile = Join-Path $env:TEMP 'MK9Rollback-launcher-error.txt'
+            $at = ''
+            if ($ex -is [System.Management.Automation.IContainsErrorRecord] -and $ex.ErrorRecord.InvocationInfo) { $at = $ex.ErrorRecord.InvocationInfo.PositionMessage }
+            try { Set-Content -LiteralPath $errFile -Value "An error inside the Play Online window:`r`n`r`n$($ex.Message)`r`n$at" -Encoding ascii } catch { }
+            Say "Something went wrong in this window: $text (Saved in $errFile; please send it with your bug report if it keeps happening.)"
+        }
+        # A start step that fails at every tick of the timer would leave the Play button greyed out for good.
+        if ($script:errorWatch.Count -eq 3 -and $script:state -ne 'idle' -and $script:state -ne 'watch') {
+            Say 'This start is given up. Press Play to try again.'
+            GoIdle
+        }
+    } catch { }
+}
 
 # Same text in README.md and the README of tools\package.ps1.
 $troubleLines = @(
@@ -347,16 +369,31 @@ $updBtn.Add_Click({
     $answer = [System.Windows.Forms.MessageBox]::Show("Install version $($script:release.Version)?`n`nYour opponent needs the same version to play with you.", 'MK9 Rollback update', 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
     $script:updateBusy = $true
+    $script:installing = $true
     $updBtn.Enabled = $false; $play.Enabled = $false; $backBtn.Enabled = $false
     Start-BgJob $kInstallJob @{ updater = $updaterPath; release = $script:release; root = $root; queue = $script:bgQueue } $onInstalled
 })
 $onInstalled = {
     param($out, $err)
     $script:updateBusy = $false
+    $script:installing = $false
+    if ($script:closeWanted) { $form.Close(); return }  # closed during the install: no restart
     if ($out -eq $true) { RestartWindow; return }
     if ($err) { Say "The update failed: $err" }
     $updBtn.Enabled = $true; $play.Enabled = -not $script:readOnly; $backBtn.Enabled = $true
 }
+# Closing the window stops the background jobs where they are (the end of this file). An install stopped while it
+# copies would leave some files new and some old, with nothing to put the old ones back (updater.ps1 Invoke-FileSwap
+# only does that for an error). So the window stays until the install job has ended, then closes by itself.
+$script:installing = $false
+$script:closeWanted = $false
+$form.Add_FormClosing({
+    param($source, $e)
+    if (-not $script:installing) { return }
+    $e.Cancel = $true
+    if (-not $script:closeWanted) { Say 'The update is still being installed: this window closes by itself when it is done. Please wait.' }
+    $script:closeWanted = $true
+})
 # Undoes the last update (updater.ps1 Restore-PreviousVersion); refused while the game runs, like updating.
 $backBtn.Add_Click({
     if ($script:updateBusy) { return }
@@ -428,7 +465,12 @@ $peerBox.Add_TextChanged({ UpdateSide })
 $where.Add_SelectedIndexChanged({ UpdateSide; UpdateMode })
 UpdateSide
 UpdateMode
-$copy.Add_Click({ if ($me) { [System.Windows.Forms.Clipboard]::SetText("$me"); Say 'Your code is copied. Send it to your friend.' } })
+$copy.Add_Click({
+    if (-not $me) { return }
+    # SetText throws while another program holds the clipboard (a clipboard manager, a remote desktop session).
+    try { [System.Windows.Forms.Clipboard]::SetText("$me"); Say 'Your code is copied. Send it to your friend.' }
+    catch { Say 'The code could not be copied (another program is using the clipboard). Press Copy again, or select the code in box 1 and press Ctrl+C.' }
+})
 
 # For a public bug report: Steam IDs, IP addresses and the user and PC names are replaced in the zip (launcher_lib
 # Save-LogsZip, PRIVACY.txt in the zip says what was replaced).
@@ -458,6 +500,18 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 
 function Arm([switch]$Next) {
+    # Local Versus needs the other player's code. Play checks it, but the mode can be switched to Local Versus after
+    # Play was pressed in the MK9 Online mode (where the box may be empty), and the Safe mode box and the re-arm after
+    # a fight come here without Play: account 0 or the player's own would be armed, and the next fight would wait for it.
+    if (-not (IsOnline) -and (-not $script:peer -or $script:peer -eq $me)) {
+        Say "Local Versus needs your friend's code: paste it in box 2, then press the button."
+        # Nothing is armed; the game and the mod stay as they are, and the button arms once the code is there.
+        $script:ackDue = $null
+        $script:state = 'watch'
+        $play.Text = 'Not armed (&press to arm)'
+        $play.Enabled = $true
+        return
+    }
     # One command per mode: Safe mode installs only the lockstep patch set (docs/restructure_plan.md, phase 1). Sent
     # again on a re-arm or a checkbox change, it only switches the mode (a running fight keeps its netcode).
     $lines = @($(if ($safe.Checked) { 'netcode safe' } else { 'netcode rollback' }), "overlay $($overlayLevels[$overlayBox.SelectedIndex])")
@@ -502,6 +556,24 @@ function Arm([switch]$Next) {
 
 function GoIdle { $script:state = 'idle'; $play.Enabled = -not $script:readOnly }
 $script:shownDesync = 0
+# The game's own window has taken no message for 5 s (what Windows shows as "Not responding"). Asked of that window
+# only, by its class: the game thread owns it (the "HANG?   window" lines of src\debug\CrashLog.cpp), and the game's
+# second window (D3DProxyWindow) belongs to another thread. IsHungAppWindow answers at once; Process.Responding would
+# wait up to 5 s for the game, and this window with it. $false when it cannot be told.
+$script:hang = New-HangWatch
+function GameHung($game) {
+    try {
+        $h = [IntPtr]::Zero
+        for ($i = 0; $i -lt 16; $i++) {
+            $h = [MK9R.Native]::FindWindowEx([IntPtr]::Zero, $h, 'LaunchUnrealUWindowsClient', [IntPtr]::Zero)
+            if ($h -eq [IntPtr]::Zero) { break }
+            $owner = [uint32]0
+            [void][MK9R.Native]::GetWindowThreadProcessId($h, [ref]$owner)
+            if ($owner -eq $game.Id) { return [bool][MK9R.Native]::IsHungAppWindow($h) }
+        }
+    } catch { }
+    $false
+}
 
 $timer.Add_Tick({
     switch ($script:state) {
@@ -516,20 +588,20 @@ $timer.Add_Tick({
             if (++$script:wait -ge 2) { $script:state = 'inject'; $script:wait = 0 }
         }
         'inject' {
-            if (@(Get-Process MKKE -ErrorAction SilentlyContinue).Count -gt 1) { Say 'Two copies of the game are running. Close one.'; GoIdle; return }
+            $games = @(Get-Process MKKE -ErrorAction SilentlyContinue)
+            if ($games.Count -gt 1) { Say 'Two copies of the game are running. Close one.'; GoIdle; return }
+            # Closed while this window waited for its menu or between two tries: the injector would end with code 1 and
+            # the antivirus text below would be shown for it.
+            if ($games.Count -eq 0) { Say (Get-InjectFailureText $null $false); GoIdle; return }
             $files = Test-InstalledFiles $root
             if (-not $files.Ok) { Say $files.Message; GoIdle; return }
             # The last session's logs are kept for "Save logs": a player who restarts after a crash would lose them.
-            $old = @(Get-ChildItem -LiteralPath $dir -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue)
-            if ($old) {
-                $prevLogs = Join-Path $dir 'previous_logs'
-                Remove-Item -LiteralPath $prevLogs -Recurse -Force -ErrorAction SilentlyContinue
-                New-Item -ItemType Directory -Force -Path $prevLogs | Out-Null
-                $old | Move-Item -Destination $prevLogs -Force -ErrorAction SilentlyContinue
-            }
-            Get-ChildItem -LiteralPath $dir -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-            $out = (& (Join-Path $dir 'MK9RollbackInjector.exe') inject 2>&1 | Out-String)
-            $r = Get-InjectorResult $LASTEXITCODE
+            # Only the first try of a start moves them: another try would replace them with the log of the try before.
+            Move-SessionLogs $dir ($script:tries -gt 0)
+            # Never throws (launcher_lib): an injector the antivirus removed or blocks is a status line, not an error.
+            $run = Invoke-Injector (Join-Path $dir 'MK9RollbackInjector.exe')
+            if (-not $run.Started) { Say $run.Error; GoIdle; return }
+            $r = Get-InjectorResult $run.Code
             if ($r.AlreadyLoaded) {
                 Say 'The mod was already loaded in this game.'
                 $script:tail = New-LogTail $log
@@ -538,9 +610,9 @@ $timer.Add_Tick({
                 return
             }
             if (-not $r.Loaded) {
-                if ($r.Retry -and ++$script:tries -lt 6) { $script:state = 'injectretry'; $script:wait = 0; return }
-                if ($r.Text) { Say $r.Text }
-                else { Say 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe. Press ''Having trouble?'' for what to try, then save the logs if it keeps failing.' }
+                $running = [bool](Get-Process MKKE -ErrorAction SilentlyContinue)
+                if ($running -and $r.Retry -and ++$script:tries -lt 6) { $script:state = 'injectretry'; $script:wait = 0; return }
+                Say (Get-InjectFailureText $r $running)
                 GoIdle
                 return
             }
@@ -550,15 +622,21 @@ $timer.Add_Tick({
             # A fresh log: read from its first line (a Steam or hook failure at start-up is shown too).
             if (Test-Path -LiteralPath $log) { Say 'Mod loaded.'; $script:tail = New-LogTail $log; Arm; return }
             if (++$script:wait -ge 10) {
-                if (++$script:tries -lt 6) { $script:state = 'inject'; return }
-                Say 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe. Press ''Having trouble?'' for what to try, then save the logs if it keeps failing.'
+                $running = [bool](Get-Process MKKE -ErrorAction SilentlyContinue)
+                if ($running -and ++$script:tries -lt 6) { $script:state = 'inject'; return }
+                Say (Get-InjectFailureText $null $running)
                 GoIdle
             }
         }
         'watch' {
-            if (-not (Get-Process MKKE -ErrorAction SilentlyContinue)) {
-                Say 'The game has closed.'; $script:ackDue = $null; $play.Text = '3. &Play'; GoIdle; return
+            $game = Get-Process MKKE -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $game) {
+                Say 'The game has closed.'; $script:ackDue = $null; $script:hang = New-HangWatch; $play.Text = '3. &Play'; GoIdle; return
             }
+            # A game that stays frozen (launcher_lib Update-HangWatch; the DLL's "HANG?" lines alone are not shown).
+            $hang = Update-HangWatch $script:hang (GameHung $game)
+            if ($hang -eq 'hung') { Say 'The game is not responding (frozen for more than 15 seconds). If it stays frozen, close it, then save the logs.' }
+            elseif ($hang -eq 'back') { Say 'The game is responding again.' }
             $rearm = $false
             foreach ($line in (Read-LogTail $script:tail)) {
                 if ($script:ackDue -and (Test-CommandAck $line)) { $script:ackDue = $null }
@@ -586,7 +664,7 @@ $play.Add_Click({
     if (-not $me) { $script:me = MyAccountId; $me = $script:me; if ($me) { $myBox.Text = "$me" } }
     if (-not $me) { Say 'Start Steam and sign in first.'; return }
     $script:peer = ParseCode $peerBox.Text
-    if (-not (IsOnline) -and (-not $script:peer -or $script:peer -eq $me)) { Say "Paste your friend's code first (box 2)."; return }
+    if (-not (IsOnline) -and (-not $script:peer -or $script:peer -eq $me)) { Say "Paste your friend's code first (box 2): only the number they sent you."; return }
     SaveSettings
     if (-not (Test-Path -LiteralPath (Join-Path $dir 'MK9RollbackInjector.exe'))) { Say "The mod files are missing next to this launcher ($dir)."; return }
     if ($script:state -eq 'watch') { Arm; return }

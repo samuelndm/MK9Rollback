@@ -6,6 +6,7 @@
 #include <cstring>
 #include <vector>
 
+#include "../common/StrAppend.h"
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
 #include "../hook/GameLoopHook.h"
@@ -124,7 +125,7 @@ extern "C" int __fastcall MK9R_DestroyActorImpl(void* world, uint32_t mkobj, voi
             const uint32_t v = Read32(a + o);
             if (n > (int)sizeof line - 40) break;
             if ((v == mkobj || v == e.mkid) && o != kRefOffset + 4 && o != kRefOffset + 8)
-                n += snprintf(line + n, sizeof line - n, " actor+%X=%s", o, v == mkobj ? "obj" : "id");
+                n = AppendF(line, sizeof line, n, " actor+%X=%s", o, v == mkobj ? "obj" : "id");
         }
         const uint32_t comps = Read32(a + 0x3C), ncomp = Read32(a + 0x40);
         for (uint32_t k = 0; k < ncomp && k < 16 && Readable(comps, ncomp * 4); ++k) {
@@ -133,7 +134,7 @@ extern "C" int __fastcall MK9R_DestroyActorImpl(void* world, uint32_t mkobj, voi
             for (uint32_t o = 0; o + 4 <= 0x400; o += 4) {
                 const uint32_t v = Read32(c + o);
                 if (n > (int)sizeof line - 40) break;
-                if (v == mkobj || v == e.mkid) n += snprintf(line + n, sizeof line - n, " comp%u+%X=%s", k, o, v == mkobj ? "obj" : "id");
+                if (v == mkobj || v == e.mkid) n = AppendF(line, sizeof line, n, " comp%u+%X=%s", k, o, v == mkobj ? "obj" : "id");
             }
         }
         line[n] = 0;

@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Lab.h"
 #include "../debug/Logger.h"
@@ -362,7 +363,7 @@ void __fastcall HkHeapFree(void* self, void* /*edx*/, void* ptr, void* region) {
                     for (int d = 0; d < 8; ++d) {
                         uint32_t up = 0;
                         if (!CrashLog::SafeRead32(fp, &up) || up <= fp || !CrashLog::SafeRead32(up + 4, &ret)) break;
-                        k += snprintf(chain + k, sizeof chain - k, " %08X", ret);
+                        k = AppendF(chain, sizeof chain, k, " %08X", ret);
                         fp = up;
                     }
                     chain[k] = 0;
@@ -775,7 +776,7 @@ int OnLoad(uint32_t S, const std::vector<std::pair<uintptr_t, uint32_t>>* restor
         std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.first > b.first; });
         char line[400];
         int m = 0;
-        for (size_t i = 0; i < top.size() && i < 10; ++i) m += snprintf(line + m, sizeof line - m, " %08X x%u", top[i].second, top[i].first);
+        for (size_t i = 0; i < top.size() && i < 10; ++i) m = AppendF(line, sizeof line, m, " %08X x%u", top[i].second, top[i].first);
         line[m] = 0;
         Logger::Info("ALLOCLEAK:   non-MK un-free callers:%s", line);
     }

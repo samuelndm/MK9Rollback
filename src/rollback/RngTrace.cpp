@@ -8,6 +8,7 @@
 #include <map>
 #include <vector>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Lab.h"
 #include "../debug/Logger.h"
@@ -179,7 +180,9 @@ void NoteOnlineNative(uint32_t fn, uint32_t exec) {
         else hi = mid;
     }
     if (lo == kOnlineNativeCount || kOnlineNatives[lo].fn != fn) return;
-    const bool replay = gNatCur == &gNatResim;
+    // A call made by a rollback's replay. (gNatCur told that only under 'lab 1': players' games counted replayed calls
+    // as new ones, and said "live" for all of them.)
+    const bool replay = Rollback::gIsResimulating;
     if (kOnlineNatives[lo].id == 1182 && !replay) Online::OnLoadedNative();
     if (!replay && FlowNative(kOnlineNatives[lo].id)) {
         const uint32_t n = ++gFlowCalls[lo];
@@ -197,7 +200,7 @@ void NoteOnlineNative(uint32_t fn, uint32_t exec) {
     if (start) ++startCalls;
     gOnlineSeen[lo] = true;
     Logger::Info("ONLINENATIVE %s: id %u native %08X at gf %u (%s, %s) exec %08X", start ? "call" : "first call", kOnlineNatives[lo].id, fn,
-                 (uint32_t)gCurGf, gNatCur == &gNatResim ? "replay" : "live", Rollback::GgpoActive() ? "in a GGPO session" : "no session", exec);
+                 (uint32_t)gCurGf, replay ? "replay" : "live", Rollback::GgpoActive() ? "in a GGPO session" : "no session", exec);
 }
 }
 extern "C" {
@@ -576,13 +579,13 @@ void RqDescribe(uint32_t helper, char* out, size_t cap) {
         ++shown;
         const char* thr = w.tid == ObjectHooks::gGameThread ? "game" : "OTHER";
         if (w.kind == kRqGate)
-            k += snprintf(out + k, cap - k, " [gf %u %s gate obj %08X read +C %u]", w.gf, w.resim ? "replay" : "live", w.x, w.before);
+            k = AppendF(out, cap, k, " [gf %u %s gate obj %08X read +C %u]", w.gf, w.resim ? "replay" : "live", w.x, w.before);
         else if (w.kind == kRqIssue)
-            k += snprintf(out + k, cap - k, " [gf %u %s %s issue@%06X %s +C %u>%u +4/+8 %u%u>%u%u]", w.gf, w.resim ? "replay" : "live", thr,
+            k = AppendF(out, cap, k, " [gf %u %s %s issue@%06X %s +C %u>%u +4/+8 %u%u>%u%u]", w.gf, w.resim ? "replay" : "live", thr,
                           w.ret - 5, (w.x & 1) && !(w.x & 2) ? "busy" : ((w.x & 4) && !(w.x & 8) ? "async" : "sync"), w.before, w.after,
                           w.x & 1, (w.x >> 1) & 1, (w.x >> 2) & 1, (w.x >> 3) & 1);
         else
-            k += snprintf(out + k, cap - k, " [gf %u %s %s tid %u %s %u +C %u>%u by %08X]", w.gf, w.resim ? "replay" : "live", thr, w.tid,
+            k = AppendF(out, cap, k, " [gf %u %s %s tid %u %s %u +C %u>%u by %08X]", w.gf, w.resim ? "replay" : "live", thr, w.tid,
                           w.kind == kRqRay ? "ray" : "bool", w.result, w.before, w.after, w.ret);
     }
     ReleaseSRWLockShared(&gRqLock);
@@ -764,7 +767,7 @@ void DumpIdle() {
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     char line[600];
     int n = 0;
-    for (size_t i = 0; i < v.size() && i < 24 && n < 560; ++i) n += snprintf(line + n, sizeof line - n, " %08X:%u", v[i].first, v[i].second);
+    for (size_t i = 0; i < v.size() && i < 24 && n < 560; ++i) n = AppendF(line, sizeof line, n, " %08X:%u", v[i].first, v[i].second);
     Logger::Info("RNGLOG draws since the last fight (caller:count):%s", n ? line : " none");
     gIdleCallers.clear();
 }
@@ -849,14 +852,14 @@ bool EndResimFrame(uint32_t gf, int k) {
             Logger::Info("RNGTRACE k=%d gf=%u: draw #%u differs: original %u draws (caller %08X), resim %u draws (caller %08X)",
                          k, gf, (unsigned)i, (unsigned)s.callers.size(), i < s.callers.size() ? s.callers[i] : 0,
                          (unsigned)gResim.size(), i < gResim.size() ? gResim[i] : 0);
-            char line[256];
+            char line[256] = "";
             int ln = 0;
             for (size_t j = i > 3 ? i - 3 : 0; j < i + 6 && j < s.callers.size(); ++j)
-                ln += snprintf(line + ln, sizeof line - ln, " %08X", s.callers[j]);
+                ln = AppendF(line, sizeof line, ln, " %08X", s.callers[j]);
             Logger::Info("RNGTRACE   original around:%s", line);
             ln = 0;
             for (size_t j = i > 3 ? i - 3 : 0; j < i + 6 && j < gResim.size(); ++j)
-                ln += snprintf(line + ln, sizeof line - ln, " %08X", gResim[j]);
+                ln = AppendF(line, sizeof line, ln, " %08X", gResim[j]);
             Logger::Info("RNGTRACE   resim around:   %s", line);
             const std::vector<uint32_t>& oe = gOrigExec[gf % kSlots];
             const uint32_t eo = i < oe.size() ? oe[i] : 0, er = i < gResimExec.size() ? gResimExec[i] : 0;
@@ -1036,7 +1039,7 @@ void LogOtherThreads(const char* tag) {
     int k = 0;
     for (LONG i = n > 16 ? n - 16 : 0; i < n && k < 600; ++i) {
         const OffDraw& d = gOffDraw[i & 63];
-        k += snprintf(line + k, sizeof line - k, " %08X(t%u gf%u)", d.caller, d.tid, d.gf);
+        k = AppendF(line, sizeof line, k, " %08X(t%u gf%u)", d.caller, d.tid, d.gf);
     }
     line[k] = 0;
     Logger::Info("%s: %ld RNG A draw(s) off the game thread so far; last:%s", tag, (long)n, k ? line : " none");
@@ -1053,7 +1056,7 @@ void LogFrameDraws(uint32_t gf, const char* tag) {
     char line[700];
     int n = 0;
     for (size_t i = 0; i < s.callers.size() && i < 24 && n < 660; ++i)
-        n += snprintf(line + n, sizeof line - n, " %08X(%08X)", s.callers[i], i < ex.size() ? ex[i] : 0);
+        n = AppendF(line, sizeof line, n, " %08X(%08X)", s.callers[i], i < ex.size() ? ex[i] : 0);
     line[n] = 0;
     Logger::Info("%s gf=%u: %u RNG A draws, caller(executor):%s", tag, gf, (unsigned)s.callers.size(), line);
 }

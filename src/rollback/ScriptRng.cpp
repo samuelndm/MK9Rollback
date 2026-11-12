@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "../common/StrAppend.h"
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
 
@@ -290,7 +291,7 @@ void LogStages() {
             const char* e = *reinterpret_cast<const char* const*>(0x00DEF5E8 + 4 * x);
             if (e && !IsBadReadPtr(e, 4) && !_stricmp(e, name)) excluded = true;
         }
-        k += snprintf(line + k, sizeof line - k, " %u=%s%s%s", i, name ? name : "?", flag ? "" : "(off)", excluded ? "(x)" : "");
+        k = AppendF(line, sizeof line, k, " %u=%s%s%s", i, name ? name : "?", flag ? "" : "(off)", excluded ? "(x)" : "");
     }
     Logger::Info("%s", line);
 }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../common/StrAppend.h"
 #include "../hook/CodePatch.h"
 #include "../hook/ObjectHooks.h"
 #include "../rollback/FramePace.h"
@@ -171,22 +172,22 @@ void Format(const Overlay::Stats& s, int level, char* a, char* b, size_t n, DWOR
         const int rtt = s.rttMs >= 0 ? s.rttMs : s.ping;
         int k = snprintf(a, n, "%s", lock ? "LOCKSTEP" : "ROLLBACK");
         if (level >= 2) {
-            if (s.rttMs >= 0 && k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  rtt %d ms", s.rttMs);
-            if (s.ping >= 0 && k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  ping %d ms", s.ping);
-            if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  delay %d", s.delay);
+            if (s.rttMs >= 0 && k > 0 && (size_t)k < n) k = AppendF(a, n, k, "  rtt %d ms", s.rttMs);
+            if (s.ping >= 0 && k > 0 && (size_t)k < n) k = AppendF(a, n, k, "  ping %d ms", s.ping);
+            if (k > 0 && (size_t)k < n) k = AppendF(a, n, k, "  delay %d", s.delay);
             if (!lock && k > 0 && (size_t)k < n)
-                k += snprintf(a + k, n - k, "  rolled back: last %u, max %u (1 s), %u/s", s.lastDepth, s.maxDepth, s.loadsPerSec);
-            if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  behind %d", s.behindLocal);
+                k = AppendF(a, n, k, "  rolled back: last %u, max %u (1 s), %u/s", s.lastDepth, s.maxDepth, s.loadsPerSec);
+            if (k > 0 && (size_t)k < n) k = AppendF(a, n, k, "  behind %d", s.behindLocal);
             if (k > 0 && (size_t)k < n)
                 snprintf(a + k, n - k, "  | %d loads, %d replayed, %d kbps, queue %d, waits %d", s.loads, s.replayed, s.kbps, s.sendQueue,
                          s.barrierWaits);
         } else {
-            if (rtt >= 0 && k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  %d ms", rtt);
-            if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "  delay %d", s.delay);
+            if (rtt >= 0 && k > 0 && (size_t)k < n) k = AppendF(a, n, k, "  %d ms", rtt);
+            if (k > 0 && (size_t)k < n) k = AppendF(a, n, k, "  delay %d", s.delay);
         }
         // Wi-Fi is the first thing to fix in an uneven match (other fighting games show it per player for that reason).
         static const char* const kWifi[4] = {"", "  Wi-Fi: you", "  Wi-Fi: opponent", "  Wi-Fi: both"};
-        if (k > 0 && (size_t)k < n) k += snprintf(a + k, n - k, "%s", kWifi[s.wifi & 3]);
+        if (k > 0 && (size_t)k < n) k = AppendF(a, n, k, "%s", kWifi[s.wifi & 3]);
         if (level >= 2 && s.relayed && k > 0 && (size_t)k < n) snprintf(a + k, n - k, "  (Steam relay)");
         *bars = 3 - Quality(s);
         if (s.mismatched > 0) snprintf(b, n, "  DESYNC (%d frames)", s.mismatched);

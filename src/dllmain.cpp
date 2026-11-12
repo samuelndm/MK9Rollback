@@ -21,6 +21,7 @@
 #include "rollback/FreeQuarantine.h"
 #include "rollback/ParallelMem.h"
 #include "rollback/RenderTag.h"
+#include "rollback/Rumble.h"
 #include "rollback/Snapshot.h"
 
 namespace {
@@ -82,6 +83,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     InterlockedExchange(&gUnloading, 1);
     Overlay::Disable();  // the stub passes through until CodePatch::RestoreAll removes it
     RenderTag::Disable();  // frames queued from here on carry the game's own render command again
+    Rumble::Uninstall();   // the game's XInputSetState pointer is its own again (a call in flight leaves during the waits below)
     if (InterlockedExchange(&gHooksInstalled, 0)) {
         GameLoopHook::Uninstall();
         for (int i = 0; i < 200 && GameLoopHook::InFlight() != 0; ++i) Sleep(10);

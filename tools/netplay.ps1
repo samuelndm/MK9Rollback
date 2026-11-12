@@ -10,11 +10,12 @@
 param([Parameter(Mandatory = $true)][string]$Peer, [ValidateSet(1, 2)][int]$Player = 1, [int]$Delay = 0,
       [switch]$Lockstep, [int]$Port = 7000)
 $ErrorActionPreference = 'Continue'
-$dir = Resolve-Path "$PSScriptRoot\..\build\clang"
+# Every path is taken literally (-LiteralPath): a folder name with [ or ] would be read as a wildcard and match nothing.
+$dir = (Resolve-Path -LiteralPath "$PSScriptRoot\..\build\clang").Path
 $log = "$dir\MK9Rollback.log"
 function Cmd([string[]]$lines) {
-    Set-Content -Encoding ascii "$dir\cmd.tmp" $lines
-    Move-Item "$dir\cmd.tmp" "$dir\MK9Rollback_cmd.txt" -Force
+    Set-Content -Encoding ascii -LiteralPath "$dir\cmd.tmp" -Value $lines
+    Move-Item -LiteralPath "$dir\cmd.tmp" -Destination "$dir\MK9Rollback_cmd.txt" -Force
 }
 
 $steam = $Peer -match '^\d{17}$'
@@ -25,23 +26,23 @@ if (-not (Get-Process MKKE -ErrorAction SilentlyContinue)) {
     & "$PSScriptRoot\launch_game.ps1" | Where-Object { $_ -is [string] } | Select-Object -Last 1
     Start-Sleep 15
 }
-$injected = (Test-Path $log) -and ((Get-Item $log).LastWriteTime -gt (Get-Process MKKE).StartTime)
+$injected = (Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).LastWriteTime -gt (Get-Process MKKE).StartTime)
 if (-not $injected) {
-    Remove-Item "$dir\MK9Rollback*.log" -ErrorAction SilentlyContinue
-    for ($try = 1; $try -le 6 -and -not (Test-Path $log); $try++) {
+    Get-ChildItem -LiteralPath $dir -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    for ($try = 1; $try -le 6 -and -not (Test-Path -LiteralPath $log); $try++) {
         & "$dir\MK9RollbackInjector.exe" inject | Select-Object -Last 1
-        for ($w = 0; $w -lt 10 -and -not (Test-Path $log); $w++) { Start-Sleep 1 }
+        for ($w = 0; $w -lt 10 -and -not (Test-Path -LiteralPath $log); $w++) { Start-Sleep 1 }
     }
-    if (-not (Test-Path $log)) { 'Injection failed (see the injector output above).'; return }
+    if (-not (Test-Path -LiteralPath $log)) { 'Injection failed (see the injector output above).'; return }
 }
-$start = @(Get-Content $log).Count
+$start = @(Get-Content -LiteralPath $log).Count
 $lines = @($(if ($Lockstep) { 'netcode safe' } else { 'netcode rollback' }))
 $lines += if ($steam) { "ggpo steamnetplay $Peer $Player $Delay" } else { "ggpo netplay $Port $Peer $Port $Player $Delay" }
 Cmd $lines
 "Armed as player $Player against $Peer ($(if ($steam) { 'Steam' } else { 'UDP' }), delay $Delay$(if ($Lockstep) { ', lockstep' })). Pick the same Versus fight on both PCs."
 $pattern = 'NETPLAY|GGPO (running|connected|synchronized|disconnected|p2p stopped)|STEAM bridge|CRASH|HANG|ENVIRONMENT|refus'
 while (Get-Process MKKE -ErrorAction SilentlyContinue) {
-    $all = @(Get-Content $log)
+    $all = @(Get-Content -LiteralPath $log)
     if ($all.Count -gt $start) {
         $all[$start..($all.Count - 1)] | Select-String -Pattern $pattern | Where-Object { $_.Line -notmatch 'NETPLAY STATE' } |
             ForEach-Object { $_.Line }

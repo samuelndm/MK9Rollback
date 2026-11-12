@@ -5,6 +5,7 @@
 
 #include <cstring>
 
+#include "../common/StrAppend.h"
 #include "../common/MemQuery.h"
 #include "../debug/Logger.h"
 #include "../game/MK9Game.h"
@@ -464,7 +465,7 @@ void VtableKeepReport(const char* name, uintptr_t base, uint32_t size) {
         ++total;
         float f;
         memcpy(&f, &v, 4);
-        if (shown++ < 8) n += snprintf(line + n, sizeof line - n, " +%X=%08X(%g vt %08X)", o, v, f, first);
+        if (shown++ < 8) n = AppendF(line, sizeof line, n, " +%X=%08X(%g vt %08X)", o, v, f, first);
     }
     line[n] = 0;
     if (total) {
@@ -960,7 +961,11 @@ void BuildTierE(uint32_t gf) {
         comps[i] = obj ? Read32(obj + 0x10C) : 0;
     }
     const bool sameFight = comps[0] == gTierEComps[0] && comps[1] == gTierEComps[1];
-    if (gTierEBuiltGf != 0xFFFFFFFF && sameFight && gf - gTierEBuiltGf < 600)
+    // Signed: a replay saves frames from before the build (up to the ring's depth back). As an unsigned difference that
+    // was a huge age, and the whole scan ran again inside the replay, the longest frames a session has. A frame far
+    // below the build is a new timeline (gf starts over) and still rebuilds.
+    const int32_t age = (int32_t)(gf - gTierEBuiltGf);
+    if (gTierEBuiltGf != 0xFFFFFFFF && sameFight && age > -64 && age < 600)
         return;
     FramePace::Note("tiere");
     gTierE.clear();
@@ -1032,16 +1037,16 @@ void BuildTierE(uint32_t gf) {
         const uint32_t root = Read32(comp + 0x75C);
         if (root && Writable(root, 0x40)) {
             Ue3Names::NameOf(Read32(root + 0x30), cls, sizeof cls);
-            on += snprintf(out + on, sizeof out - on, "root %08X %s uobj=%d outer=%08X;", root, cls, LiveUObject(root), Read32(root + 0x24));
+            on = AppendF(out, sizeof out, on, "root %08X %s uobj=%d outer=%08X;", root, cls, LiveUObject(root), Read32(root + 0x24));
         }
         const uint32_t arr = Read32(comp + 0x290);
         const int32_t cnt = (int32_t)Read32(comp + 0x294);
-        on += snprintf(out + on, sizeof out - on, " table %d:", cnt);
+        on = AppendF(out, sizeof out, on, " table %d:", cnt);
         for (int32_t k = 0; k < cnt && k < 12 && Writable(arr, cnt * 0xC); ++k) {
             const uint32_t o = Read32(arr + k * 0xC + 8);
             if (!o || !Writable(o, 0x40)) continue;
             Ue3Names::NameOf(Read32(o + 0x30), cls, sizeof cls);
-            on += snprintf(out + on, sizeof out - on, " %s(uobj=%d inE=%d)", cls, LiveUObject(o),
+            on = AppendF(out, sizeof out, on, " %s(uobj=%d inE=%d)", cls, LiveUObject(o),
                            std::find(gTierE.begin(), gTierE.end(), o) != gTierE.end());
         }
         Logger::Info("TIERE comp%d %08X: %s", i, comp, out);
@@ -1120,14 +1125,14 @@ void CineWatch(uint32_t gf, const uint32_t actors[2]) {
         }
         t.seenGf = gf;
         if (size <= 0x3C) continue;
-        char changed[200];
+        char changed[200] = "";
         int k = 0, nchg = 0;
         for (uint32_t c64 = 0; c64 < 64 && 0x3C + c64 * 64 < size; ++c64) {
             const uint32_t off = 0x3C + c64 * 64, len = size - off < 64 ? size - off : 64;
             const uint32_t h = ChunkHash(o + off, len);
             if (!born && h != t.chunk[c64]) {
                 ++nchg;
-                if (k < (int)sizeof changed - 12) k += snprintf(changed + k, sizeof changed - k, " +%X", off);
+                if (k < (int)sizeof changed - 12) k = AppendF(changed, sizeof changed, k, " +%X", off);
             }
             t.chunk[c64] = h;
         }
@@ -2502,7 +2507,7 @@ bool WatchBin(uint32_t bin, uint32_t gf) {
             fired = true;
             char line[200];
             int n = 0;
-            for (int i = 0; i < 12; ++i) n += snprintf(line + n, sizeof line - n, " %08X", Read32(prev + 4 * i));
+            for (int i = 0; i < 12; ++i) n = AppendF(line, sizeof line, n, " %08X", Read32(prev + 4 * i));
             Logger::Info("BINWATCH gf=%08X bin %u: free block %08X (depth %d) has garbage link %08X; contents:%s", gf, bin,
                          (unsigned)prev, d - 1, (unsigned)node, line);
             uint32_t fg = 0, rg = 0, caller = 0;
@@ -2922,7 +2927,15 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
         }
         const SpanNameFlags& nf = acc.f;
         SpanTimer spanTimer{acc, qpc()};
-        if (!Writable(s.base, s.size)) continue;
+        if (!Writable(s.base, s.size)) {
+            // A span that cannot be written back is state this load does not rewind: said in the log (it was skipped in
+            // silence until rc30, so a desync from it had no trace), the first 20 and then every 256th.
+            static uint32_t unwritable = 0;
+            if (++unwritable <= 20 || !(unwritable & 0xFF))
+                Logger::Info("LOADAB skip %s %08X+%X: no longer writable (unmapped or protected since the save), %u so far", s.name,
+                             (unsigned)s.base, s.size, unwritable);
+            continue;
+        }
         uint32_t padHw[kHwPadSlots];
         const bool padHwKeep = gPadHwLive && s.size >= kHwPadSlots * kPadObjSize && nf.hwpads;
         if (padHwKeep)
@@ -3621,7 +3634,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
                     char line[400];
                     int ln = 0;
                     for (uint32_t w = 0; w < 0x248 / 4 && ln < 360; ++w)
-                        if (sHist[w]) ln += snprintf(line + ln, sizeof line - ln, " +%X:%u", w * 4, sHist[w]);
+                        if (sHist[w]) ln = AppendF(line, sizeof line, ln, " +%X:%u", w * 4, sHist[w]);
                     Logger::Info("MOVEREQ: %u entry restores, %u differed; offsets:%s", sLoads, sDiffEntries, ln ? line : " none");
                 }
             }
@@ -3695,7 +3708,7 @@ int LoadAB(const StateAB& st, bool force, char* why, size_t whyLen) {
         char line[700];
         int k = snprintf(line, sizeof line, "LOADAB PROFILE (ms/load, 100 loads): setup %.2f tail %.2f; spans:", ms(sSetupT), ms(sTailT));
         for (size_t j = 0; j < top.size() && j < 10 && k < (int)sizeof line - 60; ++j)
-            k += snprintf(line + k, sizeof line - k, " %s %.2f (%u/load)", top[j].second.first, ms(top[j].first),
+            k = AppendF(line, sizeof line, k, " %s %.2f (%u/load)", top[j].second.first, ms(top[j].first),
                           top[j].second.second / (uint32_t)sProfLoads);
         Logger::Info("%s", line);
         // rc25: setup in parts, and the diff-first merge (per load: spans merged by diff, those with no differing dword, the

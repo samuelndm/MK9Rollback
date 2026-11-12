@@ -1,8 +1,8 @@
 #include "FpuGuard.h"
 #include <windows.h>
-#include <tlhelp32.h>
 #include <cstring>
 #include <set>
+#include "../common/ThreadWalk.h"
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
 
@@ -36,18 +36,10 @@ bool gPinInSessions = false;
 int PinAllThreads() {
     PinGameThread();
     CodePatch::LockSuspenders();  // not while another thread of ours suspends the others (both would stay suspended)
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) {
-        CodePatch::UnlockSuspenders();
-        return -1;
-    }
     int fixed = 0;
-    THREADENTRY32 te{};
-    te.dwSize = sizeof te;
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
-        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-        if (!t) continue;
+    // Each thread is suspended, inspected and resumed on its own, so a walk that stops half way leaves nothing to undo:
+    // the second call takes the other route over all threads (ThreadWalk.h), and a thread seen twice is harmless.
+    const auto one = [&](HANDLE t, DWORD id) {
         // Only threads the game started (start address in MKKE.exe: its task pool runs anim jobs) are pinned. Others
         // (audio, Steam, drivers) keep their own environment: two of them run with x87 0x037F and reset it themselves
         // (fpu_1 2026-10-18), and changing it under their code could perturb them; they are reported once.
@@ -56,10 +48,7 @@ int PinAllThreads() {
         const bool gameThread = start >= gImageLo && start < gImageHi;
         // Inspected already: do not suspend it again (audio, driver and Steam threads were suspended every 10 s, the
         // render thread's driver work included).
-        if (!gameThread && !gForeignSeen.insert(te.th32ThreadID).second) {
-            CloseHandle(t);
-            continue;
-        }
+        if (!gameThread && !gForeignSeen.insert(id).second) return false;
         // Nothing that can take a lock (logging, allocation) runs while the thread is suspended: it may hold that lock.
         bool changed = false, foreignOdd = false;
         uint16_t was = 0;
@@ -90,12 +79,13 @@ int PinAllThreads() {
             }
             ResumeThread(t);
         }
-        CloseHandle(t);
-        if (changed && fixed++ < 8) Logger::Info("FPUGUARD game thread %lu (start %08X): x87cw %04X mxcsr %08X -> canonical", te.th32ThreadID, (unsigned)start, was, wasCsr);
-        if (foreignOdd && gReported.insert(te.th32ThreadID).second && gReported.size() < 16)
-            Logger::Info("FPUGUARD thread %lu (start %08X, not the game's): x87cw %04X mxcsr %08X, left as is", te.th32ThreadID, (unsigned)start, was, wasCsr);
-    }
-    CloseHandle(snap);
+        if (changed && fixed++ < 8) Logger::Info("FPUGUARD game thread %lu (start %08X): x87cw %04X mxcsr %08X -> canonical", id, (unsigned)start, was, wasCsr);
+        if (foreignOdd && gReported.insert(id).second && gReported.size() < 16)
+            Logger::Info("FPUGUARD thread %lu (start %08X, not the game's): x87cw %04X mxcsr %08X, left as is", id, (unsigned)start, was, wasCsr);
+        return false;  // the walk closes the handle
+    };
+    const ACCESS_MASK access = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION;
+    if (!ThreadWalk::Others(access, one)) ThreadWalk::Others(access, one);
     CodePatch::UnlockSuspenders();
     return fixed;
 }

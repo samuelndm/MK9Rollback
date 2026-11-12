@@ -19,6 +19,11 @@ $kUpdateAgent = 'MK9Rollback-updater'
 $kReleaseFiles = @('^tools\\[^\\]+\.ps1$', '^build\\clang\\MK9Rollback\.dll$', '^build\\clang\\MK9RollbackInjector\.exe$',
     '^docs\\[^\\]+\.md$', '^version\.txt$', '^README\.txt$', '^Play Online\.bat$')
 $kReleaseDirs = @('tools\', 'docs\', 'build\', 'build\clang\')
+# The files a release holds today, by name (tools\package.ps1 refuses to pack a file that is not listed here): the
+# ones the Play Online window unblocks when it opens (Unblock-PackageFiles).
+$kPackageFiles = @('Play Online.bat', 'README.txt', 'version.txt', 'build\clang\MK9Rollback.dll', 'build\clang\MK9RollbackInjector.exe',
+    'tools\netplay.ps1', 'tools\netplay_gui.ps1', 'tools\launcher_lib.ps1', 'tools\updater.ps1', 'tools\launch_game.ps1',
+    'docs\netplay_lan_test.md')
 
 function Get-InstalledVersion([string]$root) {
     $f = Join-Path $root 'version.txt'
@@ -78,6 +83,19 @@ function Get-ReleaseEntryPath([string]$name) {
     if ($rel.EndsWith('\')) { if ($kReleaseDirs -contains $rel) { return '' } else { return $null } }
     foreach ($p in $kReleaseFiles) { if ($rel -match $p) { return $rel } }
     $null
+}
+
+# Removes the internet zone mark from the release's files in $root (files extracted from a downloaded zip carry it; the
+# injector and the DLL would then be blocked) and from nothing else: the zip has no top folder, so $root can be the
+# player's Downloads or Desktop folder, where every other download must keep its mark. $rels: relative paths; one that
+# a release must not hold (Get-ReleaseEntryPath) is skipped.
+function Unblock-PackageFiles([string]$root, [string[]]$rels = $kPackageFiles) {
+    foreach ($rel in $rels) {
+        if (-not $rel -or -not (Get-ReleaseEntryPath $rel)) { continue }
+        $f = Join-Path $root $rel
+        if (-not [System.IO.File]::Exists($f)) { continue }
+        try { Unblock-File -LiteralPath $f -ErrorAction Stop } catch { }
+    }
 }
 
 # The files under $dir as relative paths, built from the names (not by cutting $dir's length off FullName: %TEMP% is
@@ -199,7 +217,7 @@ function Install-UpdateFromZip([string]$zipPath, [string]$shaText, [string]$root
             Rename-Item -LiteralPath $next -NewName 'previous_version'
             & $say "Updated to version $($v.version). The previous files are in previous_version."
         }
-        Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+        Unblock-PackageFiles $root $rels  # the files this zip brought, not every file under $root
         return $true
     } catch {
         & $say "The update failed: $($_.Exception.Message). Nothing was changed."

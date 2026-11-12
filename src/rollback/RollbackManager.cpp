@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../common/StrAppend.h"
 #include "../debug/AllocWatch.h"
 #include "../debug/AnimInputTrace.h"
 #include "../debug/Overlay.h"
@@ -53,6 +54,7 @@
 #include "FreeQuarantine.h"
 #include "Snapshot.h"
 #include "OnlineKeep.h"
+#include "../net/HelloProto.h"
 #include "../net/OnlineMode.h"
 #include "../net/SteamBridge.h"
 
@@ -94,6 +96,11 @@ constexpr uint32_t kActorBytes = 0x28C;  // MKPawn PropertiesSize (Snapshot.cpp 
 constexpr int kRing = 12;  // snapshots kept (max rollback depth kRing-1)
 constexpr int kInputRing = 128;
 constexpr uintptr_t kGameInfoPtr = 0x00DEF4B4;
+
+// The frame n frames before gf, 0 in a timeline's first n frames. The plain subtraction wraps there to about four
+// billion, and a release cutoff of that size let go of every block and actor held for a rollback (SyncTest and local
+// sessions near frame 0; the netplay start renumbers its frames to 100000).
+constexpr uint32_t FramesBack(uint32_t gf, uint32_t n) { return gf > n ? gf - n : 0; }
 
 struct InputFrame {
     uint32_t gf;
@@ -279,6 +286,10 @@ bool gAttachRepair = true;
 bool gScriptRngWanted = true;  // script RandomInt on a private, snapshotted stream ('scriptrng 0|1', ScriptRng.h)
 bool gCrowdRngWanted = true;   // background crowds off the gameplay RNG ('crowdrng 0|1', CrowdRng.h)
 int gQuarantineMargin = 8;     // 'qmargin N': freed blocks stay quarantined N frames beyond the snapshot ring
+// What the frame boundary last switched the free quarantine to. Cleared wherever else the quarantine is switched off
+// (Enable, SetLockstep): the boundary compares against it, and "safe" then "rollback" read in one batch of commands
+// with a session armed left the quarantine off for the whole match while this still said on.
+bool gQuarantineOn = false;
 uint32_t gAttachRepaired = 0;
 bool AttachListRoom(uint32_t base, uint32_t need);
 int RepairAttachBase(uint32_t S) {
@@ -396,17 +407,17 @@ int AttachAudit(const char* when) {
         const uint32_t base = *reinterpret_cast<const uint32_t*>(actor + 0x60);
         auto report = [&](uint32_t key, const char* fmt, uint32_t a, uint32_t b) {
             ++bad;
-            for (int i = 0; i < nSeen; ++i)
+            for (int i = 0; i < nSeen && i < 64; ++i)  // nSeen counts on past the 64 kept (the oldest are replaced)
                 if (seen[i] == key) return;
             seen[nSeen++ & 63] = key;
             char m[200];
-            snprintf(m, sizeof m, fmt, a, b);
+            snprintf(m, sizeof m, fmt, a, b);  // a format may use fewer than both
             Logger::Info("ATTACH %s gf=%u p%d actor=%08X: %s", when, GameFrame(), p, actor, m);
         };
         if (base) {
             bool found = false;
             if (!Live(base)) {
-                report(actor ^ 0x60, "Base %08X is not a live object%s", base, 0);
+                report(actor ^ 0x60, "Base %08X is not a live object", base, 0);
             } else {
                 const uint32_t data = *reinterpret_cast<const uint32_t*>(base + 0x68), n = *reinterpret_cast<const uint32_t*>(base + 0x6C);
                 for (uint32_t i = 0; i < n && i < 64 && Readable(data + i * 0x60, 4); ++i) found |= *reinterpret_cast<const uint32_t*>(data + i * 0x60) == actor;
@@ -414,7 +425,7 @@ int AttachAudit(const char* when) {
             }
         }
         const uint32_t data = *reinterpret_cast<const uint32_t*>(actor + 0x68), n = *reinterpret_cast<const uint32_t*>(actor + 0x6C);
-        if (n && !data) report(actor ^ 0x68, "attached list null data with count %u%s", n, 0);
+        if (n && !data) report(actor ^ 0x68, "attached list null data with count %u", n, 0);
         for (uint32_t i = 0; i < n && i < 64 && Readable(data + i * 0x60, 4); ++i) {
             const uint32_t a = *reinterpret_cast<const uint32_t*>(data + i * 0x60);
             if (!Live(a)) {
@@ -470,7 +481,7 @@ int TaskRegAudit(const char* when) {
             if (live && !deleted) continue;
             ++bad;
             bool dup = false;
-            for (int s = 0; s < nSeen && !dup; ++s) dup = seen[s] == item;
+            for (int s = 0; s < nSeen && s < 64 && !dup; ++s) dup = seen[s] == item;
             if (dup) continue;
             seen[nSeen++ & 63] = item;
             uint32_t freed = 0, released = 0, caller = 0;
@@ -1275,7 +1286,7 @@ void TypeCensus() {
     int n = 0;
     for (auto& [name, c] : types)
         if (c.second || name.find("Shake") != std::string::npos)
-            n += snprintf(line + n, sizeof line - n, " %s:%d(out %d)", name.substr(0, 48).c_str(), c.first, c.second);
+            n = AppendF(line, sizeof line, n, " %s:%d(out %d)", name.substr(0, 48).c_str(), c.first, c.second);
     line[n] = 0;
     Logger::Info("TYPECENSUS gf=%u: %d MK objects in %d types, %d outside the master ranges; shake/outside:%s", GameFrame(), total,
                  (int)types.size(), outside, line);
@@ -1294,7 +1305,7 @@ void TypeCensus() {
     for (auto& [h, c] : headers)
         if (!Snapshot::TierACovers(h, 0x14)) {
             ++uncovered;
-            n += snprintf(line + n, sizeof line - n, " %08X(%d nodes)", h, c);
+            n = AppendF(line, sizeof line, n, " %08X(%d nodes)", h, c);
         }
     line[n] = 0;
     Logger::Info("LISTHEADERS gf=%u: %d static list headers referenced by nodes, %d not fully restored by Tier A:%s", GameFrame(),
@@ -1834,10 +1845,10 @@ bool DoRollback(void* engine, float dt, int k, bool loadOnly = false) {
                     memcpy(&y, reinterpret_cast<const void*>(regs[r].addr + o), 4);
                     if (x == y) continue;
                     ++total;
-                    if (shown++ < 4) pn += snprintf(part + pn, sizeof part - pn, " +%X:%08X>%08X", o, x, y);
+                    if (shown++ < 4) pn = AppendF(part, sizeof part, pn, " +%X:%08X>%08X", o, x, y);
                 }
                 part[pn] = 0;
-                if (total) dn += snprintf(d + dn, sizeof d - dn, " %s(%d):%s", regs[r].name, total, part);
+                if (total) dn = AppendF(d, sizeof d, dn, " %s(%d):%s", regs[r].name, total, part);
             }
             d[dn] = 0;
             const bool same = !memcmp(&gpA, &gpB, sizeof gpA);
@@ -1864,15 +1875,15 @@ bool DoRollback(void* engine, float dt, int k, bool loadOnly = false) {
         int n = snprintf(diff, sizeof diff, "ROLLBACK gameplay MISMATCH k=%d:", k);
         for (int p = 0; p < 2; ++p) {
             if (gpPre.life[p] != gpPost.life[p])
-                n += snprintf(diff + n, sizeof diff - n, " P%d life %.4f->%.4f", p + 1, gpPre.life[p], gpPost.life[p]);
+                n = AppendF(diff, sizeof diff, n, " P%d life %.4f->%.4f", p + 1, gpPre.life[p], gpPost.life[p]);
             if (gpPre.meter[p] != gpPost.meter[p])
-                n += snprintf(diff + n, sizeof diff - n, " P%d meter %.4f->%.4f", p + 1, gpPre.meter[p], gpPost.meter[p]);
+                n = AppendF(diff, sizeof diff, n, " P%d meter %.4f->%.4f", p + 1, gpPre.meter[p], gpPost.meter[p]);
             for (int a = 0; a < 3; ++a)
                 if (gpPre.pos[p][a] != gpPost.pos[p][a])
-                    n += snprintf(diff + n, sizeof diff - n, " P%d pos%c %.3f->%.3f", p + 1, "xyz"[a], gpPre.pos[p][a],
+                    n = AppendF(diff, sizeof diff, n, " P%d pos%c %.3f->%.3f", p + 1, "xyz"[a], gpPre.pos[p][a],
                                   gpPost.pos[p][a]);
         }
-        if (gpPre.rng != gpPost.rng) n += snprintf(diff + n, sizeof diff - n, " rng %08X->%08X", gpPre.rng, gpPost.rng);
+        if (gpPre.rng != gpPost.rng) n = AppendF(diff, sizeof diff, n, " rng %08X->%08X", gpPre.rng, gpPost.rng);
         if (gpPre.gameFrame != gpPost.gameFrame)
             snprintf(diff + n, sizeof diff - n, " gf %u->%u", gpPre.gameFrame, gpPost.gameFrame);
         Logger::Info("%s", diff);
@@ -1887,7 +1898,7 @@ bool DoRollback(void* engine, float dt, int k, bool loadOnly = false) {
                 if (obj < s.base || obj + 0xC580 > s.base + s.size) continue;
                 const uint8_t* before = pre.bytes[i].data() + (obj - s.base);
                 int shown = 0, total = 0;
-                char line[256];
+                char line[256] = "";
                 int ln = 0;
                 for (uint32_t o = 0; o < 0xC580; o += 4) {
                     uint32_t a, b;
@@ -1898,7 +1909,7 @@ bool DoRollback(void* engine, float dt, int k, bool loadOnly = false) {
                     if (ptrA || ptrB) continue;
                     ++total;
                     if (shown < 24) {
-                        ln += snprintf(line + ln, sizeof line - ln, " +%X:%08X>%08X", o, a, b);
+                        ln = AppendF(line, sizeof line, ln, " +%X:%08X>%08X", o, a, b);
                         if (++shown % 6 == 0) {
                             Logger::Info("ROLLBACK diverged P%d char%s", p + 1, line);
                             ln = 0;
@@ -2237,7 +2248,7 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
         // First replayed frame of a check only (gf == loaded + 1): later frames inherit the difference.
         for (int p = 0; p < 2 && gf == gGgpoLoadedS + 1; ++p) {
             if (!chars[p]) continue;
-            char line[400];
+            char line[400] = "";
             int ln = 0, shown = 0, total = 0;
             for (uint32_t o = 0; o < 0xC580; o += 4) {
                 uint32_t a, b;
@@ -2245,14 +2256,14 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
                 memcpy(&b, reinterpret_cast<const void*>(chars[p] + o), 4);
                 if (a == b) continue;
                 ++total;
-                if (shown++ < 14) ln += snprintf(line + ln, sizeof line - ln, " +%X:%08X>%08X", o, a, b);
+                if (shown++ < 14) ln = AppendF(line, sizeof line, ln, " +%X:%08X>%08X", o, a, b);
             }
             if (total) Logger::Info("GGPO DESYNC   char P%d: %d dwords differ:%s", p + 1, total, line);
             if (total && Readable(chars[p] + 0xB40, 4)) Rollback::LogSpansContaining(*reinterpret_cast<const uint32_t*>(chars[p] + 0xB40));  // input history
         }
         for (int p = 0; p < 2; ++p) {
             if (!actors[p]) continue;
-            char line[300];
+            char line[300] = "";
             int ln = 0, shown = 0, total = 0;
             for (uint32_t o = 0; o < kActorBytes; o += 4) {
                 uint32_t a, b;
@@ -2260,7 +2271,7 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
                 memcpy(&b, reinterpret_cast<const void*>(actors[p] + o), 4);
                 if (a == b) continue;
                 ++total;
-                if (shown++ < 10) ln += snprintf(line + ln, sizeof line - ln, " +%X:%08X>%08X", o, a, b);
+                if (shown++ < 10) ln = AppendF(line, sizeof line, ln, " +%X:%08X>%08X", o, a, b);
             }
             if (total) Logger::Info("GGPO DESYNC   actor P%d: %d dwords differ:%s", p + 1, total, line);
             // Attachment records (Base +0x60, list +0x68: {attached actor, rel loc, ..., +0x30 base comp}).
@@ -2275,7 +2286,7 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
                 for (uint32_t i = 0; i < rc && i < 4 && Readable(ra + i * 0x60, 4); ++i) {
                     char d[80];
                     Ue3Names::Describe(*reinterpret_cast<const uint32_t*>(ra + i * 0x60), d, sizeof d);
-                    nn += snprintf(names + nn, sizeof names - nn, " [%s]", d);
+                    nn = AppendF(names, sizeof names, nn, " [%s]", d);
                 }
                 names[nn] = 0;
                 Logger::Info("GGPO DESYNC   actor P%d attached: original count %u, replay count %u:%s", p + 1, lc, rc, names);
@@ -2285,10 +2296,10 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
         char d[400];
         int n = snprintf(d, sizeof d, "GGPO DESYNC gf=%u (loaded %u):", gf, gGgpoLoadedS);
         for (int p = 0; p < 2; ++p) {
-            if (a.life[p] != gp.life[p]) n += snprintf(d + n, sizeof d - n, " P%d life %.4f->%.4f", p + 1, a.life[p], gp.life[p]);
-            if (a.meter[p] != gp.meter[p]) n += snprintf(d + n, sizeof d - n, " P%d meter %.4f->%.4f", p + 1, a.meter[p], gp.meter[p]);
+            if (a.life[p] != gp.life[p]) n = AppendF(d, sizeof d, n, " P%d life %.4f->%.4f", p + 1, a.life[p], gp.life[p]);
+            if (a.meter[p] != gp.meter[p]) n = AppendF(d, sizeof d, n, " P%d meter %.4f->%.4f", p + 1, a.meter[p], gp.meter[p]);
             for (int c = 0; c < 3; ++c)
-                if (a.pos[p][c] != gp.pos[p][c]) n += snprintf(d + n, sizeof d - n, " P%d pos%c %.3f->%.3f", p + 1, "xyz"[c], a.pos[p][c], gp.pos[p][c]);
+                if (a.pos[p][c] != gp.pos[p][c]) n = AppendF(d, sizeof d, n, " P%d pos%c %.3f->%.3f", p + 1, "xyz"[c], a.pos[p][c], gp.pos[p][c]);
         }
         if (a.rng != gp.rng) snprintf(d + n, sizeof d - n, " rng %08X->%08X", a.rng, gp.rng);
         Logger::Info("%s", d);
@@ -2323,6 +2334,7 @@ bool __cdecl GgpoLoadState(unsigned char* buffer, int) {
                      "inputs, nothing is replayed", S, GameFrame());
         return true;
     }
+    if (gGgpoLoadFailed) return false;  // the session is being stopped already (no snapshot, or a replay started the next map)
     CrashLog::TraceFrame(0xFFFFFFFF, false);  // the load's own writes are not a frame's
     Snapshot::StateAB* snap = SlotFor(S);
     char why[200] = {};
@@ -2378,9 +2390,24 @@ bool __cdecl GgpoAdvanceFrame(int) {
     ResimFrame(gGgpoEngine, gGgpoDt, g, (int)(gGgpoLiveF - gGgpoLoadedS), in);
     if (gGgpoIsP2P) TickSpin();
     FramePace::Add(FramePace::kReplayTick, FramePace::Now() - tr);
+    const bool restarted = GameFrame() != g;
     ++HostFrame();
     ++GameFrame();
     ++gGgpoReplayed;
+    if (restarted) {
+        // The replayed frame started the next map (MK9 zeroes GameFrame there): the fight's timeline is over, as when a
+        // live tick does it and the next tick stops the session. The frames GGPO still wants replayed belong to a
+        // timeline that no longer exists: they ran as ticks of the new map under the replay's rules, their saves
+        // could not be loaded, and a second rollback in the same poll ended the session as "a load found no
+        // snapshot", an abnormal stop at an ordinary fight end (2 field logs; the restart was then seen at gf >= 2
+        // in 83 of 2415 session ends). Nothing more is replayed; the session stops at the boundary.
+        Logger::Info("GGPO replay of gf=%u started the next map (gf is now %u): the session stops as at a timeline restart, "
+                     "%d frame(s) left unreplayed", g, GameFrame(), (int)(gGgpoLiveF - g) - 1);
+        gGgpoLoadFailed = true;
+        gGgpoStopWhy = "timeline restart";
+        ggpo_advance_frame(gGgpo);
+        return true;
+    }
     NetplayFrameEvents(GameFrame());  // before the next frame's save, as in the live tick
     ggpo_advance_frame(gGgpo);  // saves the next frame through GgpoSaveState
     return true;
@@ -2615,8 +2642,10 @@ void CsPump(uint32_t liveGf) {
         Logger::Info("NETPLAY checksums so far: %d frames matched the peer, %d did not", gCsMatched, gCsMismatched);
         // Connection quality for the reports of real online sessions: GGPO's view of the remote player.
         GGPONetworkStats ns{};
-        const int remote = 2 - gP2P.player;  // the other index of gGgpoPlayer
-        if (gGgpo && gP2P.player >= 1 && gP2P.player <= 2 && GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns)))
+        // The other index of gGgpoPlayer. The running session's own side (gGgpoLocal, 0 or 1), here and below: gP2P is the
+        // configuration for the next start, and an arm command arriving during a session rewrites it.
+        const int remote = 1 - gGgpoLocal;
+        if (gGgpo && GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns)))
             Logger::Info("NETSTATS ping %d ms, send queue %d, %d kbps sent, frames behind: local %d remote %d; %d loads, %d replayed so far",
                          ns.network.ping, ns.network.send_queue_len, ns.network.kbps_sent, ns.timesync.local_frames_behind,
                          ns.timesync.remote_frames_behind, gGgpoLoads, gGgpoReplayed);
@@ -2639,7 +2668,13 @@ void CsPump(uint32_t liveGf) {
     if (rel == 600 && !gEnvChecked) Logger::Info("NETPLAY environment: no fingerprint from the peer in 600 frames (older DLL?)");
     for (int n = 0; n < 16; ++n) {
         uint32_t in[16];
-        const int got = recvfrom(gCsSock, reinterpret_cast<char*>(in), sizeof in, 0, nullptr, nullptr);
+        sockaddr_in from{};
+        int fromLen = sizeof from;
+        const int got = recvfrom(gCsSock, reinterpret_cast<char*>(in), sizeof in, 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
+        if (got < 0) break;  // nothing waiting
+        // A direct-IP session's socket takes datagrams from the whole network (CsOpen): only the peer's address counts
+        // (its port may be a translated one). Anyone else's "environment differs" or "frame 0 differs" stopped the session.
+        if (from.sin_addr.s_addr != gCsPeer.sin_addr.s_addr) continue;
         if (got == (int)(4 * (1 + EnvFingerprint::kFields)) && in[0] == kEnvMagic) {
             const EnvFingerprint::Print& p = EnvFingerprint::Get();
             if (!gEnvChecked) {
@@ -2940,7 +2975,19 @@ bool GgpoStartP2P(const P2PConfig& c) {
     if (!ScriptClock::Active()) ScriptClock::AnchorCanonical(GameFrame());
     Input::SetLocalCapture(true);
     gGgpoRunning = gSyncValid = gGgpoFrameOpen = gGgpoLoadFailed = gPeerLost = false;
+    // The checksum channel's verdicts too, here and not only in CsOpen: that returns early when its port cannot be
+    // bound, and it never cleared the frame-0 verdict. A verdict left over from the last session stops this one at
+    // its first boundary with the old reason.
+    gEnvChecked = gEnvMismatch = gStartMismatch = gDesyncStop = false;
+    gCsMismatchRun = 0;
     gGgpoLoads = gGgpoReplayed = gGgpoSyncErrors = gGgpoSaveFails = gBarrierWaits = gP2PFrames = 0;
+    // Per session as well: the X-ray lock's log budget (40 lines, spent for good by the first long session of a
+    // launch) and the overlay's ring of recent rollbacks (sessions share the frame numbering, so the last fight's
+    // entries were counted again when this one passed the same frame numbers).
+    gXrayLockLogs = 0;
+    memset(gOvDepthGf, 0, sizeof gOvDepthGf);
+    memset(gOvDepth, 0, sizeof gOvDepth);
+    gOvLastDepth = 0;
     Logger::Info("GGPO p2p started at gf=%u (%s): local port %u, player %d, remote %s:%u, frame delay %d", GameFrame(),
                  gLockstep ? "LOCKSTEP" : "rollback", c.localPort, c.player, c.ip, c.remotePort, delay);
     CsOpen(c.ip, c.localPort, c.remotePort);
@@ -2993,10 +3040,10 @@ double QpcMs(int64_t ticks) {
 }
 void StallHold(double waitedMs) {
     if (!gStallHold || gLockstep || waitedMs < gStallHoldMinMs) return;
-    const int remote = 2 - gP2P.player;
+    const int remote = 1 - gGgpoLocal;
     GGPONetworkStats ns{};
     int ping = 0;
-    if (gP2P.player >= 1 && gP2P.player <= 2 && GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns)))
+    if (GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns)))
         ping = ns.network.ping;
     // rc25: the lowest recent round trip (GGPO's latest sample right after a stall can hold the stall itself).
     if (ggpo_rtt_min_ms >= 0) ping = ggpo_rtt_min_ms;
@@ -3078,7 +3125,7 @@ void XrayLockNote(const uint32_t masks[2], bool replay) {
     if (!gXrayLock || gLockstep || !gGgpoRunning || gXrayCine) return;  // the meter is spent in the cinematic anyway
     for (int p = 0; p < 2; ++p) {
         if (!(masks[p] & 0x4000) || PlayerMeter(p) < 0.995f) continue;
-        if (gXrayLockUntil < gP2PFrames) gXrayLockWhy = p == gP2P.player - 1 ? (replay ? "own press, replayed" : "own press")
+        if (gXrayLockUntil < gP2PFrames) gXrayLockWhy = p == gGgpoLocal ? (replay ? "own press, replayed" : "own press")
                                                                               : (replay ? "peer's press, in a replay" : "peer's press");
         gXrayLockUntil = gP2PFrames + gXrayLockWindow;
     }
@@ -3128,7 +3175,7 @@ void XrayLockPre() {
 // Decided once per boundary, before frame gP2PFrames is synchronized.
 bool XrayLockNow() {
     if (!gXrayLock || gLockstep) return false;
-    const int local = gP2P.player - 1;
+    const int local = gGgpoLocal;
     if (local < 0 || local > 1) return false;
     gXrayLastAdded = gLocalRaw;  // added at this boundary (the held one in the cinematic)
     uint32_t own[2] = {0, 0};
@@ -3215,7 +3262,7 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         if (gP2PFrames == 0 && !gGgpoFrameOpen) gCsStartGf = GameFrame();
         if (!gLocalScripted) gLocalRaw = Input::LocalHardwareMask() & ~0x0F00u;
         XrayLockPre();
-        earlyAdded = GGPO_SUCCEEDED(ggpo_add_local_input(gGgpo, gGgpoPlayer[gP2P.player - 1], &gLocalRaw, sizeof gLocalRaw));
+        earlyAdded = GGPO_SUCCEEDED(ggpo_add_local_input(gGgpo, gGgpoPlayer[gGgpoLocal], &gLocalRaw, sizeof gLocalRaw));
         if (earlyAdded) {
             SteamBridge::Pump();
             ++gEarlyAdds;
@@ -3288,12 +3335,12 @@ void GgpoBoundaryP2P(void* engine, float dt) {
         const bool fresh = gP2PFrames != lastFrame;  // a boundary that advanced no frame samples nothing
         lastFrame = gP2PFrames;
         GGPONetworkStats ns{};
-        const int remote = 2 - gP2P.player;
+        const int remote = 1 - gGgpoLocal;
         if (!fresh) {
         } else if (gTimesyncDebt > 0) {
             settleUntil = gP2PFrames + gBalanceSettle;
             samples = sumDiff = 0;
-        } else if (gP2PFrames >= settleUntil && gP2P.player >= 1 && gP2P.player <= 2 && ggpo_rtt_min_ms >= 0 &&
+        } else if (gP2PFrames >= settleUntil && ggpo_rtt_min_ms >= 0 &&
                    GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns))) {
             sumDiff += ns.timesync.remote_frames_behind - ns.timesync.local_frames_behind;  // 2x frames ahead
             if (++samples >= gBalanceSamples) {
@@ -3370,8 +3417,12 @@ void GgpoBoundaryP2P(void* engine, float dt) {
     const bool earlyDone = earlyAdded;
     const bool paused = !earlyDone && *reinterpret_cast<const uint32_t*>(0x00E43054) != 0;
     if (gGgpoRunning && !paused && gP2PFrames == 0 && !gGgpoFrameOpen) gCsStartGf = GameFrame();
-    if (gGgpoRunning && !paused) {
-        const int local = gP2P.player - 1;
+    // Not for a session this poll has already ended (gGgpoLoadFailed: a load without a snapshot, or a replay that
+    // started the next map): the caller stops it right after this boundary. Adding an input could wait here up to 5 s
+    // for a peer that has closed its own session at the same fight end, and then replaced the reason with "no
+    // synchronized input", an abnormal stop.
+    if (gGgpoRunning && !paused && !gGgpoLoadFailed) {
+        const int local = gGgpoLocal;
         // Wait for the remote input (lockstep) or until GGPO accepts the local one (rollback: too far ahead of the
         // remote). Either way a frame never runs unsynchronized: it would get the pad instead of GGPO's inputs and shift
         // the frame numbering against the peer (two-instance test with a slowed instance, 2026-10-18).
@@ -3479,17 +3530,17 @@ void GgpoBoundaryP2P(void* engine, float dt) {
     SteamBridge::Pump();
     Input::SetDeferSampling(gLateSample && gGgpoRunning);  // the next pass samples at its boundary
     RenderTag::SetStamp(gSyncValid && gGgpoFrameOpen && gP2PFrames >= gGgpoDelay ? sampledAt[(gP2PFrames - gGgpoDelay) & 63] : 0);
-    if (gEnvMismatch) {
-        gEnvMismatch = false;
+    // One verdict stops the session and all of them are cleared with it: a second one raised in the same boundary (a
+    // different environment usually comes with a different frame 0) stayed set and stopped the next session.
+    const bool envMismatch = gEnvMismatch, startMismatch = gStartMismatch, desyncStop = gDesyncStop, peerLost = gPeerLost;
+    gEnvMismatch = gStartMismatch = gDesyncStop = gPeerLost = false;
+    if (envMismatch) {
         GgpoStop("environment mismatch with the peer (see NETPLAY ENVIRONMENT MISMATCH)");
-    } else if (gStartMismatch) {
-        gStartMismatch = false;
+    } else if (startMismatch) {
         GgpoStop("the peers started the fight from different states (frame 0 differs)");
-    } else if (gDesyncStop) {
-        gDesyncStop = false;
+    } else if (desyncStop) {
         GgpoStop("the two games went out of sync");
-    } else if (gPeerLost) {
-        gPeerLost = false;
+    } else if (peerLost) {
         gNetplayArmed = false;  // the next fight would wait for a peer that is gone
         // The other game counts the same differing frames and may reach the limit a few frames earlier: its bye
         // (GgpoStop) then arrives before this game's own stop. Both screens give the same reason.
@@ -4012,13 +4063,13 @@ void PadTrace() {
             ++sDiff;
             static int logs = 0;
             if (logs++ < 40) {
-                char line[300];
+                char line[300] = "";
                 int n = 0;
                 for (uint32_t o = 0; o < 0x60 && n < 260; o += 4) {
                     uint32_t a, b;
                     memcpy(&a, r.b[p] + o, 4);
                     memcpy(&b, now[p] + o, 4);
-                    if (a != b) n += snprintf(line + n, sizeof line - n, " +%X:%08X>%08X", o, a, b);
+                    if (a != b) n = AppendF(line, sizeof line, n, " +%X:%08X>%08X", o, a, b);
                 }
                 Logger::Info("PADTRACE gf=%u P%d pad differs at FightUpdate entry (S=%u):%s", gf, p + 1, gLastLoadS, line);
             }
@@ -4082,7 +4133,7 @@ void BoneHashDump(uint32_t gf) {
     int n = 0;
     for (int p = 0; p < 2; ++p)
         for (int k = 0; k < 6; ++k)
-            if (a.h[p][k] != r.h[p][k]) n += snprintf(line + n, sizeof line - n, " P%d.%s", p + 1, kName[k]);
+            if (a.h[p][k] != r.h[p][k]) n = AppendF(line, sizeof line, n, " P%d.%s", p + 1, kName[k]);
     line[n] = 0;
     Logger::Info("BONEHASH gf=%u at %s: %s", gf, at == 2 ? "FightUpdate exit" : at ? "EngineTick exit" : "FightUpdate entry", n ? line : "identical");
     for (int p = 0; p < 2; ++p) {
@@ -4094,7 +4145,7 @@ void BoneHashDump(uint32_t gf) {
             memcpy(&x, gBoneActor[at][0][gf % 128][p] + o, 4);
             memcpy(&y, gBoneActor[at][1][gf % 128][p] + o, 4);
             if (x == y) continue;
-            if (total++ < 16) dn += snprintf(d + dn, sizeof d - dn, " +%X:%08X>%08X", o, x, y);
+            if (total++ < 16) dn = AppendF(d, sizeof d, dn, " +%X:%08X>%08X", o, x, y);
         }
         d[dn] = 0;
         Logger::Info("BONEHASH   P%d actor %d dwords differ:%s", p + 1, total, d);
@@ -4108,7 +4159,7 @@ void BoneHashDump(uint32_t gf) {
             memcpy(&x, gBoneComp[at][0][gf % 128][p] + o, 4);
             memcpy(&y, gBoneComp[at][1][gf % 128][p] + o, 4);
             if (x == y) continue;
-            if (total++ < 16) dn += snprintf(d + dn, sizeof d - dn, " +%X:%08X>%08X", o, x, y);
+            if (total++ < 16) dn = AppendF(d, sizeof d, dn, " +%X:%08X>%08X", o, x, y);
         }
         d[dn] = 0;
         Logger::Info("BONEHASH   P%d comp %d dwords differ:%s", p + 1, total, d);
@@ -4146,7 +4197,7 @@ void ObjectCensus() {
         for (size_t i = 0; i < d.size() && i < 10 && d[i].first > 0; ++i) {
             char nm[64];
             Ue3Names::NameOf(d[i].second, nm, sizeof nm);
-            n += snprintf(line + n, sizeof line - n, " %s+%d(%u)", nm, d[i].first, cur[d[i].second]);
+            n = AppendF(line, sizeof line, n, " %s+%d(%u)", nm, d[i].first, cur[d[i].second]);
         }
         line[n] = 0;
         Logger::Info("CENSUS: %u live UObjects (array %u); grew:%s", live, cnt, line);
@@ -4213,7 +4264,7 @@ void RegionDiff() {
         char line[300];
         int n = 0;
         for (size_t i = 0; i < sizes.size() && i < 6; ++i)
-            n += snprintf(line + n, sizeof line - n, " %uKBx%u", sizes[i].first >> 10, sizes[i].second);
+            n = AppendF(line, sizeof line, n, " %uKBx%u", sizes[i].first >> 10, sizes[i].second);
         line[n] = 0;
         if (n) Logger::Info("REGIONS   new by size:%s", line);
     }
@@ -4353,6 +4404,11 @@ void Enable(bool on) {
         on = false;
     }
     if (on) Input::InstallSamplerHook();
+    // In Safe mode too (outside 'lab 1' this is the script native dispatch hook alone): the online mode learns from
+    // native 1182 that this game has loaded the fight and holds the wait for the other player's load to 60 ticks per
+    // second (Online::OnLoadedNative). It was part of the rollback patch set only, so a Safe-mode game still gave up
+    // on a slower PC a few seconds after its own load, and its log had no ONLINEFLOW lines at all.
+    if (on) RngTrace::Install();
     if (on) CommandChannel::InstallPauseGuard();
     if (on && ScriptClock::Install()) ScriptClock::Anchor(GameFrame());
     ScriptClock::SetActive(on && VirtualClockOutsideSessions());
@@ -4361,7 +4417,10 @@ void Enable(bool on) {
     if (on) CrowdRng::Install();
     CrowdRng::SetActive(on && gCrowdRngWanted);
     gEnabled = on;
-    if (!on) FreeQuarantine::SetActive(false);  // on: per frame at the boundary, only while a session is armed or running
+    if (!on) {  // on: per frame at the boundary, only while a session is armed or running
+        FreeQuarantine::SetActive(false);
+        gQuarantineOn = false;
+    }
     ActorDefer::SetActive(on && !gLockstep);
     CinemaRestore::SetActive(on && !gLockstep);
     if (!on) {
@@ -4398,8 +4457,9 @@ void SetLockstep(bool on) {
     gLockstepDeferred = false;
     gLockstep = on;
     // Nothing is ever restored in lockstep: frees go straight through and deaths are immediate.
-    if (on) FreeQuarantine::SetActive(false);  // off -> back on at the boundary once a session is armed
-    if (on) {
+    if (on) {  // off -> back on at the boundary once a session is armed
+        FreeQuarantine::SetActive(false);
+        gQuarantineOn = false;
         FreeQuarantine::ReleaseAll();
         ActorDefer::ReleaseAll();
         CinemaRestore::ReleaseAll();
@@ -4462,11 +4522,11 @@ void LogEventListeners(const char* tag) {
         const uint32_t obj = *reinterpret_cast<const uint32_t*>(node + 4);
         const uint32_t flag = *reinterpret_cast<const uint32_t*>(node + 0x18);
         if (!obj || obj == 0xDEADBEEF || !Readable(obj, 0x14)) {
-            if (n < 840) n += snprintf(line + n, sizeof line - n, " [dead]");
+            if (n < 840) n = AppendF(line, sizeof line, n, " [dead]");
             continue;
         }
         const uint32_t ev = *reinterpret_cast<const uint32_t*>(obj + 0x10), fn = *reinterpret_cast<const uint32_t*>(obj + 0xC);
-        if (n < 840) n += snprintf(line + n, sizeof line - n, " [ev %X fn %u%s %.24s]", ev, fn, flag ? " off" : "", ObjectHooks::TypeOf(obj));
+        if (n < 840) n = AppendF(line, sizeof line, n, " [ev %X fn %u%s %.24s]", ev, fn, flag ? " off" : "", ObjectHooks::TypeOf(obj));
     }
     line[n] = 0;
     Logger::Info("LISTENERS %s gf=%u: %d:%s", tag, GameFrame(), count, line);
@@ -4528,8 +4588,8 @@ void PublishOverlay() {
         s.mode = !gGgpoRunning ? Overlay::kWaiting : gLockstep ? Overlay::kLockstep : Overlay::kRollback;
         if (gGgpoRunning && ticks % 30 == 0) {
             GGPONetworkStats ns{};
-            const int remote = 2 - gP2P.player;
-            if (gP2P.player >= 1 && gP2P.player <= 2 && GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns))) {
+            const int remote = 1 - gGgpoLocal;
+            if (GGPO_SUCCEEDED(ggpo_get_network_stats(gGgpo, gGgpoPlayer[remote], &ns))) {
                 gOvPing = ns.network.ping;
                 gOvBehindL = ns.timesync.local_frames_behind;
                 gOvBehindR = ns.timesync.remote_frames_behind;
@@ -4953,7 +5013,7 @@ bool OnTickEntry(void* engine, float dt) {
         {  // MK heaps [0xED53F0..0xED5400]: used +0x28 / reserved +0x24 (2026-10-29: #5 ran full in the menus)
             // with the base (+0x34) and whether the block range lies inside the master's region (frees of blocks
             // outside it are deferred by the GMalloc hooks: suspected menu freeze cause)
-            char hs[320];
+            char hs[320] = "";
             int k = 0;
             uint32_t mBase = 0, mRes = 0, m = 0;
             CrashLog::SafeRead32(0x00ED53F0, &m);
@@ -4971,7 +5031,7 @@ bool OnTickEntry(void* engine, float dt) {
                 }
                 const bool inMaster = h == 0 || (base >= mBase && base + res <= mBase + mRes);
                 if (k < (int)sizeof hs)
-                    k += snprintf(hs + k, sizeof hs - k, " #%d %u/%u KB @%08X%s", h + 1, used >> 10, res >> 10, base, inMaster ? "" : " OUTSIDE-MASTER");
+                    k = AppendF(hs, sizeof hs, k, " #%d %u/%u KB @%08X%s", h + 1, used >> 10, res >> 10, base, inMaster ? "" : " OUTSIDE-MASTER");
             }
             Logger::Info("MKHEAPS used/reserved:%s", hs);
         }
@@ -4983,15 +5043,14 @@ bool OnTickEntry(void* engine, float dt) {
         saveCount = 0;
     }
     CrashLog::Crumb("game");
-    ObjectHooks::TrimHistory(F - (kRing - 1));
+    ObjectHooks::TrimHistory(FramesBack(F, kRing - 1));
     {  // The free quarantine only while a session can load: a GGPO session, or netplay armed / starting. 2026-10-29
        // both players' games froze in MK9's menus with rollback mode on (MK heap #5 allocation failure at 18:41) and
        // ran 11 minutes of online fights without a freeze in Safe mode, whose only menu-time difference is this.
-        static bool qOn = false;
         const bool want = gEnabled && !gLockstep &&
                           (gQuarantineMenus || gGgpo || gNetplayArmed || gNetplayAwaitFight || gNetplayWaitRunning || gP2PPending);
-        if (want != qOn) {
-            qOn = want;
+        if (want != gQuarantineOn) {
+            gQuarantineOn = want;
             FreeQuarantine::SetActive(want);
             if (!want) FreeQuarantine::ReleaseAll();
             Logger::Info("QUARANTINE %s (%s)", want ? "on" : "off", want ? "a rollback session is armed or running" : "no rollback session");
@@ -5002,11 +5061,11 @@ bool OnTickEntry(void* engine, float dt) {
     // gQuarantineMargin frames past the ring: a safety margin for state that still points at a block freed just outside
     // the window. (Added for the 2026-11-04 regression crash, which turned out to be a garbage-collected light component
     // read by a resurrected effect's destructor, not a released block: ActorGuard.)
-    FreeQuarantine::Release(F - (kRing - 1) - (uint32_t)gQuarantineMargin);
+    FreeQuarantine::Release(FramesBack(F, (kRing - 1) + (uint32_t)gQuarantineMargin));
     ActorDefer::SetFrame(F);  // releases happen after the fight update (ReleaseDeferredActors), not here
     CinemaRestore::SetFrame(F);
     PhysWatch::SetFrame(F);
-    PhysWatch::Trim(F - (kRing - 1));
+    PhysWatch::Trim(FramesBack(F, kRing - 1));
     return rolled;
 }
 
@@ -5036,8 +5095,9 @@ void ReleaseDeferredActors() {
     if (!gEnabled || gIsResimulating) return;
     // Deferred actors live (ticking, owner freed) only as long as a load can still reach their death: GGPO SyncTest
     // goes back the check distance (4), P2P the prediction window (8); local rollbacks use the whole ring.
-    ActorDefer::Release(GameFrame() - (gGgpo ? (gGgpoIsP2P ? 10 : 6) : (kRing - 1)));
-    CinemaRestore::Release(GameFrame() - (gGgpo ? (gGgpoIsP2P ? 10 : 6) : (kRing - 1)));
+    const uint32_t oldest = FramesBack(GameFrame(), gGgpo ? (gGgpoIsP2P ? 10 : 6) : (kRing - 1));
+    ActorDefer::Release(oldest);
+    CinemaRestore::Release(oldest);
 }
 
 void FightTickDone(bool fought) {
@@ -5078,8 +5138,8 @@ void RecordInputs() {
             // Added at the next boundary. Scripted input (harness) wins; otherwise the player's own controllers/keyboard
             // (every local hardware pad), without the menu/aux bits 0x0F00 (not fight commands; 0x200 is likely Start, and
             // a pause would stall both games). The boundary reads the hardware again, from its own pass's sampling.
-            gLocalScripted = want[gP2P.player - 1] != 0;
-            gLocalRaw = gLocalScripted ? want[gP2P.player - 1] : (Input::LocalHardwareMask() & ~0x0F00u);
+            gLocalScripted = want[gGgpoLocal] != 0;
+            gLocalRaw = gLocalScripted ? want[gGgpoLocal] : (Input::LocalHardwareMask() & ~0x0F00u);
             for (int p = 0; p < 2; ++p) {
                 in.valid[p] = gSyncValid;
                 in.mask[p] = gSyncValid ? gSyncMasks[p] : 0;
@@ -5114,7 +5174,39 @@ void RecordInputs() {
     }
 }
 
+// What a session armed by hand ('ggpo p2p' / 'ggpo netplay': the launcher's direct-IP mode, the test scripts) was started
+// with, unchecked until rc30: an address GGPO cannot parse ends in its assert (the game closes), the checksum channel
+// uses each port + 100, and GGPO's input queue holds 128 frames. Four decimal numbers 0-255 with dots, no leading
+// zeros: what GGPO's inet_pton takes.
+bool DottedQuad(const char* s) {
+    for (int part = 0; part < 4; ++part) {
+        const char first = *s;
+        int v = 0, digits = 0;
+        for (; *s >= '0' && *s <= '9'; ++s) {
+            v = v * 10 + (*s - '0');
+            if (++digits > 3 || v > 255) return false;
+        }
+        if (!digits || (digits > 1 && first == '0')) return false;
+        if (part < 3 && *s++ != '.') return false;
+    }
+    return *s == 0;
+}
+bool P2PArgsOk(const char* verb, unsigned short localPort, const char* ip, unsigned short remotePort, int* delay) {
+    if (!DottedQuad(ip) || !localPort || !remotePort || localPort > 65435 || remotePort > 65435) {
+        Logger::Info("%s refused: it needs an IPv4 address (four numbers, like 192.168.0.12) and ports from 1 to 65435; got "
+                     "'%.40s', local port %u, remote port %u", verb, ip, localPort, remotePort);
+        return false;
+    }
+    if (*delay < 0 || *delay > HelloProto::kMaxDelay) {
+        const int asked = *delay;
+        *delay = asked < 0 ? 0 : HelloProto::kMaxDelay;
+        Logger::Info("%s: delay %d is outside 0-%d, %d is used", verb, asked, HelloProto::kMaxDelay, *delay);
+    }
+    return true;
+}
+
 void GgpoP2PCommand(unsigned short localPort, const char* ip, unsigned short remotePort, int player, int delay) {
+    if (!P2PArgsOk("GGPO p2p", localPort, ip, remotePort, &delay)) return;
     gP2P.localPort = localPort;
     gP2P.remotePort = remotePort;
     strncpy(gP2P.ip, ip, sizeof gP2P.ip - 1);
@@ -5132,6 +5224,7 @@ void GgpoSteamCommand(uint64_t peer, int player, int delay, bool netplay) {
 }
 
 void NetplayArm(unsigned short localPort, const char* ip, unsigned short remotePort, int player, int delay) {
+    if (!P2PArgsOk("NETPLAY arm", localPort, ip, remotePort, &delay)) return;
     gP2P.localPort = localPort;
     gP2P.remotePort = remotePort;
     strncpy(gP2P.ip, ip, sizeof gP2P.ip - 1);

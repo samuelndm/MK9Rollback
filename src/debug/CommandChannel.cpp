@@ -2,6 +2,7 @@
 #include "AllocWatch.h"
 #include "AnimInputTrace.h"
 #include "Overlay.h"
+#include "../common/StrAppend.h"
 #include "../common/MemQuery.h"
 
 #include <windows.h>
@@ -921,7 +922,7 @@ void Execute(const std::string& line) {
                 for (int i = 0; i < 512 && shown < 6; ++i) {
                     MEMORY_BASIC_INFORMATION mbi;
                     if (!VirtualQuery(sp + i, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
-                    if (sp[i] >= 0x00401000 && sp[i] < 0x00F9C000) { sn += snprintf(stk + sn, sizeof stk - sn, " %08lX", sp[i]); ++shown; }
+                    if (sp[i] >= 0x00401000 && sp[i] < 0x00F9C000) { sn = AppendF(stk, sizeof stk, sn, " %08lX", sp[i]); ++shown; }
                 }
                 stk[sn] = 0;
                 Logger::Info("FPU thread %lu x87cw=%04X mxcsr=%08X eip=%08lX game-code:%s", te.th32ThreadID, (unsigned)(c.FloatSave.ControlWord & 0xFFFF),

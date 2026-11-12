@@ -457,7 +457,11 @@ bool InstallSamplerHook() {
 }
 void SetLocalCapture(bool on) {
     const bool was = gCapture;
-    if (on != gCapture) Logger::Info("INPUT: local hardware capture %s", on ? "on (netplay)" : "off");
+    // Without the sampler patch nothing is captured: the log said "on" all the same, over a session with neutral input.
+    if (on && !gSamplerHooked)
+        Logger::Info("INPUT: local hardware capture stays off (the sampler call is not patched): this game's controllers "
+                     "do not reach the session");
+    else if (on != gCapture) Logger::Info("INPUT: local hardware capture %s", on ? "on (netplay)" : "off");
     gCapture = on && gSamplerHooked;
     gLocalHw = 0;
     if (gCapture != was) DeviceChangeCapture(gCapture);

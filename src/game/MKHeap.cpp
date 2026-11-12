@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <utility>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Logger.h"
 #include "MK9Game.h"
@@ -136,9 +137,9 @@ int MasterRanges(Region* out, int max) {
             static int lastSegs = 0;
             if (ns != lastSegs) {
                 lastSegs = ns;
-                char line[400];
+                char line[400] = "";
                 int k = 0;
-                for (int i = 0; i < ns && k < 360; ++i) k += snprintf(line + k, sizeof line - k, " %08X+%X", (unsigned)seg[i].base, seg[i].size);
+                for (int i = 0; i < ns && k < 360; ++i) k = AppendF(line, sizeof line, k, " %08X+%X", (unsigned)seg[i].base, seg[i].size);
                 Logger::Info("HEAPSEG master heap %08X owns %d segment(s):%s (root-based base %08X)", (unsigned)m, ns, line,
                              Read32(m + 0x34));
             }
@@ -198,7 +199,7 @@ void LogInfo() {
         if (!h) continue;
         char line[256];
         int n = 0;
-        for (int i = 0; i < 0x50; i += 4) n += snprintf(line + n, sizeof line - n, " %08X", Read32(h + i));
+        for (int i = 0; i < 0x50; i += 4) n = AppendF(line, sizeof line, n, " %08X", Read32(h + i));
         Logger::Info("HEAP obj %08X:%s", h, line);
     }
     for (int i = 0; i < kPoolCount; ++i) {
@@ -221,7 +222,7 @@ void LogInfo() {
         if (!h) continue;
         char line[256];
         int k = 0;
-        for (int i = 0; i < 0x50; i += 4) k += snprintf(line + k, sizeof line - k, " %08X", Read32(h + i));
+        for (int i = 0; i < 0x50; i += 4) k = AppendF(line, sizeof line, k, " %08X", Read32(h + i));
         Logger::Info("HEAP sub [%08X]=%08X:%s", hp, h, line);
     }
     {  // registry descriptors that belong to (or overlap) the MK heaps: kinds/owners at runtime

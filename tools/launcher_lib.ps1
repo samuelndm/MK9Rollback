@@ -2,6 +2,11 @@
 # so tools\launcher_selftest.ps1 can check them with fixture data:
 #   Get-LauncherMessage    log line -> plain status line (the table of the DLL's log lines the window translates)
 #   Get-InjectorResult     MK9RollbackInjector.exe exit code -> message, retry or not
+#   Invoke-Injector / Get-InjectFailureText   runs the injector without ever throwing; why the mod was not loaded
+#   Move-SessionLogs       the last session's logs -> previous_logs, once per start
+#   ConvertTo-AccountId    a pasted friend code, SteamID64 or profile link -> Steam account ID
+#   New-HangWatch / Update-HangWatch     a game that stays frozen (not a stall it recovers from)
+#   New-ErrorWatch / Update-ErrorWatch   an error of a window handler is shown once, not at every timer tick
 #   Test-InstalledFiles    MK9Rollback.dll against version.txt's dll= hash
 #   Send-LauncherCommand   commands to the DLL through MK9Rollback_cmd.txt, merged with a file still waiting
 #   Test-CommandAck        the DLL's echo of a launcher command ("CMD netcode rollback")
@@ -57,7 +62,16 @@ $script:LauncherMessages = @(
     @{ p = 'did not join within'; m = 'Your opponent''s game did not join in time. This fight continues on MK9''s own netcode.'; rearm = $true },
     @{ p = 'NETPLAY: the session could not start'; m = 'The connection to your opponent could not be set up (a network port may be in use). This fight continues on MK9''s own netcode.'; rearm = $true },
     @{ p = 'the other player disconnected'; m = 'Your opponent disconnected. The rest of this fight continues on MK9''s own netcode; the next fight tries again.' },
-    @{ p = 'CRASH\?|HANG\?'; m = 'The mod reported a crash or hang. Please save the logs.' },
+    # A crash: the first line of the DLL's report (src\debug\CrashLog.cpp), so the message comes once per crash. Its
+    # other "CRASH?" lines and the "HANG?" lines are matched and not shown: the watchdog writes "HANG? game thread N
+    # stalled >3s" and one line per thread and window (48 lines in the field log of 2026-11-11) for a stall the game
+    # recovers from too, such as the DLL's own start-up. Two kinds of real stop are still told: an error box among those
+    # windows (a dialog, class #32770: a C runtime error, a GGPO assertion; the game stands still behind it), and a game
+    # that stays frozen, which the window itself sees by asking Windows whether the game's window still answers
+    # (Update-HangWatch below).
+    @{ p = 'CRASH\? code='; m = 'The mod reported a crash. Please save the logs.' },
+    @{ p = 'HANG\?   window [0-9A-Fa-f]+ class ''#32770'''; m = 'The game stopped at an error box (it may be hidden behind the game). Please save the logs.' },
+    @{ p = 'CRASH\?|HANG\?'; m = $null },
     @{ p = 'GGPO p2p stopped'; m = $null; rearm = $true }  # each fight is one session; arm the next one
 )
 
@@ -98,6 +112,98 @@ function Get-InjectorResult([int]$code) {
         Retry = -not ($code -eq 0 -or $code -eq 2 -or $code -eq 3 -or $code -eq 4 -or $code -eq 6)
         Text = $text
     }
+}
+
+# Runs "<exe> inject" and never throws: Started = $false with Error (a sentence for the player) when the file is gone
+# (antivirus quarantine) or Windows refuses to start it (blocked). Else Code is the exit code and Output what it printed.
+function Invoke-Injector([string]$exe) {
+    $ErrorActionPreference = 'Continue'  # here only: with 'Stop' the injector's stderr lines would be thrown
+    $r = [pscustomobject]@{ Started = $false; Code = -1; Output = ''; Error = '' }
+    if (-not [System.IO.File]::Exists($exe)) {
+        $r.Error = 'MK9RollbackInjector.exe is missing (often removed by antivirus). Restore it from quarantine or extract the zip again, then add the folder to the exclusions.'
+        return $r
+    }
+    try {
+        $r.Output = (& $exe inject 2>&1 | Out-String)
+        $r.Code = $LASTEXITCODE
+        $r.Started = $true
+    } catch {
+        $e = $_.Exception
+        if ($e.InnerException) { $e = $e.InnerException }
+        $why = ("$($e.Message)".Trim() -split "`r?`n")[0]
+        $r.Error = "Windows could not start MK9RollbackInjector.exe ($why). Your antivirus may be blocking it: add the MK9 Rollback folder to its exclusions, then press Play again."
+    }
+    $r
+}
+
+# Why the mod was not loaded, for the player. A game closed before or during the injection ends the injector with
+# exit code 1 ("MKKE.exe is not running"), the same code as an injector stopped half-way: only that one is an
+# antivirus matter. $result: Get-InjectorResult's, or $null (the mod's log never appeared).
+$script:InjectClosedText = 'The game was closed before the mod was loaded. Press Play to start it again.'
+$script:InjectBlockedText = 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe. Press ''Having trouble?'' for what to try, then save the logs if it keeps failing.'
+function Get-InjectFailureText($result, [bool]$gameRunning) {
+    if ($result -and $result.Text -and -not $result.Retry) { return $result.Text }  # 2, 3, 4: the injector knew why
+    if (-not $gameRunning) { return $script:InjectClosedText }
+    if ($result -and $result.Text) { return $result.Text }
+    $script:InjectBlockedText
+}
+
+# Before an injection: the last session's logs go to previous_logs ("Save logs" zips them too: a player who restarts
+# after a crash would lose them) and $dir starts without a log. On another try of the same start ($retry) the few
+# lines of the try that failed are only deleted, so previous_logs keeps the session before it.
+function Move-SessionLogs([string]$dir, [bool]$retry = $false) {
+    $old = @(Get-ChildItem -LiteralPath $dir -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue)
+    if ($old -and -not $retry) {
+        $prevLogs = Join-Path $dir 'previous_logs'
+        Remove-Item -LiteralPath $prevLogs -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $prevLogs | Out-Null
+        $old | Move-Item -Destination $prevLogs -Force -ErrorAction SilentlyContinue
+    }
+    Get-ChildItem -LiteralPath $dir -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+# ---- friend codes ----
+# What the player pasted -> the Steam account ID (32 bits), or 0. Taken: the friend code (the account ID in digits), the
+# 17-digit SteamID64 of a player's account, or a profile link that ends in one. Anything else is refused: until
+# 2026-11-12 every digit of the text was strung together, so "at 9, my code is 123" was taken as the code 9123.
+$script:SteamIdBase = [uint64]76561197960265728
+function ConvertTo-AccountId([string]$text) {
+    $s = "$text".Trim()
+    if ($s -match '^(?:https?://)?(?:www\.)?steamcommunity\.com/profiles/(\d{17})(?:[/?#].*)?$') { $s = $Matches[1] }
+    if ($s -notmatch '^\d{1,17}$') { return [uint64]0 }
+    $v = [uint64]0
+    if (-not [uint64]::TryParse($s, [ref]$v)) { return [uint64]0 }
+    if ($v -gt $script:SteamIdBase) { $v = $v - $script:SteamIdBase }
+    if ($v -ge 1 -and $v -lt 4294967296) { return $v }
+    [uint64]0
+}
+
+# ---- a frozen game ----
+# Called once a second with what Windows says about the game's window ($hung: it has taken no message for 5 s, what
+# the title bar shows as "Not responding"). 'hung' at the $after-th second in a row, 'back' when a game reported that
+# way answers again, else ''. A stall the game recovers from (a slow load, the DLL's patches at start-up) stays below.
+function New-HangWatch { @{ Ticks = 0; Told = $false } }
+function Update-HangWatch($w, [bool]$hung, [int]$after = 10) {
+    if ($hung) {
+        $w.Ticks++
+        if ($w.Ticks -eq $after) { $w.Told = $true; return 'hung' }
+        return ''
+    }
+    $w.Ticks = 0
+    if ($w.Told) { $w.Told = $false; return 'back' }
+    ''
+}
+
+# ---- errors inside the window's handlers ----
+# $true when $text is to be shown: not the same error again within a minute (a step of the timer that fails every
+# second). Count: how many times in a row it came.
+function New-ErrorWatch { @{ Text = ''; At = [datetime]::MinValue; Count = 0 } }
+function Update-ErrorWatch($w, [string]$text, [datetime]$now = (Get-Date)) {
+    $again = ($text -eq $w.Text) -and (($now - $w.At).TotalSeconds -lt 60)
+    if ($again) { $w.Count++ } else { $w.Count = 1 }
+    $w.Text = $text
+    $w.At = $now
+    -not $again
 }
 
 # ---- installed files ----
@@ -193,7 +299,10 @@ function Read-LogTail($tail, [switch]$Discard) {
 # ---- log privacy (Save logs to the Desktop) ----
 # How the DLL names this account: "STEAM bridge: self <id> <-> peer <id>" (src\net\SteamBridge.cpp) and
 # "STEAM: interfaces ..., this account's SteamID64 = <id>" (src\debug\CommandChannel.cpp).
-$script:SelfIdPattern = '(?:STEAM bridge: self |this account''s SteamID64 = )(7656119\d{10})\b'
+# A player's SteamID64 is 76561197960265728 + the 32-bit account number: 76561197960265728 to 76561202255233023, so
+# 17 digits that start with 7656119 or, for accounts made from late 2026 on, 7656120 (to ...2999999999 here).
+$script:SteamId64Pattern = '7656(?:119\d|120[0-2])\d{9}'
+$script:SelfIdPattern = "(?:STEAM bridge: self |this account's SteamID64 = )($script:SteamId64Pattern)\b"
 
 function Find-LogSelfIds([string[]]$paths) {
     $ids = New-Object System.Collections.Generic.List[string]
@@ -228,15 +337,17 @@ function New-LogScrubState([string[]]$SelfIds = @(), [string]$UserName = $env:US
     if ($ComputerName -and $ComputerName.Length -ge 3) {
         $literal.Add(@{ Re = New-Object System.Text.RegularExpressions.Regex("(?<![A-Za-z0-9])$([regex]::Escape($ComputerName))(?![A-Za-z0-9])", 'IgnoreCase'); To = '<pc>'; Kind = 'Pc' })
     }
-    $quick = '7656119\d{10}|\d\.\d{1,3}\.\d{1,3}\.\d|:\\Users\\'
+    $quick = $script:SteamId64Pattern + '|\d\.\d{1,3}\.\d{1,3}\.\d|:\\Users\\'
     foreach ($u in $userNames) { $quick += '|' + [regex]::Escape($u) }
     if ($ComputerName -and $ComputerName.Length -ge 3) { $quick += '|' + [regex]::Escape($ComputerName) }
     @{
         Self = $self; Peers = @{}; Ips = @{}; LanN = 0; IpN = 0; PeerN = 0
         Literal = $literal
         Quick = New-Object System.Text.RegularExpressions.Regex($quick, 'IgnoreCase')
-        Steam = New-Object System.Text.RegularExpressions.Regex('\b7656119\d{10}\b')
-        UsersPath = New-Object System.Text.RegularExpressions.Regex('\b[A-Za-z]:\\Users\\(?!<user>)[^\\/:*?"<>|\s\[\]]+', 'IgnoreCase')
+        Steam = New-Object System.Text.RegularExpressions.Regex("\b$script:SteamId64Pattern\b")
+        # Another account's profile folder (this one's name is in Literal). The name runs to the next backslash, spaces
+        # included ("C:\Users\Jane Doe\..."); with no backslash after it, it can only be taken up to the first space.
+        UsersPath = New-Object System.Text.RegularExpressions.Regex('\b[A-Za-z]:\\Users\\(?!<user>)(?:[^\\/:*?"<>|\[\]]{1,64}?(?=\\)|[^\\/:*?"<>|\s\[\]]+)', 'IgnoreCase')
         # Four dot-separated numbers not inside a longer dotted run or a word ("v1.2.3.4", "1.2.3.4.5").
         Ip = New-Object System.Text.RegularExpressions.Regex('(?<![\w.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\.?\d)(?!\w)')
         Counts = @{ SelfId = 0; PeerId = 0; User = 0; Pc = 0; Ip = 0 }

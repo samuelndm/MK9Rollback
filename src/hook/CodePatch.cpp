@@ -1,11 +1,11 @@
 #include "CodePatch.h"
 
 #include <windows.h>
-#include <tlhelp32.h>
 
 #include <cstring>
 #include <vector>
 
+#include "../common/ThreadWalk.h"
 #include "../debug/Logger.h"
 
 namespace {
@@ -27,28 +27,25 @@ struct SuspendScope {
 };
 
 // Suspends all other threads; returns their handles. If any thread's EIP is in
-// [lo, hi), resumes everything and returns false so the caller can retry.
+// [lo, hi), or the walk over the threads did not complete, returns false: the
+// caller resumes everything and retries.
 bool SuspendOthers(uintptr_t lo, uintptr_t hi, std::vector<HANDLE>* out) {
-    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-    THREADENTRY32 te{sizeof te};
     bool clear = true;
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
-        if (!t) continue;
-        if (SuspendThread(t) == (DWORD)-1) {
-            CloseHandle(t);
-            continue;
+    const bool walked = ThreadWalk::Others(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, [&](HANDLE t, DWORD) {
+        // Past the reserve a push_back would allocate with threads suspended (one may hold the heap lock): such a
+        // thread stays running and the write waits for a later attempt.
+        if (out->size() == out->capacity()) {
+            clear = false;
+            return false;
         }
+        if (SuspendThread(t) == (DWORD)-1) return false;  // a thread on its way out
         out->push_back(t);
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_CONTROL;
         if (GetThreadContext(t, &ctx) && ctx.Eip >= lo && ctx.Eip < hi) clear = false;
-    }
-    CloseHandle(snap);
-    return clear;
+        return true;
+    });
+    return walked && clear;
 }
 
 void ResumeAll(std::vector<HANDLE>& threads) {

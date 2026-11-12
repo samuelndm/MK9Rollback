@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Logger.h"
 #include "../game/MKHeap.h"
@@ -268,7 +269,7 @@ void AfterLoad(uint32_t S, bool restored) {
         if (d.dwords > d.inConn) {
             int k = snprintf(out, sizeof out, "; outside it %08X..%08X:", (unsigned)d.firstOut, (unsigned)d.lastOut);
             for (int i = 0; i < d.samples && k > 0 && k < (int)sizeof out; ++i)
-                k += snprintf(out + k, sizeof out - k, " %08X %08X->%08X", (unsigned)d.sample[i], d.sampleOld[i], d.sampleNew[i]);
+                k = AppendF(out, sizeof out, k, " %08X %08X->%08X", (unsigned)d.sample[i], d.sampleOld[i], d.sampleNew[i]);
         }
         Logger::Info("ONLINEKEEP S=%u: MK9's online memory (heap #5, %u KB in %d range(s) from the %s, %u snapshot span(s) inside it "
                      "restored as saved) %s: the restore changed %u dword(s), %u in the connection %08X%s",
@@ -283,7 +284,7 @@ void OnSessionEnd() {
         int k = 0;
         for (int r = 0; r < kReasons; ++r)
             if (gRefused[r] && k >= 0 && k < (int)sizeof why)
-                k += snprintf(why + k, sizeof why - k, "%s%u x %s", k ? ", " : "", gRefused[r], kReasonText[r]);
+                k = AppendF(why, sizeof why, k, "%s%u x %s", k ? ", " : "", gRefused[r], kReasonText[r]);
         Logger::Info("ONLINEKEEP session (mode %d): %u load(s), %u passed the heap checks; %u kept live, %u measured; the restore "
                      "changed %llu dword(s) there, %llu in MK9's connection%s%s",
                      gMode, gLoads, gEligible, gKept, gMeasured, (unsigned long long)gDwords, (unsigned long long)gDwordsConn,

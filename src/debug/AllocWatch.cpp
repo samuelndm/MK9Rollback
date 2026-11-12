@@ -11,6 +11,7 @@
 
 #include "CrashLog.h"
 #include "Logger.h"
+#include "../common/StrAppend.h"
 
 // Inline hooks on ntdll!NtAllocateVirtualMemory / NtFreeVirtualMemory (WoW64 stubs start with the 5-byte
 // "mov eax, imm32"; anything else is refused). Every user-mode reservation goes through them, including
@@ -256,7 +257,7 @@ void Report() {
             if (!c) break;
             char d[96];
             Describe(c, d, sizeof d);
-            n += snprintf(chain + n, sizeof chain - n, " %s", d);
+            n = AppendF(chain, sizeof chain, n, " %s", d);
         }
         chain[n] = 0;
         const Agg& a = v[i]->second;

@@ -1806,6 +1806,172 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         - Still unverified, and not verifiable in the harness or by the gate: the load wait's pacing, the finisher
           hand-back, and the controller re-detection hold. The next two-PC evening on rc29 (blood on, one fatality,
           both log zips) is their test.
+    - **Code audit, 2026-11-12 ("audit the code and find any other bugs"; the player away, the PC not said to be free:
+      no game run). Ten read-only reviews of the rc29 source against the field logs, every claim checked in the code
+      before a fix, and the finished DLL diff read once more by a reviewer that had not written it. Candidate
+      `build\clang_rc30` (DLL DB95DB0C, GGPO `build\ggpo_rc30\libggpo.a` 1967E134; in `build\clang` and `clang2` since
+      the gate, rc29's files in `build\clang_rc29`, its GGPO in `build\ggpo_r3`). Host tests on it: hello 85,
+      finisher 17, codewrite 26, strappend 11, guardpage 11, GGPO 15 cases + 12 in-process checks + the churn and
+      relay runs, logger (passed in 2 of 3 runs: see "found, not fixed"); launcher selftest 86 of 86. **The gate
+      and a Safe-mode regression passed, and it is released as v20261112-0150 (this entry's last bullets). Still to
+      come: a two-PC evening. The source is not committed.**
+      - Fixed in the DLL:
+        - **Arming froze the game thread ~3 s at every launch.** Each of the 56 code patches suspended the other
+          threads through a system-wide Toolhelp snapshot (32 ms a pass here, ~50 ms in the field: the "HANG? game thread
+          stalled >3s" right after arming in every field log, which the launcher showed as a crash-or-hang message).
+          `src\common\ThreadWalk.h` walks this process's threads with NtGetNextThread (0.15 ms a pass; Toolhelp when the
+          export is missing or a walk fails). `FpuGuard::PinAllThreads` took the same snapshot every 10 s outside
+          sessions and at each session start. Test `codewrite` (48 threads; a write under a thread spinning in the bytes
+          is refused; Restore / RestoreAll): 56 writes in 31-35 ms.
+        - **Verdicts carried into the next session**: `gStartMismatch` (and any of the four verdict flags raised
+          together with another in one boundary) stayed set and stopped the next session at its first boundary; the
+          overlay's rollback-depth ring and the X-ray lock log budget were per process. Captured and cleared together at
+          the verdict, and reset in `GgpoStartP2P`.
+        - **The running session read `gP2P.player`**, which an arm command for the next fight rewrites: NETSTATS,
+          StallHold, the X-ray lock, the early local input, BALANCE, the boundary and the overlay read `gGgpoLocal`.
+        - **The direct-IP checksum channel acted on datagrams from any sender**: `CsPump` drops those not from the
+          peer's address. `ggpo p2p` / `ggpo netplay` took any text as the address (GGPO's assert closes the game), any
+          port (the channel uses port + 100) and any delay (GGPO's input queue holds 128 frames): `P2PArgsOk`.
+        - **Unsigned wrap near frame 0** in the release cutoffs of ObjectHooks, FreeQuarantine, PhysWatch, ActorDefer
+          and CinemaRestore: `FramesBack`.
+        - **Quarantine left off for a match** after "safe" then "rollback" in one command batch (a function-static
+          flag out of step with `FreeQuarantine::SetActive`): `gQuarantineOn`, reset where the quarantine is.
+        - **108 sites of `n += snprintf(buf + n, sizeof buf - n, ...)`**: once a line is cut, n passes the capacity, the
+          next size wraps to ~4 GB and the following writes land behind the buffer (reachable in the hang report's
+          `line[900]` and the crash report's `ml[700]`). `AppendF` (`src\common\StrAppend.h`); 14 report buffers that
+          could be logged unwritten are initialised. Test `strappend`.
+        - **A guarded read of another thread's stack guard page took the guard away** (SafeRead32's handler swallowed
+          STATUS_GUARD_PAGE_VIOLATION; Windows clears PAGE_GUARD on the fault): that thread dies with C0000005 at its
+          next stack growth. The handler re-arms the page (`src\common\GuardPage.h`), and the stall sampler does not copy
+          a stack whose pointer sits in a guard page. Test `guardpage` (2 guard pages per stack on this Windows; the
+          child without the re-arm ends with C0000005).
+        - **`gFatalTid` stayed set** after MK9's out-of-memory handler returned: a later exception on that thread
+          closed the game without a log line. Cleared; the termination is logged.
+        - **Safe mode never got rc29's load-wait pacing** (the "disconnected at the start of the match" fix): the script
+          native dispatch hook that reports native 1182 was part of the rollback patch set only. `Enable()` installs it.
+        - **A replay that starts the next map** kept replaying on the new map; its saves could not be loaded, and a
+          second rollback in the same poll ended the session as "a load found no snapshot", an abnormal stop at an
+          ordinary fight end (2 field logs; the restart seen at gf >= 2 in 83 of 2415 session ends). `GgpoAdvanceFrame`
+          stops there and the session ends as a timeline restart; the same boundary no longer adds an input for a
+          session already ended (it could wait 5 s for a peer that had closed its own, then report "no synchronized
+          input": the review's find).
+        - The review's other find, in this audit's own change: the Toolhelp fallback of `ThreadWalk` reported a snapshot
+          that could not be taken as a finished walk, so a patch would have been written with every thread running
+          (rc29 refused there). It returns false now. The watchdog's stack copy got the same guard-page check as the
+          stall sampler's.
+        - **Rumble redirect never installed** ("RUMBLE: 0 copies ... not redirected" in every log): MKKE calls
+          XInputSetState through its import table entry 0x00C5581C, in read-only .rdata (checked in the executable:
+          XINPUT1_3.dll ordinal 3, one `jmp [..]` thunk), and only writable sections were searched. Replayed frames made
+          real XInputSetState calls. The import table is searched and written under VirtualProtect; undone at unload.
+        - **A manual arm survived the switch to MK9 Online** (Local Versus, then the mode changed): nothing cancelled it,
+          and the next online fight paused up to a minute waiting for the friend. `online <peer>` cancels it when not
+          engaged.
+        - Two status lines were 69 and 66 characters for the overlay's 63 (cut on screen): shortened, and the texts of
+          `Online::StatusText` no longer compile when too long (`Fits`). The hand-back log line's `finisher[160]` cut
+          MK9's load handshake text: 280.
+        - Smaller: RngTrace counted replayed native calls as live outside lab (`gIsResimulating`); the TierE object scan
+          ran again inside a replay (unsigned age); LoadAB skipped an unwritable span in silence (now logged and
+          counted); "local hardware capture on" was logged when the sampler patch had failed; lab-only AttachAudit /
+          TaskRegAudit overran `seen[64]` and gave `%s` an integer.
+      - Fixed in the patched GGPO (`tools\build_ggpo.ps1`, block "rc30", 8 labelled patches; found by review and by a
+        sanitizer fuzz build): a quality reply's made-up `pong` gave a ping of minutes and overflowed
+        `ggpo_rtt_min_ms * 60`; one sync datagram with a far sequence number made every real packet "out of order"
+        until the disconnect timeout; Poll leaked an event handle per session (127 -> 167 over 40 sessions, now flat);
+        a first session had no network statistics for up to 33 s (a union member read as a time); uninitialised heap
+        bytes went out in packets; magic numbers and sync randoms came from an unseeded rand() (41 and 18467 in every
+        process); the handshake's round trip kept the first, queued reply (1059 ms against 51 through a relay with one
+        side a second late; now 45-51 on both, which is what the start barrier's WaitShift reads); 63 unacknowledged
+        frames with more than ~7 changed input bits a frame hit `ASSERT(offset < MAX_COMPRESSED_BITS)` (the game
+        closes): a packet now ends at the last frame that fits. New tests: `ggpo_session_test.cpp`, `ggpo_relay.cpp`,
+        raw-peer cases `seqjump`, `slowack`, `churncheck`.
+      - Fixed in the launcher (`tools\`, selftest 57 -> 86 checks): an error inside a timer or button handler opened
+        .NET's error box at every tick (one status line and a file in %TEMP% now); Unblock-File ran over every file of
+        the install folder, which can be the player's Downloads (only the release's own files, `$kPackageFiles`);
+        Local Versus could be armed without a friend's code; a game closed before the injection was reported as an
+        antivirus block; the log scrubber missed SteamID64s from 7656120... on and profile folders with a space;
+        every recovered stall showed "crash or hang" (the message now comes once per crash report, a frozen game is
+        asked of Windows with IsHungAppWindow, an error box among the game's windows is told); closing the window
+        during an update left a half install (the close waits for it); the friend code box strung every digit of the
+        text together; a failed start's retry replaced previous_logs; `Play Online.bat` was written with LF line ends
+        and showed nothing where PowerShell refuses scripts (CRLF, and a visible `-StartCheck` run first);
+        `docs\netplay_lan_test.md` described the old code-swap flow. `package.ps1` was changed and not run.
+      - Found, not fixed (each needs the game, a measurement or a decision):
+        - **Quarantine growth on Kahn's Coliseum**: frees of 625-704 bytes from caller 0x00412BD8 are parked ~4 a frame
+          for a whole match (42,237 blocks, 29.7 MB on both PCs; ~10 MB a minute in a 32-bit process at ~1.55 GB).
+        - **Cold pages kept live at 6-200 times the documented rate** (COLDKEEP median 2448 per 600 saves in the
+          field): fields a load does not rewind, different per PC; a candidate desync mechanism. Needs a per-span
+          count first.
+        - Online flow: a game past its first fight frame still says "ready" in its hello (the other waits the 15 s join
+          timeout); `IdleSocketReceived` admits sockets that stopped receiving; 'online auto' cannot find the opponent
+          again once forgotten or after 64 candidates; "a new online connection" is never detected (same address).
+        - OnlineKeep never measured a load in the field (heap #5's root moves; the refusal's reason is wrong).
+          CinemaRestore identifies objects by pointer and index only. The heap-lock timeout path restores a lock word
+          into a heap it does not hold (never seen in a log). Crash-log "restored span" lines describe the slot's newer
+          save.
+        - Start-up and unload: "Inert: hook installation refused." leaves patches in and the launcher says Ready;
+          an unreadable executable is reported as an unsupported version; HookManager's patch list has no lock;
+          MK9R_Unload (developer path) frees the module with the stall sampler thread alive; the injector accepts
+          "already loaded" from another folder.
+        - Logger: write and rotation failures are dropped in silence; `%ls` with characters above U+00FF. Command
+          channel: test verbs (`whatis`, `oomtest`, `lab`, `poke`) have no real gate; a 256-character line is split.
+        - **Logger, frame log at process exit (rc29's code, untouched here):** the host test failed once, "child 41:
+          276481 frame lines are not in the files, the main log reports 0 dropped" (a child that lived 184 ms), in 1 of
+          660 exits that day; the run before and 480 exits after it passed. A window is left where text waiting for the
+          disk is lost at exit without the report. The runner deleted the child's files: `run.ps1` keeps a failed
+          run's files now.
+        - `results\online_20261103\desktop_212011\MK9Rollback.log` line 875 holds an unscrubbed SteamID64 (a raw log;
+          `results\` is not shipped, the launcher scrubs what "Save logs" zips).
+      - Lesson for the harness: a 32-bit test program with "patch", "setup", "install" or "update" in its file name is
+        taken for an installer by Windows and asks for administrator rights (`codepatch_test.exe` put a UAC prompt on
+        the screen; renamed `codewrite_test`). `tests\host\run.ps1` runs the small tests with a time limit.
+      - **Gate on DB95DB0C, 01:18-01:50 (user: "Run the gate"; `results\gate_20261112_rc30.txt`): pass, zip
+        `dist\MK9Rollback-netplay-20261112-0150.zip`** (SHA-256 224E31C3..., local only). Online smoke; the plain, auto
+        re-arm (3 re-arms a game) and delay-change (21 changes) regressions each 3 fights, 6 checksum reports, 0
+        mismatching, 0 failed saves, 0 crashes, 0 cut sessions; menu walk 305 key presses, no hang or crash. The
+        package's text files and both binaries were scanned before it: no SteamID, user name or profile path.
+        - In the logs: an arming's 58 code patches land in 43-78 ms (2.9-3.6 s in the three field logs of 2026-11-11)
+          and no "HANG? game thread stalled" line follows; "RUMBLE: XInputSetState pointer at 00C5581C redirected" in
+          every game; all 18 sessions ended as "timeline restart" at 1965 frames; no CRASH?, DESYNC, LOGGER: or GGPO
+          assertion line.
+        - Not exercised by it: the replay-restart stop ("started the next map": 0 lines), the "no longer writable"
+          skip, the argument checks' refusals, the cancelling of a hand-armed session, Safe mode's load wait (the gate
+          runs rollback mode), the launcher's window.
+        - The source tree moved after the build: from about 01:30 other sessions' work went into the shared folder (the
+          start alignment in RollbackManager, CommandChannel and `tests\host\run.ps1`; the HUD display, merged 08:38,
+          in those and in OnlineMode, Overlay, the launcher window and the packaging script). The gated DLL was built
+          at 00:55, so the tree is rc30 plus that work: a commit of rc30 alone has to leave those hunks out, and a
+          build of the tree is a new candidate that needs its own gate.
+      - **Safe mode on DB95DB0C, 08:39-08:46 (user: "Run Safe-mode check"; `results\batch_rc30x.txt`,
+        `results\rc30x_lockstep*`): pass.** The gate's regression with `-Lockstep -Delay 3`, as rc29's `batch_rc29x.txt`:
+        3 fights, 6 checksum reports, 0 mismatching, 0 failed saves, 0 crashes, 0 cut sessions, 0 arming retries; all 6
+        sessions LOCKSTEP with 0 loads, ended as "timeline restart" at 1965 frames, 59.1-59.9 fps; no CRASH?, HANG?,
+        DESYNC, LOGGER: or assertion line. The mode's 34 code patches land in 30-56 ms.
+        - Game A's third fight counted 20077 barrier waits (1 ms polls; 0 in its other two fights, 12-17 on B, at most
+          14096 in the 52 lockstep sessions kept under `results\`). Its window stopped presenting at that fight's start
+          (52 of 1966 frames presented, the overlay's draw count stands still; no other harness log shows this), so the
+          wait for B's input was all that paced it. The cause is not in the log: most likely the fullscreen window lost
+          the foreground (the PC was in use, another session started its own games at 08:46:35). The simulation was
+          not affected: 16.7 ms a frame, p99 20, four frames >= 34 ms, checksums equal.
+        - No RUMBLE line in this mode, as in rc29's run: the redirect is installed with the rollback modules only.
+        - It does not test what only two PCs can: the load wait's pacing, the finisher hand-back, the controller
+          re-detection hold.
+        - The working tree holds the HUD network display too since 08:38 (merged by another session;
+          `tools\netplay_gui.ps1`, `tools\package.ps1` and `docs\netplay_lan_test.md` among its files): the 01:50 zip
+          was packaged before it and is rc30 as gated; a repackage now would not be.
+      - **Released 2026-11-12 10:05 as v20261112-0150 (user: "Publish rc30"), Latest.** The gated zip as it was (SHA-256
+        224E31C3..., DLL DB95DB0C): its eleven files were extracted and scanned again first (text and both binaries: no
+        user name, profile path, SteamID or address beyond 127.0.0.1 and the documented example), the downloaded asset
+        equals the local zip and its .sha256. Both players must update (no rollback session against rc29). The tag
+        sits on 84448a6, rc29's source.
+      - **Source pushed 2026-11-12 on the player's word ("Push rc30 source"), without the start alignment and the HUD
+        display.** Assembled in a separate checkout of 84448a6: from the shared folder the files nobody wrote after
+        00:55, the co-edited ones from the pre-HUD copies kept in `MK9Rollback_hud\_base` (one still carried five
+        start-alignment lines, a socket option on the checksum channel: taken out), and of this log this entry alone.
+        Proof that it is the release's source: built there with `build\ggpo_rc30\libggpo.a`, the DLL equals DB95DB0C in
+        every code and data byte (.text, .rdata, .data, relocations, exception tables; only the build id and the
+        folder name inside the debug strings differ), and so does the injector. The host tests and the launcher
+        selftest pass from that checkout. No file of the shared folder was written: what `git status` shows there
+        afterwards is the other two pieces of work.
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as

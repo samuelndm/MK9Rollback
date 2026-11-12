@@ -188,8 +188,34 @@ try {
         $ro2 = Join-Path $tmp 'real.out'
         Protect-LogFile $real $ro2 $rs
         $txt = [System.IO.File]::ReadAllText($ro2)
-        Check 'privacy: real log keeps its lines and loses every SteamID64' (($txt -notmatch '7656119\d{10}') -and @(Get-Content -LiteralPath $real).Count -eq @(Get-Content -LiteralPath $ro2).Count -and $txt -match 'steam-self' -and $txt -match '127\.0\.0\.1:7050')
+        Check 'privacy: real log keeps its lines and loses every SteamID64' (($txt -notmatch '7656(119|120)\d{10}') -and @(Get-Content -LiteralPath $real).Count -eq @(Get-Content -LiteralPath $ro2).Count -and $txt -match 'steam-self' -and $txt -match '127\.0\.0\.1:7050')
     }
+    # Accounts made from late 2026 on: 7656120... (76561202255233023 is the highest SteamID64 of a player's account).
+    $newSelf = '76561200000000044'; $newPeer = '76561202255233023'
+    $fileC = @(
+        "[22:00:00.000] STEAM: interfaces available, this account's SteamID64 = $newSelf",
+        "[22:00:01.000] STEAM bridge: self $newSelf <-> peer $newPeer, 2 links",
+        "[22:00:02.000] ONLINE auto: the game's online opponent is $peerA (process memory, 15 candidate(s), Steam P2P session active)",
+        "[22:00:03.000] not Steam IDs: 76561200000000044123 and 7656120000000004",
+        # Another account's profile folder with a space in its name (this one's is 'Some Body', replaced by name).
+        '[22:01:00.000] Config: E:\Users\Jane Doe\Documents\My Games\x.ini',
+        '[22:01:01.000] two: C:\Users\Jane Doe\a.log and D:\Users\bob\b.log, done',
+        '[22:01:02.000] home C:\Users\bob (no file name)'
+    )
+    $lc = Join-Path $tmp 'MK9Rollback_c.log'
+    [System.IO.File]::WriteAllLines($lc, [string[]]$fileC)
+    $ids2 = @(Find-LogSelfIds @($lc))
+    Check 'Find-LogSelfIds reads a 7656120... SteamID64' ($ids2.Count -eq 1 -and $ids2[0] -eq $newSelf) ($ids2 -join ',')
+    $st2 = New-LogScrubState -SelfIds $ids2 -UserName 'Some Body' -ComputerName 'SOMEPC-01' -UserProfile 'C:\Users\Some Body'
+    $oc = Join-Path $tmp 'c.out'
+    Protect-LogFile $lc $oc $st2
+    $rc = @(Get-Content -LiteralPath $oc)
+    Check 'privacy: 7656120... SteamIDs -> steam-self / steam-peer' ($rc[0] -eq "[22:00:00.000] STEAM: interfaces available, this account's SteamID64 = steam-self" -and
+        $rc[1] -eq '[22:00:01.000] STEAM bridge: self steam-self <-> peer steam-peer1, 2 links' -and $rc[2] -like '*opponent is steam-peer2 (process*' -and
+        $rc[3] -eq $fileC[3]) ($rc[0..3] -join ' | ')
+    Check 'privacy: a profile folder with a space in its name' ($rc[4] -eq '[22:01:00.000] Config: C:\Users\<user>\Documents\My Games\x.ini' -and
+        $rc[5] -eq '[22:01:01.000] two: C:\Users\<user>\a.log and C:\Users\<user>\b.log, done' -and
+        $rc[6] -eq '[22:01:02.000] home C:\Users\<user> (no file name)' -and (($rc -join ' ') -notmatch 'Jane|Doe|bob')) ($rc[4..6] -join ' | ')
 
     # ---- 7. Get-LauncherMessage ----
     $m1 = Get-LauncherMessage "[12:00:00.000] ONLINE: the other player's mod is older (theirs 20261101-1200, this 20261110-1200); not engaging"
@@ -208,6 +234,20 @@ try {
         (Get-LauncherMessage 'NETPLAY DESYNC: frame 12').Kind -eq 'desync')
     Check 'command acknowledgement lines' ((Test-CommandAck '[21:12:03.582] CMD netcode rollback') -and (Test-CommandAck '[21:12:03.718] CMD online auto ping') -and
         (Test-CommandAck "[1] CMD ignored: 'netcode rollback'") -and -not (Test-CommandAck '[1] CMD hold 1 16 21') -and -not (Test-CommandAck '[1] NETCODE mode: rollback'))
+    # A stall the game recovered from (line shapes of results\field_20261111) says nothing; a crash says it once.
+    $h1 = Get-LauncherMessage '[18:27:42.381] HANG? game thread 4544 stalled >3s: eip=758F5FDC esp=012AE5D4 ebp=012AE5F4 crumb=idle(0) stack: 0065006C'
+    $h2 = Get-LauncherMessage "[18:27:42.391] HANG?   window 00050912 class 'LaunchUnrealUWindowsClient' title 'Mortal Kombat' (thread 4544)"
+    $c1 = Get-LauncherMessage '[04:35:11.774] CRASH? code=C0000005 eip=0042B2BC read addr=BF2769AA thread=21740 crumb=idle(0)'
+    $c2 = Get-LauncherMessage '[04:35:11.774] CRASH? stack code-like values: 00E2F4C0 00E0AC18 00E0AC48'
+    $h3 = Get-LauncherMessage "[03:10:22.118] HANG?   window 001A0B2E class '#32770' title 'Microsoft Visual C++ Runtime Library' (thread 4544)"
+    Check 'message: a stall dump (HANG? lines) is matched and not shown' ($h1 -and $null -eq $h1.Text -and $h2 -and $null -eq $h2.Text)
+    Check 'message: an error box in the stall dump is told' ($h3.Text -eq 'The game stopped at an error box (it may be hidden behind the game). Please save the logs.') "$($h3.Text)"
+    Check 'message: a crash is shown once, at its first line' ($c1.Text -eq 'The mod reported a crash. Please save the logs.' -and $c2 -and $null -eq $c2.Text) "$($c1.Text)"
+    # The window's own check: 3 s frozen and back says nothing; frozen on says 'hung' once, at the 10th second, then 'back'.
+    $hw = New-HangWatch
+    $seq = @(foreach ($hung in @($true, $true, $true, $false) + @($true) * 12 + @($false, $false)) { Update-HangWatch $hw $hung })
+    $want = @('', '', '', '') + @('') * 9 + @('hung', '', '') + @('back', '')
+    Check 'hang watch: silent for a recovered stall, one message for a game that stays frozen' (($seq -join ',') -eq ($want -join ',')) ($seq -join ',')
 
     # ---- 8. injector exit codes ----
     $c = @{}; foreach ($i in 0..8) { $c[$i] = Get-InjectorResult $i }
@@ -218,6 +258,23 @@ try {
     Check 'injector 5: refused, retried' ($c[5].Retry -and -not $c[5].Loaded -and $c[5].Text -eq 'Windows or your antivirus refused to load MK9Rollback.dll.')
     Check 'injector 6: already loaded = loaded, arm' ($c[6].Loaded -and $c[6].AlreadyLoaded -and -not $c[6].Retry)
     Check 'injector 7 and 1: retried' ($c[7].Retry -and $c[1].Retry -and -not $c[7].Loaded)
+    # Exit code 1 is also "MKKE.exe is not running": the text depends on whether the game is still there.
+    Check 'injector 1 with the game closed: "the game was closed", not the antivirus text' ((Get-InjectFailureText $c[1] $false) -eq 'The game was closed before the mod was loaded. Press Play to start it again.' -and
+        (Get-InjectFailureText $null $false) -eq (Get-InjectFailureText $c[1] $false))
+    Check 'injector 1 with the game running: the antivirus text; 5 and 2 keep their own' ((Get-InjectFailureText $c[1] $true) -like 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe.*' -and
+        (Get-InjectFailureText $null $true) -eq (Get-InjectFailureText $c[1] $true) -and (Get-InjectFailureText $c[5] $true) -eq $c[5].Text -and
+        (Get-InjectFailureText $c[2] $false) -eq $c[2].Text)
+    $threw = $false; $gone = $null; $bad = $null; $ran = $null
+    try {
+        $gone = Invoke-Injector (Join-Path $root 'build\clang\NoSuchInjector.exe')
+        # The fixture's injector is a text file: Windows refuses to start it, as it does an exe an antivirus blocks.
+        $bad = Invoke-Injector (Join-Path $root 'build\clang\MK9RollbackInjector.exe')
+        # A program that starts and ends with an exit code (where.exe finds no file named "inject": 1).
+        $ran = Invoke-Injector (Join-Path $env:SystemRoot 'System32\where.exe')
+    } catch { $threw = $true }
+    Check 'Invoke-Injector: a missing exe is a message, not an error' ((-not $threw) -and $gone -and (-not $gone.Started) -and $gone.Error -like 'MK9RollbackInjector.exe is missing*') "$($gone.Error)"
+    Check 'Invoke-Injector: an exe Windows will not start is a message, not an error' ((-not $threw) -and $bad -and (-not $bad.Started) -and $bad.Error -like 'Windows could not start MK9RollbackInjector.exe (*). Your antivirus may be blocking it*') "$($bad.Error)"
+    Check 'Invoke-Injector: a program that runs gives its exit code' ((-not $threw) -and $ran -and $ran.Started -and ($ran.Code -eq 0 -or $ran.Code -eq 1) -and -not $ran.Error) "started $($ran.Started), code $($ran.Code)"
 
     # ---- 9. command merge ----
     $cd = Join-Path $tmp 'cmd'; New-Item -ItemType Directory -Force -Path $cd | Out-Null
@@ -268,6 +325,123 @@ try {
     $hint = $null; $threw = $false
     try { $hint = Get-ConnectionHint } catch { $threw = $true }
     Check 'Get-ConnectionHint returns a string without failing' ((-not $threw) -and $hint -is [string] -and ($hint -eq '' -or $hint -eq 'You are on Wi-Fi: a cable gives steadier fights.')) "'$hint' in $($sw.ElapsedMilliseconds) ms"
+
+    # ---- 13. the last session's logs survive another try of the same start ----
+    $ld = Join-Path $root 'build\clang'
+    $prevLog = Join-Path $ld 'previous_logs\MK9Rollback.log'
+    function Logs-In([string]$d) { @(Get-ChildItem -LiteralPath $d -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue).Count }
+    [System.IO.File]::WriteAllText((Join-Path $ld 'MK9Rollback.log'), 'session one'); [System.IO.File]::WriteAllText((Join-Path $ld 'MK9Rollback_frames.log'), 'frames one')
+    Move-SessionLogs $ld $false
+    Check 'session logs: the first try moves them to previous_logs' ((Logs-In $ld) -eq 0 -and (Logs-In (Join-Path $ld 'previous_logs')) -eq 2 -and (Get-Content -LiteralPath $prevLog) -eq 'session one')
+    [System.IO.File]::WriteAllText((Join-Path $ld 'MK9Rollback.log'), 'a try that failed')
+    Move-SessionLogs $ld $true
+    Check 'session logs: another try keeps previous_logs and starts without a log' ((Logs-In $ld) -eq 0 -and (Logs-In (Join-Path $ld 'previous_logs')) -eq 2 -and (Get-Content -LiteralPath $prevLog) -eq 'session one')
+    Move-SessionLogs $ld $false
+    Check 'session logs: a start without logs keeps previous_logs' ((Get-Content -LiteralPath $prevLog) -eq 'session one')
+    [System.IO.File]::WriteAllText((Join-Path $ld 'MK9Rollback.log'), 'session two')
+    Move-SessionLogs $ld $false
+    Check 'session logs: the next start replaces previous_logs' ((Logs-In $ld) -eq 0 -and (Logs-In (Join-Path $ld 'previous_logs')) -eq 1 -and (Get-Content -LiteralPath $prevLog) -eq 'session two')
+    Check 'session logs: the settings file stays' ((Get-Content -LiteralPath (Join-Path $ld 'netplay_gui.txt')) -eq 'settings stay')
+
+    # ---- 14. friend codes ----
+    Check 'friend code: the code, a SteamID64 (old and 7656120...), a profile link' ((ConvertTo-AccountId ' 123456789 ') -eq 123456789 -and
+        (ConvertTo-AccountId '76561198000000022') -eq 39734294 -and (ConvertTo-AccountId '76561200000000044') -eq 2039734316 -and
+        (ConvertTo-AccountId '76561202255233023') -eq 4294967295 -and (ConvertTo-AccountId 'https://steamcommunity.com/profiles/76561198000000022/') -eq 39734294)
+    $refused = @('', '   ', 'abc', 'at 9, my code is 123', '12 34', '1234abc', '0', '-5', '4294967296', '76561197960265728', '76561202255233024',
+        '99999999999999999999', 'https://steamcommunity.com/id/john123') | Where-Object { (ConvertTo-AccountId $_) -ne 0 }
+    Check 'friend code: anything else is refused' (-not $refused) "taken: $($refused -join ' | ')"
+
+    # ---- 15. only the release's files are unblocked (the zip may sit in Downloads next to anything) ----
+    $dl = Join-Path $tmp 'Downloads [x]'
+    $strays = @('holiday.jpg', 'other-setup.exe', 'tools\someone-elses.ps1', 'docs\notes.md', 'build\clang\payload.exe', 'sub\tools\netplay.ps1')
+    Write-Files $dl $v2
+    foreach ($s in $strays) { Write-Files $dl @{ $s = 'not ours' } }
+    function Set-Mark([string]$f) { Set-Content -LiteralPath $f -Stream 'Zone.Identifier' -Value "[ZoneTransfer]`r`nZoneId=3" -ErrorAction Stop }
+    function Test-Mark([string]$f) { [bool](Get-Item -LiteralPath $f -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue) }
+    $marks = $true
+    try { foreach ($rel in Get-TreeFiles $dl) { Set-Mark (Join-Path $dl $rel) } } catch { $marks = $false }
+    Check 'package list: every file of a release is on $kPackageFiles, and every entry passes the allow-list' (-not @($v2.Keys | Where-Object { $kPackageFiles -notcontains $_ }) -and
+        -not @($kPackageFiles | Where-Object { -not (Get-ReleaseEntryPath $_) })) (@($v2.Keys | Where-Object { $kPackageFiles -notcontains $_ }) -join ', ')
+    if (-not $marks) {
+        'SKIP  unblock checks (3): this temporary folder cannot hold the internet zone mark (not NTFS)'
+    } else {
+        Unblock-PackageFiles $dl
+        Unblock-PackageFiles $dl @('holiday.jpg', 'build\clang\payload.exe', '..\other-setup.exe', '')
+        $stillOurs = @($v2.Keys | Where-Object { Test-Mark (Join-Path $dl $_) })
+        $lostStray = @($strays | Where-Object { -not (Test-Mark (Join-Path $dl $_)) })
+        Check 'unblock: every file of the release loses the mark' (-not $stillOurs) ($stillOurs -join ', ')
+        Check 'unblock: every other file in the folder keeps it' (-not $lostStray) ($lostStray -join ', ')
+        foreach ($rel in Get-TreeFiles $dl) { Set-Mark (Join-Path $dl $rel) }
+        $ok = Install-UpdateFromZip $goodZip $goodSha $dl $null '20261110-1200'
+        $lostStray = @($strays | Where-Object { -not (Test-Mark (Join-Path $dl $_)) })
+        Check 'unblock: an update leaves the mark of the other files too' ($ok -and -not $lostStray) ($lostStray -join ', ')
+    }
+
+    # ---- 16. an error inside a window handler is shown once, not at every tick ----
+    $ew = New-ErrorWatch
+    $t0 = New-Object datetime 2026, 1, 1, 12, 0, 0
+    $e1 = Update-ErrorWatch $ew 'boom' $t0; $e2 = Update-ErrorWatch $ew 'boom' $t0.AddSeconds(1); $e3 = Update-ErrorWatch $ew 'boom' $t0.AddSeconds(2)
+    $n3 = $ew.Count
+    $e4 = Update-ErrorWatch $ew 'other' $t0.AddSeconds(3); $n4 = $ew.Count
+    $e5 = Update-ErrorWatch $ew 'other' $t0.AddSeconds(200)
+    Check 'error watch: the same error within a minute is counted, not shown again' ($e1 -and -not $e2 -and -not $e3 -and $n3 -eq 3 -and $e4 -and $n4 -eq 1 -and $e5)
+
+    # ---- 17. the scripts themselves ----
+    $parseErrors = @()
+    foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'updater.ps1', 'netplay.ps1', 'launch_game.ps1', 'package.ps1') {
+        $f = Join-Path $PSScriptRoot $s
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $tokens = $null; $errs = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$tokens, [ref]$errs)
+        foreach ($e in @($errs)) { $parseErrors += "$s line $($e.Extent.StartLineNumber): $($e.Message)" }
+    }
+    Check 'the scripts parse without errors in this PowerShell' (-not $parseErrors) ($parseErrors -join ' | ')
+    # "Play Online.bat" runs this first: it must end at once with code 0, before anything of the window exists.
+    function Run-Hidden([string]$exe, [string]$arguments, [int]$timeoutMs = 30000) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo $exe, $arguments
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $p.StandardInput.Close()  # a "pause" reads the end of the input and goes on
+        $read = $p.StandardOutput.ReadToEndAsync()
+        $done = $p.WaitForExit($timeoutMs)
+        if (-not $done) { try { $p.Kill() } catch { } }
+        [pscustomobject]@{ Done = $done; Code = $(if ($done) { $p.ExitCode } else { -1 }); Output = $(if ($done) { $read.Result } else { '' }) }
+    }
+    $sc = Run-Hidden 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\netplay_gui.ps1`" -StartCheck"
+    Check 'netplay_gui.ps1 -StartCheck ends at once with code 0' ($sc.Done -and $sc.Code -eq 0) "done $($sc.Done), code $($sc.Code)"
+
+    # ---- 18. "Play Online.bat" as tools\package.ps1 writes it (a developer tree; the package itself is not built) ----
+    $pkg = Join-Path $PSScriptRoot 'package.ps1'
+    if (Test-Path -LiteralPath $pkg) {
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($pkg, [ref]$tokens, [ref]$errs)
+        $batAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -like '@echo off*' }, $true)
+        $crlfAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'CrLf' }, $true)
+        $batDir = Join-Path $tmp 'bat test'
+        $bat = Join-Path $batDir 'Play Online.bat'
+        New-Item -ItemType Directory -Force -Path $batDir | Out-Null
+        $written = $false
+        if ($batAst -and $crlfAst) {
+            . ([scriptblock]::Create($crlfAst.Extent.Text))  # package.ps1's own CrLf
+            CrLf $batAst.Value | Set-Content -Encoding ascii -LiteralPath $bat
+            $written = $true
+        }
+        $bytes = if ($written) { [System.IO.File]::ReadAllBytes($bat) } else { @() }
+        $bareLf = 0
+        for ($i = 0; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -eq 10 -and ($i -eq 0 -or $bytes[$i - 1] -ne 13)) { $bareLf++ } }
+        Check 'Play Online.bat: found in package.ps1, written with CRLF line ends, ASCII' ($written -and $bytes.Length -gt 0 -and $bareLf -eq 0 -and $bytes[$bytes.Length - 1] -eq 10 -and
+            -not @($bytes | Where-Object { $_ -gt 126 })) "$bareLf line(s) end in LF only"
+        if ($written) {
+            $r0 = Run-Hidden 'cmd.exe' "/c `"`"$bat`"`""
+            Check 'Play Online.bat: without the tools folder it says to extract the zip' ($r0.Done -and $r0.Code -eq 1 -and $r0.Output -like '*Extract the whole zip first*') "code $($r0.Code): $($r0.Output)"
+            # A PC that refuses the script: PowerShell ends with an error before any window (here a stand-in that does).
+            Write-Files $batDir @{ 'tools\netplay_gui.ps1' = 'param([switch]$StartCheck) "stand-in: scripts are disabled on this system"; exit 1' }
+            $r1 = Run-Hidden 'cmd.exe' "/c `"`"$bat`"`""
+            Check 'Play Online.bat: a readable line and a pause when PowerShell refuses the script' ($r1.Done -and $r1.Code -eq 1 -and
+                $r1.Output -like '*MK9 Rollback cannot open its window*' -and $r1.Output -match 'Press any key|\. \. \.') "code $($r1.Code): $($r1.Output)"
+        }
+    }
 } finally {
     Get-ChildItem -LiteralPath $tmp -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

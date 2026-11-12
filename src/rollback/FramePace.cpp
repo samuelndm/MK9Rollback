@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <vector>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
@@ -120,7 +121,7 @@ void Print(const char* tag, uint32_t gf, const Stats& s) {
     const double other = pf(kBoundary) - pf(kLiveSave) - pf(kLoad) - pf(kReplayTick) - pf(kReplaySave) - pf(kWait);
     char dh[120];
     int k = 0;
-    for (int d = 0; d < 10; ++d) k += snprintf(dh + k, sizeof dh - k, "%s%d%s:%u", d ? " " : "", d + 1, d == 9 ? "+" : "", s.depthHist[d]);
+    for (int d = 0; d < 10; ++d) k = AppendF(dh, sizeof dh, k, "%s%d%s:%u", d ? " " : "", d + 1, d == 9 ? "+" : "", s.depthHist[d]);
     Logger::Info("PACE %s gf=%u: %u frames in %.1f s = %.1f fps; frame ms avg %.2f p50 %d p95 %d p99 %d max %.1f, >=20ms %u >=34ms %u "
                  ">=50ms %u; presented %u (%.1f/s) ms p50 %d p95 %d p99 %d max %.1f, >=20ms %u >=34ms %u >=50ms %u; boundary ms/frame "
                  "livesave %.2f load %.2f replay %.2f replaysave %.2f wait %.2f extra %.2f other %.2f total %.2f (max %.1f, max replay "
@@ -260,7 +261,7 @@ void LiveFrame(uint32_t gf) {
         if (ms >= 40.0 && (++gHitches <= 40 || gHitches % 25 == 0 || ms >= kMemHitchMs)) {
             char notes[96] = "";
             int k = 0;
-            for (int i = 0; i < gNoteN && k < (int)sizeof notes; ++i) k += snprintf(notes + k, sizeof notes - k, " %s", gNotes[i]);
+            for (int i = 0; i < gNoteN && k < (int)sizeof notes; ++i) k = AppendF(notes, sizeof notes, k, " %s", gNotes[i]);
             char mem[160] = "";
             if (ms >= kMemHitchMs && counters && gFaultsValid) {
                 MEMORYSTATUSEX ms2{};
@@ -507,7 +508,9 @@ bool Capture(HANDLE t, CONTEXT* c, DWORD* stack, uint32_t* count) {
     if (got) {
         MEMORY_BASIC_INFORMATION smbi;
         const DWORD* sp = reinterpret_cast<const DWORD*>((uintptr_t)c->Esp);
-        if (VirtualQuery(sp, &smbi, sizeof smbi) && smbi.State == MEM_COMMIT) {
+        // Not a guard page: a thread that has just moved its stack pointer down can have it in one, and reading it from
+        // here would raise the guard fault in this thread and take the guard away from that one (see GuardPage.h).
+        if (VirtualQuery(sp, &smbi, sizeof smbi) && smbi.State == MEM_COMMIT && !(smbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
             const DWORD* end = reinterpret_cast<const DWORD*>(reinterpret_cast<uintptr_t>(smbi.BaseAddress) + smbi.RegionSize);
             uint32_t n = end > sp ? (uint32_t)(end - sp) : 0;
             if (n > kStackWords) n = kStackWords;
@@ -524,7 +527,7 @@ bool Capture(HANDLE t, CONTEXT* c, DWORD* stack, uint32_t* count) {
 int Describe(const CONTEXT& c, const DWORD* stack, uint32_t count, int maxOwn, int maxOther, char* out, int cap) {
     int n = snprintf(out, cap, "eip");
     n += Where((uint32_t)c.Eip, out + n, cap - n);
-    n += snprintf(out + n, cap - n, "; stack");
+    n = AppendF(out, cap, n, "; stack");
     int own = 0, other = 0;
     bool gap = false;
     for (uint32_t i = 0; i < count && own < maxOwn && n < cap - 64; ++i) {
@@ -532,7 +535,7 @@ int Describe(const CONTEXT& c, const DWORD* stack, uint32_t count, int maxOwn, i
         if (!IsCode(v) || !LooksLikeReturn(v)) continue;
         const bool ours = OwnCode(v);
         if (!ours && other >= maxOther) {
-            if (!gap) n += snprintf(out + n, cap - n, " ..");
+            if (!gap) n = AppendF(out, cap, n, " ..");
             gap = true;
             continue;
         }
@@ -613,7 +616,7 @@ DWORD WINAPI Sampler(LPVOID) {
         int n = snprintf(line, sizeof line, "STALL gf=%ld +%.1f ms (sample %d): game ", (long)gf, el, samples);
         n += Describe(c, stack, count, 18, 12, line + n, (int)sizeof line - n);
         if (rgot && n < (int)sizeof line - 80) {
-            n += snprintf(line + n, sizeof line - n, " | render thread %lu ", rid);
+            n = AppendF(line, sizeof line, n, " | render thread %lu ", rid);
             n += Describe(rc, rstack, rcount, 14, 10, line + n, (int)sizeof line - n);
         }
         Logger::Info("%s", line);

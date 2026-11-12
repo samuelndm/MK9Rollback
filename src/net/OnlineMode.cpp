@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../common/StrAppend.h"
 #include "../debug/CrashLog.h"
 #include "../debug/Lab.h"
 #include "../debug/Logger.h"
+#include "../debug/Overlay.h"
 #include "../game/Input.h"
 #include "../game/MK9Game.h"
 #include "../hook/CodePatch.h"
@@ -596,9 +598,9 @@ void LogLayout(const char* why) {
     char pads[160] = {};
     int n = 0;
     for (uint32_t i = 0; i < localCount && i < 4 && Readable(reinterpret_cast<void*>(localList), (i + 1) * 4); ++i)
-        n += snprintf(pads + n, sizeof pads - n, " L%u=%08X", i, reinterpret_cast<const uint32_t*>(localList)[i]);
+        n = AppendF(pads, sizeof pads, n, " L%u=%08X", i, reinterpret_cast<const uint32_t*>(localList)[i]);
     for (uint32_t i = 0; i < remoteCount && i < 4 && Readable(reinterpret_cast<void*>(remoteList), (i + 1) * 4); ++i)
-        n += snprintf(pads + n, sizeof pads - n, " R%u=%08X", i, reinterpret_cast<const uint32_t*>(remoteList)[i]);
+        n = AppendF(pads, sizeof pads, n, " R%u=%08X", i, reinterpret_cast<const uint32_t*>(remoteList)[i]);
     const uintptr_t conn = reinterpret_cast<uintptr_t>(g) - kConnToGamepads;
     Logger::Info("ONLINE %s: gamepads %08X (connection %08X, in Tier A: %d) active %u frame +0x20 %u +0x24 %u; pads%s; "
                  "fighter pads P1 %08X P2 %08X",
@@ -960,6 +962,13 @@ void Command(uint64_t peer, int delay, bool pingDelay) {
         return;
     }
     if (!Install()) return;
+    // A session armed by hand before (the launcher's Local Versus, 'ggpo steamnetplay') is cancelled: nothing else did,
+    // and it fired at the next online fight's start, a pause of up to a minute waiting for a friend who was never
+    // coming, also against an opponent without the mod. While engaged the arm is this mode's own and stays.
+    if (!gEngaged && Rollback::NetplayArmed()) {
+        Logger::Info("ONLINE: a session armed by hand is cancelled (the online mode arms its own)");
+        Rollback::NetplayDisarm();
+    }
     // What the hellos say about this build and this PC, each on a thread of its own and long before a fight: the game
     // files listed and the DLL read (EnvFingerprint, once per run; it used to happen on the game thread at the first
     // session's frame 24), and the default route's adapter.
@@ -1009,17 +1018,25 @@ bool LocalOnWifi() { return gLocalWifi == 1; }
 bool PeerOnWifi() { return gPeerWifi == 1 && HeardPeer(); }
 bool LinkRelayed() { return gLinkRelayed; }
 
+// A status text that fits the overlay's line, or the build fails: two of them were 69 and 66 characters until rc30 and
+// lost their ends on screen. (HelloProto::StatusText's are checked by tests\host\hello_test.cpp.)
+template <size_t N>
+constexpr const char* Fits(const char (&text)[N]) {
+    static_assert(N <= sizeof(Overlay::Stats::stopWhy), "a status text longer than the overlay's line");
+    return text;
+}
+
 const char* StatusText() {  // game thread (overlay publish); null outside an online fight or while engaged
     if ((!gPeer && !gAuto) || gEngaged || !FightActive()) return nullptr;
-    if (gMatchRefused) return "MK9 NETCODE  (rollback off: only 1 vs 1 Player Match / private rooms)";
-    if (gFailedThisMatch) return "MK9 NETCODE  (rollback stopped for this match)";
-    if (!gPeer) return "MK9 NETCODE  (looking for the opponent's mod...)";
+    if (gMatchRefused) return Fits("MK9 NETCODE  (rollback off: 1 vs 1 Player Match / private only)");
+    if (gFailedThisMatch) return Fits("MK9 NETCODE  (rollback stopped for this match)");
+    if (!gPeer) return Fits("MK9 NETCODE  (looking for the opponent's mod...)");
     // "No mod" only when no hello of any version or size came from the opponent in this match.
-    if (!HeardPeer()) return "MK9 NETCODE  (the opponent does not run the mod)";
+    if (!HeardPeer()) return Fits("MK9 NETCODE  (the opponent does not run the mod)");
     // Another build, other game files or other settings (gVerdict: this tick's, Tick runs before the overlay's publish).
     if (const char* why = HelloProto::StatusText(gVerdict)) return why;
-    if (GetTickCount64() - gAnyHelloRx > kHelloFreshMs) return "MK9 NETCODE  (the opponent's mod stopped answering)";
-    return "MK9 NETCODE  (both run the mod: rollback starts at the next fight)";
+    if (GetTickCount64() - gAnyHelloRx > kHelloFreshMs) return Fits("MK9 NETCODE  (the opponent's mod stopped answering)");
+    return Fits("MK9 NETCODE  (both run the mod: rollback from the next fight)");
 }
 
 void TestScan() {  // 'onlinescan': the fallback pass on demand (its log line gives size and time); results unused
@@ -1210,7 +1227,7 @@ void Tick() {
         if (Rollback::NetplayRunning() && (results || gFinisherNotes.HandBackAt(GameFrameNow()))) {
             uint32_t median = 0;
             const uint32_t est = PingEstimate(&median);
-            char finisher[160] = "results screen";
+            char finisher[280] = "results screen";  // 160 until rc30: the load handshake's text (up to 119) lost its end
             if (!results) {
                 char load[120];
                 AsyncLoadText(load, sizeof load);
