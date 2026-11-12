@@ -14,6 +14,27 @@ Do not use `dist\MK9Rollback-netplay-20261028-0107.zip`: its regression had a cu
 **Latest zip for players (2026-11-03): `dist\MK9Rollback-netplay-20261103-2313.zip`** (DLL EE8A69D4…, rollback gate
 and lag_ns80_d2 passed; fixes below).
 
+**2026-11-12 rc33, the latest release (v20261112-1447, DLL A23E54EC; source in 42b79d1): rc31 plus trace lines for the
+stage and the rematch.** Logging only, the first step of the stage-pick and re-fight features: in a connected
+one-on-one online session the log gets `ONLINEFLOW` lines with values for script natives 670, 671, 672, 1178, 1179,
+1375, 1259 and 1224-1227, `ONLINEMSG` lines for game message 9 "GameSettings" (sent, received) and 10 "ReadyState"
+(received; a player's name is never written, only its length), and an `ONLINESTAGE` line per fight start
+(`src\net\FlowTrace.cpp`, `FlowDecode.h`, host test `flow`). Nothing in the fight or the netcode changes. The gate
+passed on one PC (`results\gate_20261112_rc33.txt`, the menu walk rerun alone once the PC was unlocked); no such line
+appears offline or in attract fights. A first candidate, rc32, wrote them in every offline fight (the match
+description reads the same offline and in an invited room) and was dropped; rc33 asks MKOnlineSession's connected
+flag (+0x4BB0) as well. A build of 42b79d1 with the release's GGPO library equals the released DLL and injector in
+every code and data section.
+- Not verified, needs a two-PC evening on rc33 (both players update; the way back is v20261112-1043): the two stubs
+  at `0x0087F94C` and `0x00887028` have never executed, since no test opens an MK9 online session; and that the
+  connected flag stays 1 from the lobby to the results screen is read from the game's code, not seen. If it does not,
+  natives 1178 / 1179 / 1375 still write their old lines without values and the new lines are missing.
+- From that evening's two log zips: who sends message 9 and when, what its 16 bytes hold when the stage changes,
+  whether a 1 vs 1 room sends message 10 at all, which natives run at a rematch (the sync wait of type 5, begun by
+  native 1259), and whether those natives are called once or polled.
+- Found while reading the game's code: message 10 is "ReadyState" (a name and a byte), not the rematch; the rematch
+  vote is the sync wait of type 5; native 672 sets fighters and stage in one call.
+
 **2026-11-04 scenario simulation (all stages, simulated lag, frame pacing).** Two-instance runs at netsim 30 (ping
 65-145 ms) and delay 2, every stage forced in turn (`forcestage`, `stages`), fighters varied (`pickvariety`), both
 games' frame pacing logged per session (`PACE session`: frame and present times, >=34/50 ms counts, boundary cost per
