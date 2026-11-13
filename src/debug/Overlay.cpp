@@ -13,7 +13,9 @@
 #include "../rollback/FramePace.h"
 #include "../rollback/RollbackManager.h"
 #include "Hud.h"
+#include "KeyEdge.h"
 #include "Logger.h"
+#include "SysWatch.h"
 
 // Site (docs\status_overlay_plan.md 2.3, checked against the disassembly 2026-10-29): RHIEndDrawingViewport 0x00666F20,
 // presenting branch, after the state reset (render target 0 = the back buffer [0xE84538], depth, shaders, streams,
@@ -191,21 +193,10 @@ void Format(const Overlay::Stats& s, int level, char* a, char* b, size_t n, DWOR
     }
 }
 
-// F9 switches compact <-> detailed (level 1 <-> 2); level 0 (off) is left alone. Render thread; gLevel is also set by
-// the command channel, so the switch is a compare-exchange.
-bool gHintDone = false;
-bool gF9Prev = false;
-void PollToggle() {
-    const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    const bool edge = down && !gF9Prev;
-    gF9Prev = down;
-    if (!edge) return;
-    DWORD pid = 0;
-    const HWND fg = GetForegroundWindow();
-    if (!fg || !GetWindowThreadProcessId(fg, &pid) || pid != GetCurrentProcessId()) return;
-    if (InterlockedCompareExchange(&gLevel, 2, 1) != 1) InterlockedCompareExchange(&gLevel, 1, 2);
-    gHintDone = true;
-}
+// F9 switches compact <-> detailed (level 1 <-> 2); level 0 (off) is left alone. The key is read by the watcher thread
+// below (Watch), never by the render thread; gLevel is also set by the command channel, so the switch is a
+// compare-exchange.
+volatile LONG gHintDone = 0;
 
 float TextS(const char* s, float x, float y, float scale, DWORD c) {
     Text(s, x + scale, y + scale, scale, 0xFF000000);  // shadow
@@ -292,35 +283,147 @@ void FirstCall(IDirect3DDevice9* dev) {
 // present parameters and the refresh rate of the monitor the window is on. A match that "stutters with a good
 // connection" is often this: vertical sync against a 59.94 or 75 Hz refresh, or a 144 Hz monitor in windowed mode.
 volatile LONG gDisplayLogWanted = 1;
-void LogDisplay(IDirect3DDevice9* dev) {
-    IDirect3DSwapChain9* chain = nullptr;
-    if (FAILED(dev->GetSwapChain(0, &chain)) || !chain) return;
-    D3DPRESENT_PARAMETERS pp{};
-    const HRESULT hr = chain->GetPresentParameters(&pp);
-    chain->Release();
-    if (FAILED(hr)) return;
+// The swap chain's side is read by the render thread (Direct3D only), the monitor's side by the watcher thread.
+struct DisplayInfo {
+    bool windowed;
+    unsigned width, height, interval, backBuffers, refresh;
+    int swapEffect;
+    HWND window;
+};
+DisplayInfo gDisplay;            // the render thread writes it while gDisplayReady is 0, the watcher reads it while 1
+volatile LONG gDisplayReady = 0;
+
+void LogDisplayInfo(const DisplayInfo& d) {
     unsigned hz = 0;
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof mi;
     DEVMODEW dm{};
     dm.dmSize = sizeof dm;
-    const HMONITOR mon = pp.hDeviceWindow ? MonitorFromWindow(pp.hDeviceWindow, MONITOR_DEFAULTTONEAREST) : nullptr;
+    const HMONITOR mon = d.window ? MonitorFromWindow(d.window, MONITOR_DEFAULTTONEAREST) : nullptr;
     if (mon && GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hz = dm.dmDisplayFrequency;
-    const bool vsync = pp.PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE;
+    const bool vsync = d.interval != D3DPRESENT_INTERVAL_IMMEDIATE;
     const char* note = "";
     if (vsync && hz && (hz < 60 || hz > 61))
         note = hz == 59 ? "; note: vertical sync at 59.94 Hz shows one frame twice every ~17 s (set the monitor to 60 Hz)"
                         : "; note: vertical sync on a monitor that is not at 60 Hz makes the 60 fps game uneven (set it to 60 Hz, or turn vertical sync off)";
     Logger::Info("DISPLAY: %s %ux%u, vertical sync %s (presentation interval %08X), swap effect %d, %u back buffer(s), fullscreen "
                  "refresh %u Hz; the window's monitor runs at %u Hz%s",
-                 pp.Windowed ? "windowed" : "fullscreen", pp.BackBufferWidth, pp.BackBufferHeight, vsync ? "on" : "off",
-                 (unsigned)pp.PresentationInterval, (int)pp.SwapEffect, pp.BackBufferCount, pp.FullScreen_RefreshRateInHz, hz, note);
+                 d.windowed ? "windowed" : "fullscreen", d.width, d.height, vsync ? "on" : "off", d.interval, d.swapEffect,
+                 d.backBuffers, d.refresh, hz, note);
 }
 
+// ---- the watcher thread: every call of this file into the window manager ----
+// The render thread must not call the window manager. GetAsyncKeyState, and the monitor queries of the DISPLAY line,
+// take win32k's lock, which is one lock for the whole desktop session: while any program on the PC holds it, such a
+// call waits, and a wait on the render thread stops the picture and, through the engine's frame sync, the game
+// thread, so the other player's game waits too. Field evening 2026-11-11 (rc28, the F9 poll opened Draw): frames of
+// 197 and 218 ms on the player's PC with 183 and 199 ms inside Draw, five such frames in 22 matches, and the other
+// game waited 137-176 ms each time. Measured 2026-11-12: another process holding the lock for 39-48 ms (SetWindowRgn
+// with 100,000+ rectangles) gave both games of a running pair a 39-42 ms draw, and in a test program
+// (tests\host\winlock_probe.cpp) it delays GetAsyncKeyState by as long while PeekMessage on an empty queue and
+// GetForegroundWindow do not wait. What held the lock that evening is not known; here a wait only delays the switch
+// of the display. KEYWAIT lines name such waits, so a log still shows when the PC's window manager was busy.
+// The watcher also starts and stops SysWatch (SysWatch.h): what Windows announced and which program came to the front,
+// written as SYSEVENT lines by a listener thread, so that a KEYWAIT line has its likely cause next to it. While it
+// runs, the key poll is made at display level 0 too: there it switches nothing and only measures the window manager.
+HANDLE gWatchThread = nullptr, gWatchStop = nullptr;
+volatile LONG gKeyPolls = 0, gKeyWinMaxUs = 0;  // since the last LogCounters
+volatile LONG gKeyMaxUs = 0, gKeyWaits = 0;     // the whole run; waits = polls of kKeyWaitUs or more
+volatile LONG gSysWatchWanted = 1;              // 'syswatch 0|1'
+constexpr LONG kKeyWaitUs = 50000;
+constexpr DWORD kWatchMs = 25;  // 40 polls a second
+constexpr int kSamplePolls = 40;  // a reading of the programs' processor times about once a second, during sessions
+
+void SysLine(const char* line) { Logger::Info("%s", line); }
+
+DWORD WINAPI Watch(LPVOID) {
+    LARGE_INTEGER fq;
+    QueryPerformanceFrequency(&fq);
+    KeyEdge f9;
+    bool sys = false, sysFailed = false;
+    int sinceSample = 0;
+    // A plain timed wait: this thread must not wait for messages (SysWatch's listener does that on a thread of its own),
+    // or that wait would take the window manager's delay and the timed key poll below would no longer see it.
+    while (WaitForSingleObject(gWatchStop, kWatchMs) == WAIT_TIMEOUT) {
+        if (gSysWatchWanted && gEnabled && !sys && !sysFailed) {
+            sys = SysWatch::Start(SysLine);
+            sysFailed = !sys;
+        } else if (!gSysWatchWanted && sys) {
+            SysWatch::Stop();
+            sys = false;
+        }
+        if (!gSysWatchWanted) sysFailed = false;  // a later 'syswatch 1' tries again
+        if (gDisplayReady) {
+            LogDisplayInfo(gDisplay);
+            InterlockedExchange(&gDisplayReady, 0);
+        }
+        const int level = gLevel;
+        if (!gEnabled || (level <= 0 && !sys)) {  // nothing F9 could switch and nothing to measure: no call at all
+            f9.Reset();
+            continue;
+        }
+        if (sys) {
+            const int mode = gBuf[gFront & 1].mode;
+            if (mode != Overlay::kRollback && mode != Overlay::kLockstep) sinceSample = kSamplePolls;  // the first one right at a session's start
+            else if (++sinceSample >= kSamplePolls) {
+                sinceSample = 0;
+                SysWatch::Sample();
+            }
+        }
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        const SHORT state = GetAsyncKeyState(VK_F9);
+        QueryPerformanceCounter(&b);
+        const LONG us = (LONG)((b.QuadPart - a.QuadPart) * 1000000 / (fq.QuadPart ? fq.QuadPart : 1));
+        InterlockedIncrement(&gKeyPolls);
+        if (us > gKeyWinMaxUs) InterlockedExchange(&gKeyWinMaxUs, us);
+        if (us > gKeyMaxUs) InterlockedExchange(&gKeyMaxUs, us);
+        if (us >= kKeyWaitUs && InterlockedIncrement(&gKeyWaits) <= 30) {
+            Logger::Info("KEYWAIT: the F9 poll waited %.1f ms for the window manager (#%ld). Some program on this PC kept the window "
+                         "manager busy that long; the poll runs on its own thread, so the picture did not wait for it",
+                         (double)us / 1000.0, gKeyWaits);
+            char who[420];
+            const int ms = sys ? SysWatch::Busiest(who, sizeof who) : -1;
+            if (ms >= 0) {
+                Logger::Info("KEYWAIT: processor time by program in the %d ms up to the end of that wait, in ms: %s", ms, who);
+                sinceSample = 0;
+            }
+        }
+        if (level <= 0) {  // measured only
+            f9.Reset();
+            continue;
+        }
+        if (!f9.Poll(state)) continue;  // KeyEdge.h: one press, however the polls fall on it
+        DWORD pid = 0;
+        const HWND fg = GetForegroundWindow();
+        if (!fg || !GetWindowThreadProcessId(fg, &pid) || pid != GetCurrentProcessId()) continue;
+        if (InterlockedCompareExchange(&gLevel, 2, 1) != 1) InterlockedCompareExchange(&gLevel, 1, 2);
+        InterlockedExchange(&gHintDone, 1);
+    }
+    if (sys) SysWatch::Stop();  // its listener thread, window and hooks must be gone before the module is
+    return 0;
+}
+
+// Render thread: the swap chain's present parameters for the DISPLAY line; the watcher adds the monitor and writes it.
+void CaptureDisplay(IDirect3DDevice9* dev) {
+    IDirect3DSwapChain9* chain = nullptr;
+    if (FAILED(dev->GetSwapChain(0, &chain)) || !chain) return;
+    D3DPRESENT_PARAMETERS pp{};
+    const HRESULT hr = chain->GetPresentParameters(&pp);
+    chain->Release();
+    if (FAILED(hr)) return;
+    gDisplay = DisplayInfo{pp.Windowed != FALSE, pp.BackBufferWidth, pp.BackBufferHeight, (unsigned)pp.PresentationInterval,
+                           pp.BackBufferCount, pp.FullScreen_RefreshRateInHz, (int)pp.SwapEffect, pp.hDeviceWindow};
+    if (gWatchThread) InterlockedExchange(&gDisplayReady, 1);
+    else LogDisplayInfo(gDisplay);  // no watcher thread in this run: from here, as it was before the watcher existed
+}
+
+constexpr LONG kSlowUs = 20000;  // a part of the render-thread hook that takes this long gets an OVERLAYSLOW line
+volatile LONG gSlowDraws = 0, gSlowProbes = 0;
+
 void Draw(IDirect3DDevice9* dev) {
-    LARGE_INTEGER t0, t1, fq;
+    LARGE_INTEGER t0, tBuilt, tBlock, tDrawn, t1, fq;
     QueryPerformanceCounter(&t0);
-    PollToggle();
     Overlay::Stats s = gBuf[gFront & 1];
     s.stopWhy[sizeof s.stopWhy - 1] = 0;
     int level = gLevel;
@@ -401,13 +504,15 @@ void Draw(IDirect3DDevice9* dev) {
                 static char lh[] = "F9: network details";
                 DrawLine(lh, kGrey, nullptr, -1, x, ly, scale, right);
             } else {
-                gHintDone = true;
+                InterlockedExchange(&gHintDone, 1);
             }
         }
     }
     if (gN < 3) return;  // nothing on screen this frame: the device is not touched
+    QueryPerformanceCounter(&tBuilt);
     IDirect3DStateBlock9* sb = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
+    QueryPerformanceCounter(&tBlock);
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
     dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
@@ -435,6 +540,7 @@ void Draw(IDirect3DDevice9* dev) {
     dev->SetPixelShader(nullptr);
     dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
     dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, gN / 3, gV, sizeof(Vtx));
+    QueryPerformanceCounter(&tDrawn);
     sb->Apply();
     sb->Release();
     InterlockedIncrement(&gDraws);
@@ -446,6 +552,17 @@ void Draw(IDirect3DDevice9* dev) {
     InterlockedIncrement(&gWinDraws);
     InterlockedExchangeAdd(&gWinSumUs, us > 100000 ? 100000 : us);  // capped: the sum stays far inside a LONG
     if (us > gWinMaxUs) InterlockedExchange(&gWinMaxUs, us);
+    // A slow draw names its part (the first 30 of a run). Nothing here calls the window manager any more (the watcher
+    // thread above), so what is left is this thread's own work and Direct3D: its lock, the driver, a layer hooked into
+    // the device.
+    if (us >= kSlowUs && InterlockedIncrement(&gSlowDraws) <= 30) {
+        const double k = 1000.0 / (double)(fq.QuadPart ? fq.QuadPart : 1);
+        Logger::Info("OVERLAYSLOW: a draw took %.1f ms on the render thread (#%ld): text and vertices %.1f, state block %.1f, states "
+                     "and draw call %.1f, state restore %.1f; %d vertices",
+                     (double)us / 1000.0, gSlowDraws, (double)(tBuilt.QuadPart - t0.QuadPart) * k,
+                     (double)(tBlock.QuadPart - tBuilt.QuadPart) * k, (double)(tDrawn.QuadPart - tBlock.QuadPart) * k,
+                     (double)(t1.QuadPart - tDrawn.QuadPart) * k, gN);
+    }
 }
 }  // namespace
 
@@ -591,8 +708,21 @@ void Capture(IDirect3DDevice9* dev) {
 extern "C" void __cdecl MK9R_OverlayDraw(IDirect3DDevice9* dev) {
     InterlockedIncrement(&gInFlight);
     FramePace::OnPresent();  // presented-frame intervals (PACE lines), drawn or not
-    if (dev && gWanted) LatencyProbe(dev);
-    if (dev && gWanted && InterlockedExchange(&gDisplayLogWanted, 0)) LogDisplay(dev);
+    if (dev && gWanted) {
+        LARGE_INTEGER a, b, fq;
+        QueryPerformanceCounter(&a);
+        LatencyProbe(dev);
+        QueryPerformanceCounter(&b);
+        QueryPerformanceFrequency(&fq);
+        const LONG us = (LONG)((b.QuadPart - a.QuadPart) * 1000000 / (fq.QuadPart ? fq.QuadPart : 1));
+        if (us >= kSlowUs && InterlockedIncrement(&gSlowProbes) <= 30)
+            Logger::Info("OVERLAYSLOW: the GPU queue probe took %.1f ms on the render thread (#%ld)", (double)us / 1000.0, gSlowProbes);
+    }
+    // The previous DISPLAY line is still with the watcher: this one waits a frame.
+    if (dev && gWanted && gDisplayLogWanted && !gDisplayReady) {
+        InterlockedExchange(&gDisplayLogWanted, 0);
+        CaptureDisplay(dev);
+    }
     if (gEnabled && dev) {
         if (!InterlockedExchange(&gFirstLogged, 1)) FirstCall(dev);
         if (gEnabled) Draw(dev);
@@ -639,6 +769,11 @@ bool Install() {
     if (!CodePatch::Write(kSite, kSiteBytes, call, 5, "RHIEndDrawingViewport pre-EndScene 0x00667106 (overlay)")) return false;
     InterlockedExchange(&gEnabled, 1);
     InterlockedExchange(&gWanted, 1);
+    if (!gWatchThread) {
+        if (!gWatchStop) gWatchStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (gWatchStop) gWatchThread = CreateThread(nullptr, 64u << 10, Watch, nullptr, 0, nullptr);
+        if (!gWatchThread) Logger::Info("OVERLAY: the watcher thread could not be started; F9 does not switch the display in this run");
+    }
     return true;
 }
 
@@ -652,6 +787,20 @@ void EnsureInstalled() {
 void Disable() {
     InterlockedExchange(&gWanted, 0);
     InterlockedExchange(&gEnabled, 0);
+    if (gWatchStop) SetEvent(gWatchStop);  // the watcher leaves its loop; Shutdown waits for it
+}
+
+void Shutdown() {
+    if (gWatchStop) SetEvent(gWatchStop);
+    if (gWatchThread) {
+        WaitForSingleObject(gWatchThread, 5000);  // it may be inside a window-manager call that is waiting
+        CloseHandle(gWatchThread);
+        gWatchThread = nullptr;
+    }
+    if (gWatchStop) {
+        CloseHandle(gWatchStop);
+        gWatchStop = nullptr;
+    }
 }
 
 long InFlight() { return gInFlight; }
@@ -679,16 +828,25 @@ void LogCounters() {
     // the whole run says nothing about the usual cost, one slow frame at the start sets it for the evening.
     const LONG wn = InterlockedExchange(&gWinDraws, 0), wsum = InterlockedExchange(&gWinSumUs, 0);
     const LONG wmax = InterlockedExchange(&gWinMaxUs, 0);
+    const LONG kn = InterlockedExchange(&gKeyPolls, 0), kmax = InterlockedExchange(&gKeyWinMaxUs, 0);
     Logger::Info("OVERLAY draws %ld, while resimulating %ld, max draw time %ld us, level %ld%s; HUD display: %ld of them, largest "
-                 "frame %ld vertices of %d, %ld rectangles dropped; since the last report %ld draws, average %ld us, max %ld us",
+                 "frame %ld vertices of %d, %ld rectangles dropped; since the last report %ld draws, average %ld us, max %ld us; "
+                 "slow draws %ld; F9 poll (own thread): %ld polls since the last report, longest %ld us, longest ever %ld us, "
+                 "%ld of %ld ms or more",
                  gDraws, gResimDraws, gMaxUs, gLevel, gEnabled ? "" : " (disabled)", gHudDraws, gHudMaxVerts, kMaxV, gHudDropped, wn,
-                 wn ? wsum / wn : 0, wmax);
+                 wn ? wsum / wn : 0, wmax, gSlowDraws, kn, kmax, gKeyMaxUs, gKeyWaits, kKeyWaitUs / 1000);
     const LONG n = InterlockedExchange(&gQueueFrames, 0), sum = InterlockedExchange(&gQueueSum, 0);
     const LONG mx = InterlockedExchange(&gQueueMax, 0), full = InterlockedExchange(&gQueueFull, 0);
     if (n)
         Logger::Info("GPUQUEUE: frames not yet finished by the GPU at EndScene: avg %.2f max %ld over %ld frames, ring full %ld "
                      "(maximum frame latency %ld, 0 = the game's %d)",
                      (double)sum / n, mx, n, full, gLatencyWanted, gLatencyDefault);
+}
+
+void SetSysWatch(bool on) {
+    InterlockedExchange(&gSysWatchWanted, on ? 1 : 0);
+    Logger::Info("SYSWATCH %d: Windows' announcements, the program in front and new windows are %s", on ? 1 : 0,
+                 on ? "written to this log (SYSEVENT lines)" : "not written");
 }
 
 void SetFrameLatency(int n) { InterlockedExchange(&gLatencyWanted, n < 0 ? 0 : n > 16 ? 16 : n); }

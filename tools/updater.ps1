@@ -1,27 +1,39 @@
 # Updates an installed netplay package from the GitHub repository's latest release.
-# The Play Online window (tools\netplay_gui.ps1) dot-sources this file; it also runs on its own:
+# The MK9 Rollback window (tools\netplay_gui.ps1) dot-sources this file; it also runs on its own:
 #   tools\updater.ps1 -Check            -> prints the installed and the latest version
 #   tools\updater.ps1 -Apply            -> installs the latest version if it is newer (the game must be closed)
 #   tools\updater.ps1 -Restore          -> puts the files of previous_version back (undoes the last update)
 #   tools\updater.ps1 -Apply -InstallRoot <folder>   (another installed copy, e.g. a test folder)
-# A release is a tag v<yyyyMMdd-HHmm> with two assets: MK9Rollback-netplay-<stamp>.zip and <zip>.sha256 (written by
-# tools\package.ps1, published by tools\publish_release.ps1). The zip is installed only if its SHA-256 matches, every
-# entry is a file a release holds ($kReleaseFiles) and it holds the same version. The install is all or nothing: the
-# files it replaces go to previous_version.new first, any failure puts them back, and only a complete install turns
-# previous_version.new into previous_version; version.txt is written last. "Go back to the previous version" in the
-# window (Restore-PreviousVersion) undoes it the same way.
-# Settings (build\clang\netplay_gui.txt) and logs are not in the zip and stay.
+# A release is a tag v<yyyyMMdd-HHmm> with two zips, each with a <zip>.sha256 (written by tools\package.ps1, published
+# by tools\publish_release.ps1):
+#   MK9-Rollback-<stamp>.zip          the package: what players download and what this updater installs. It has
+#                                     "MK9 Rollback.exe", the program that opens the window (since 2026-11).
+#   MK9Rollback-netplay-<stamp>.zip   the same without that program, for the updaters of the versions before 2026-11
+#                                     (up to v20261112-1447). They look for a zip of this name and refuse one with a
+#                                     file they do not know ($kLegacyReleaseFiles). After such an update the new
+#                                     window fetches the program from the package itself (Complete-Install).
+# A zip is installed only if its SHA-256 matches, every entry is a file a release holds ($kReleaseFiles) and it holds
+# the same version. The install is all or nothing: the files it replaces go to previous_version.new first, any failure
+# puts them back, and only a complete install turns previous_version.new into previous_version; version.txt is
+# written last. "Go back to the previous version" in the window (Restore-PreviousVersion) undoes it the same way.
+# The logs are not in the zip and stay.
 param([switch]$Check, [switch]$Apply, [switch]$Restore, [string]$InstallRoot = '')
 
 $kUpdateRepo = 'samuelndm/MK9Rollback'
 $kUpdateAgent = 'MK9Rollback-updater'
 # What a release zip may hold (tools\package.ps1 checks its own zip against this list), as paths with backslashes.
 $kReleaseFiles = @('^tools\\[^\\]+\.ps1$', '^build\\clang\\MK9Rollback\.dll$', '^build\\clang\\MK9RollbackInjector\.exe$',
-    '^docs\\[^\\]+\.md$', '^version\.txt$', '^README\.txt$', '^Play Online\.bat$')
+    '^docs\\[^\\]+\.md$', '^version\.txt$', '^README\.txt$', '^Play Online\.bat$', '^MK9 Rollback\.exe$')
 $kReleaseDirs = @('tools\', 'docs\', 'build\', 'build\clang\')
+# The list above as the versions before 2026-11 have it. Their updater installs a zip only when every entry passes
+# THEIR list, so the zip made for them must pass this copy of it (tools\package.ps1 checks). Never change it.
+$kLegacyReleaseFiles = @('^tools\\[^\\]+\.ps1$', '^build\\clang\\MK9Rollback\.dll$', '^build\\clang\\MK9RollbackInjector\.exe$',
+    '^docs\\[^\\]+\.md$', '^version\.txt$', '^README\.txt$', '^Play Online\.bat$')
+$kLauncherExe = 'MK9 Rollback.exe'   # opens the window
+$kOldLauncher = 'Play Online.bat'    # did so before 2026-11; an install that gets the program loses it
 # The files a release holds today, by name (tools\package.ps1 refuses to pack a file that is not listed here): the
-# ones the Play Online window unblocks when it opens (Unblock-PackageFiles).
-$kPackageFiles = @('Play Online.bat', 'README.txt', 'version.txt', 'build\clang\MK9Rollback.dll', 'build\clang\MK9RollbackInjector.exe',
+# ones the window unblocks when it opens (Unblock-PackageFiles).
+$kPackageFiles = @('MK9 Rollback.exe', 'README.txt', 'version.txt', 'build\clang\MK9Rollback.dll', 'build\clang\MK9RollbackInjector.exe',
     'tools\netplay.ps1', 'tools\netplay_gui.ps1', 'tools\launcher_lib.ps1', 'tools\updater.ps1', 'tools\launch_game.ps1',
     'docs\netplay_lan_test.md')
 
@@ -60,11 +72,22 @@ function Get-LatestRelease([int]$TimeoutSec = 8) {
     $tag = "$($r.tag_name)"
     if ($tag -notmatch '^v(\d{8}-\d{4})$') { $script:UpdateError = "unexpected release tag '$tag'"; return $null }
     $version = $Matches[1]  # now: the -match below replaces $Matches
-    $zip = $r.assets | Where-Object { $_.name -match '^MK9Rollback-netplay-\d{8}-\d{4}\.zip$' } | Select-Object -First 1
-    $sha = $r.assets | Where-Object { $_.name -eq "$($zip.name).sha256" } | Select-Object -First 1
-    if (-not $zip -or -not $sha) { $script:UpdateError = "release $tag has no zip and checksum"; return $null }
-    [pscustomobject]@{ Version = $version; Tag = $tag; ZipUrl = $zip.browser_download_url; ZipName = $zip.name
-        ShaUrl = $sha.browser_download_url; Page = $r.html_url; Notes = "$($r.body)" }
+    $rel = Select-ReleaseAssets $r.assets
+    if (-not $rel) { $script:UpdateError = "release $tag has no zip and checksum"; return $null }
+    [pscustomobject]@{ Version = $version; Tag = $tag; ZipUrl = $rel.Zip.browser_download_url; ZipName = $rel.Zip.name
+        ShaUrl = $rel.Sha.browser_download_url; Full = $rel.Full; Page = $r.html_url; Notes = "$($r.body)" }
+}
+
+# The zip to install among a release's assets (objects with name and browser_download_url) and its checksum file:
+# the package (Full = $true: it has "MK9 Rollback.exe"), else the zip made for the older updaters. $null: neither.
+function Select-ReleaseAssets($assets) {
+    foreach ($kind in @(@{ Re = '^MK9-Rollback-\d{8}-\d{4}\.zip$'; Full = $true }, @{ Re = '^MK9Rollback-netplay-\d{8}-\d{4}\.zip$'; Full = $false })) {
+        $zip = @($assets) | Where-Object { $_.name -match $kind.Re } | Select-Object -First 1
+        if (-not $zip) { continue }
+        $sha = @($assets) | Where-Object { $_.name -eq "$($zip.name).sha256" } | Select-Object -First 1
+        if ($sha) { return [pscustomobject]@{ Zip = $zip; Sha = $sha; Full = [bool]$kind.Full } }
+    }
+    $null
 }
 
 # Why the last Get-LatestRelease returned $null (read from the same scope it was written in, also in a runspace).
@@ -203,8 +226,12 @@ function Install-UpdateFromZip([string]$zipPath, [string]$shaText, [string]$root
         if (-not $complete) { & $say 'The download is not a complete package. Nothing was changed.'; return $false }
         $rels = @(Get-TreeFiles $x)
         $next = Join-Path $root 'previous_version.new'
+        # A zip that brings the program that opens the window takes the older "Play Online.bat" away (into the
+        # backup, so going back to the previous version returns it).
+        $remove = @()
+        if (($rels -contains $kLauncherExe) -and ($rels -notcontains $kOldLauncher)) { $remove = @($kOldLauncher) }
         try {
-            Invoke-FileSwap $x $rels $root $next
+            Invoke-FileSwap $x $rels $root $next $remove
         } catch {
             & $say "The update failed: $($_.Exception.Message). Your files are as they were."
             return $false
@@ -227,6 +254,20 @@ function Install-UpdateFromZip([string]$zipPath, [string]$shaText, [string]$root
     }
 }
 
+# A release's zip and the text of its .sha256, downloaded into $work. Throws when a download fails.
+function Save-ReleaseZip($release, [string]$work) {
+    $old = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'  # Windows PowerShell's progress bar slows the download a lot
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $zip = Join-Path $work $release.ZipName
+        Invoke-WebRequest -Uri $release.ZipUrl -OutFile $zip -UseBasicParsing -TimeoutSec 120 -Headers @{ 'User-Agent' = $kUpdateAgent }
+        $shaText = (Invoke-WebRequest -Uri $release.ShaUrl -UseBasicParsing -TimeoutSec 30 -Headers @{ 'User-Agent' = $kUpdateAgent }).Content
+    } finally { $ProgressPreference = $old }
+    if ($shaText -is [byte[]]) { $shaText = [Text.Encoding]::ASCII.GetString($shaText) }
+    [pscustomobject]@{ Zip = $zip; ShaText = "$shaText" }
+}
+
 # Downloads, checks and installs a release into $root. $say: a scriptblock taking one status line. Returns $true when
 # installed; the caller restarts the launcher.
 function Install-Update($release, [string]$root, [scriptblock]$say) {
@@ -235,21 +276,88 @@ function Install-Update($release, [string]$root, [scriptblock]$say) {
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     try {
         & $say "Downloading version $($release.Version)..."
-        $old = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'  # Windows PowerShell's progress bar slows the download a lot
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-            $zip = Join-Path $work $release.ZipName
-            Invoke-WebRequest -Uri $release.ZipUrl -OutFile $zip -UseBasicParsing -TimeoutSec 120 -Headers @{ 'User-Agent' = $kUpdateAgent }
-            $shaText = (Invoke-WebRequest -Uri $release.ShaUrl -UseBasicParsing -TimeoutSec 30 -Headers @{ 'User-Agent' = $kUpdateAgent }).Content
-        } finally { $ProgressPreference = $old }
-        if ($shaText -is [byte[]]) { $shaText = [Text.Encoding]::ASCII.GetString($shaText) }
-        return (Install-UpdateFromZip $zip "$shaText" $root $say $release.Version)
+        $got = Save-ReleaseZip $release $work
+        return (Install-UpdateFromZip $got.Zip $got.ShaText $root $say $release.Version)
     } catch {
         $status = 0
         try { $status = [int]$_.Exception.Response.StatusCode } catch { }
         if ($status -eq 403 -or $status -eq 429) { & $say 'GitHub is limiting downloads; try again in an hour. Nothing was changed.' }
         else { & $say "The download failed: $($_.Exception.Message). Nothing was changed." }
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# $true when $root holds $release's version without the program that opens the window, and the release has the
+# package to take it from: an install that a version before 2026-11 updated (its updater was given the zip without the
+# program, see the top of this file).
+function Test-InstallIncomplete($release, [string]$root) {
+    [bool]($release -and $release.Full -and $release.Version -and $release.Version -eq (Get-InstalledVersion $root).version -and
+        -not [System.IO.File]::Exists((Join-Path $root $kLauncherExe)))
+}
+
+# Adds the files of a package zip that $root does not have yet (the program that opens the window), nothing else: the
+# zip must be this install's own version with the same DLL, and no file that is there is replaced. "Play Online.bat"
+# then goes away. With a previous_version folder (the update that led here), the files added are noted in its
+# added_files.txt and the .bat moves into it, so "Go back to the previous version" returns the install as it was.
+# $shaText, $say as in Install-UpdateFromZip. Returns $true when the program is there afterwards.
+function Complete-InstallFromZip([string]$zipPath, [string]$shaText, [string]$root, [scriptblock]$say) {
+    if (-not $say) { $say = { param($s) } }
+    $want = ("$shaText".Trim() -split '\s+')[0].ToUpperInvariant()
+    $got = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($want -notmatch '^[0-9A-F]{64}$' -or $want -ne $got) { & $say 'The download is damaged (checksum mismatch). Nothing was changed.'; return $false }
+    $work = Join-Path $env:TEMP "mk9r-finish-$(Get-Random)"
+    $x = Join-Path $work 'x'
+    New-Item -ItemType Directory -Force -Path $x | Out-Null
+    $added = New-Object System.Collections.Generic.List[string]
+    try {
+        $refused = Expand-ReleaseZip $zipPath $x
+        if ($refused) { & $say "The download holds a file an update must not have ($refused). Nothing was changed."; return $false }
+        $have = Get-InstalledVersion $root
+        $v = Get-InstalledVersion $x
+        $dllHere = Join-Path $root 'build\clang\MK9Rollback.dll'
+        $same = $v.version -and $v.version -eq $have.version -and $v.dll -and [System.IO.File]::Exists($dllHere) -and
+            (Get-FileHash -LiteralPath $dllHere -Algorithm SHA256).Hash -eq $v.dll.ToUpperInvariant() -and
+            (Get-FileHash -LiteralPath (Join-Path $x 'build\clang\MK9Rollback.dll') -Algorithm SHA256).Hash -eq $v.dll.ToUpperInvariant()
+        if (-not $same -or -not [System.IO.File]::Exists((Join-Path $x $kLauncherExe))) { & $say 'The download is not this version''s package. Nothing was changed.'; return $false }
+        foreach ($rel in @(Get-TreeFiles $x)) {
+            $dest = Join-Path $root $rel
+            if ([System.IO.File]::Exists($dest)) { continue }
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+            [System.IO.File]::Copy((Join-Path $x $rel), $dest, $false)
+            $added.Add($rel)
+        }
+        $prev = Join-Path $root 'previous_version'
+        $bat = Join-Path $root $kOldLauncher
+        if (Test-Path -LiteralPath $prev) {
+            if ($added.Count) { [System.IO.File]::AppendAllLines((Join-Path $prev 'added_files.txt'), [string[]]$added.ToArray(), [System.Text.Encoding]::ASCII) }
+            if ([System.IO.File]::Exists($bat) -and -not [System.IO.File]::Exists((Join-Path $prev $kOldLauncher))) { [System.IO.File]::Copy($bat, (Join-Path $prev $kOldLauncher), $false) }
+        }
+        if ([System.IO.File]::Exists($bat)) { [System.IO.File]::Delete($bat) }
+        Unblock-PackageFiles $root ([string[]]$added.ToArray())
+        return $true
+    } catch {
+        # What this call added goes away again: the install stays as the older updater left it, and still opens.
+        foreach ($rel in $added) { try { [System.IO.File]::Delete((Join-Path $root $rel)) } catch { } }
+        & $say "It could not be added: $($_.Exception.Message)."
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Downloads $release's package and adds what $root lacks of it (Complete-InstallFromZip). Returns $true when done.
+function Complete-Install($release, [string]$root, [scriptblock]$say) {
+    if (-not $say) { $say = { param($s) } }
+    if (-not (Test-InstallIncomplete $release $root)) { return $false }
+    $work = Join-Path $env:TEMP "mk9r-finish-dl-$(Get-Random)"
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    try {
+        $got = Save-ReleaseZip $release $work
+        return (Complete-InstallFromZip $got.Zip $got.ShaText $root $say)
+    } catch {
+        & $say "The download failed: $($_.Exception.Message)."
         return $false
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

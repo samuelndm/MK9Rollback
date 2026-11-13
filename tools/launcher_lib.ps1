@@ -1,10 +1,9 @@
-# Pure functions of the Play Online window (tools\netplay_gui.ps1 dot-sources this file). Nothing here opens a window,
+# Pure functions of the MK9 Rollback window (tools\netplay_gui.ps1 dot-sources this file). Nothing here opens a window,
 # so tools\launcher_selftest.ps1 can check them with fixture data:
 #   Get-LauncherMessage    log line -> plain status line (the table of the DLL's log lines the window translates)
 #   Get-InjectorResult     MK9RollbackInjector.exe exit code -> message, retry or not
 #   Invoke-Injector / Get-InjectFailureText   runs the injector without ever throwing; why the mod was not loaded
 #   Move-SessionLogs       the last session's logs -> previous_logs, once per start
-#   ConvertTo-AccountId    a pasted friend code, SteamID64 or profile link -> Steam account ID
 #   New-HangWatch / Update-HangWatch     a game that stays frozen (not a stall it recovers from)
 #   New-ErrorWatch / Update-ErrorWatch   an error of a window handler is shown once, not at every timer tick
 #   Test-InstalledFiles    MK9Rollback.dll against version.txt's dll= hash
@@ -14,40 +13,42 @@
 #   New-LogScrubState / Protect-LogLine / Protect-LogFile / Save-LogsZip   logs for a public bug report
 #   New-MatchFacts / Update-MatchFacts / Format-MatchFacts   the window's "Last match" line
 #   Get-ConnectionHint     Wi-Fi or cable (slow: run it in the background)
+#   New-LogoBitmap         the mark (window icon, header, launcher\app.ico), and $script:UiColors
 # Windows PowerShell 5.1, ASCII only.
 
 # ---- log line -> status ----
 # First match wins; m = $null: matched but not shown. {1} {2}: the pattern's groups, {mode}: Rollback or Safe mode.
 # kind: 'desync' (shown once per fight), 'reset' (a new fight or session: a later desync is shown again).
 # check: run the update check (this mod is the older one).
+# h, t: the window's headline for this line and its tone (good, warn, bad, busy); none: the headline stays.
 $script:LauncherMessages = @(
     @{ p = 'NETPLAY armed'; m = $null },
     # Logged 5 s into a match whose opponent's mod never answered (rc25, OnlineMode Tick); the connection-end line is the
     # older DLLs' only trace of it.
-    @{ p = 'ONLINE: the opponent does not run the mod'; m = 'Your opponent is not running the mod: MK9''s own netcode plays this match. Send them the download link.' },
-    @{ p = 'ONLINE connection end: mod not engaged; the opponent''s mod last answered never'; m = $null },
-    @{ p = 'ONLINE: hooks not installed'; m = 'The online mode could not hook this game version. Use Local Versus instead.' },
-    @{ p = 'ONLINE auto: the game''s online opponent is'; m = 'Online fight found. Checking whether your opponent runs the mod...' },
+    @{ p = 'ONLINE: the opponent does not run the mod'; m = 'Your opponent is not running the mod: MK9''s own netcode plays this match. Send them the download link.'; h = 'Your opponent has no mod: MK9''s own netcode'; t = 'warn' },
+    @{ p = 'ONLINE connection end: mod '; m = $null; h = 'Ready in the game'; t = 'good' },
+    @{ p = 'ONLINE: hooks not installed'; m = 'The mod could not hook this game version, so MK9''s own netcode plays. Please save the logs and report it.'; h = 'The mod could not hook the game'; t = 'bad' },
+    @{ p = 'ONLINE auto: the game''s online opponent is'; m = 'Online fight found. Checking whether your opponent runs the mod...'; h = 'Opponent found: checking for the mod...'; t = 'busy' },
     @{ p = 'ONLINE auto: no opponent found yet'; m = $null },
     # The three version lines (one per disagreement) of the DLL's hello check.
-    @{ p = 'ONLINE: the other player''s mod is older'; m = 'Your opponent''s mod is older: they must press ''Check for updates'', then ''Update now''. MK9''s netcode plays this match.' },
-    @{ p = 'ONLINE: this mod is older than the other player''s'; m = 'Your mod is older than your opponent''s: close the game and press ''Update now''. MK9''s netcode plays this match.'; check = $true },
-    @{ p = 'ONLINE: the other player''s mod is a different build'; m = 'You and your opponent run different builds of the mod: both extract the same zip. MK9''s netcode plays this match.' },
+    @{ p = 'ONLINE: the other player''s mod is older'; m = 'Your opponent''s mod is older: they must press ''Check for updates'', then ''Update now''. MK9''s netcode plays this match.'; h = 'Your opponent needs to update'; t = 'warn' },
+    @{ p = 'ONLINE: this mod is older than the other player''s'; m = 'Your mod is older than your opponent''s: close the game and press ''Update now''. MK9''s netcode plays this match.'; check = $true; h = 'You need to update'; t = 'warn' },
+    @{ p = 'ONLINE: the other player''s mod is a different build'; m = 'You and your opponent run different builds of the mod: both extract the same zip. MK9''s netcode plays this match.'; h = 'You and your opponent need the same version'; t = 'warn' },
     @{ p = 'ONLINE: the other player''s game files differ'; m = 'Your game files differ from your opponent''s: both need the unmodified Steam Komplete Edition (Steam: Properties, Installed Files, Verify). MK9''s netcode plays this match.' },
     @{ p = 'ONLINE: the other player''s mod runs with other settings'; m = 'Your mod''s settings differ from your opponent''s: both close the game and start it from this window again. MK9''s netcode plays this match.' },
     @{ p = 'ONLINE: hello from the other player'; m = 'Your opponent''s mod answered: {mode} can take over.' },
-    @{ p = 'ONLINE: both games run MK9Rollback'; m = 'Both games run the mod.' },
-    @{ p = 'ONLINE: not engaging in this match'; m = 'This room is not a 1 vs 1 Player/Private match (King of the Hill or Ranked): MK9''s own netcode plays this match.' },
-    @{ p = 'ONLINE: the other player runs (Safe mode|Rollback), this game (Safe mode|Rollback)'; m = 'Your opponent uses {1}, you use {2}: both must pick the same setting. MK9''s netcode plays until you do.' },
+    @{ p = 'ONLINE: both games run MK9Rollback'; m = 'Both games run the mod.'; h = 'Both games run the mod'; t = 'good' },
+    @{ p = 'ONLINE: not engaging in this match'; m = 'This room is not a 1 vs 1 Player/Private match (King of the Hill or Ranked): MK9''s own netcode plays this match.'; h = 'Not a 1 vs 1 Player Match: MK9''s own netcode'; t = 'warn' },
+    @{ p = 'ONLINE: the other player runs (Safe mode|Rollback), this game (Safe mode|Rollback)'; m = 'Your opponent''s mod runs in {1} and yours in {2}: both must update MK9 Rollback and start the game from its window. MK9''s netcode plays until then.'; h = 'Your opponent''s mod is set up differently'; t = 'warn' },
     @{ p = 'ONLINE: the session starts at the first fight frame'; m = '{mode} takes over when this fight starts.'; kind = 'reset' },
     @{ p = 'ONLINE: the session starts at the next fight start'; m = 'This fight already started: {mode} takes over from the next fight.'; kind = 'reset' },
     @{ p = 'ONLINE: the fight ended; rollback re-armed'; m = 'Fight over. {mode} stays on for the next fight.' },
-    @{ p = 'ONLINE: this game controls player (\d)'; m = '{mode} on. You are player {1}.' },
+    @{ p = 'ONLINE: this game controls player (\d)'; m = '{mode} on. You are player {1}.'; h = 'Rollback is on'; t = 'good' },
     @{ p = 'ONLINE: input delay (\d) agreed'; m = 'Input delay this match: {1} frame(s).' },
     @{ p = 'ONLINE: input delay \d -> (\d) between rounds'; m = 'Input delay: {1} frames from this round (the ping changed).' },
-    @{ p = 'ONLINE: the match is over'; m = 'Match over. The results and rematch screens run on MK9''s netcode; {mode} takes over again at the next fight.' },
-    @{ p = 'ONLINE: rollback disengaged \(match over\)'; m = $null },
-    @{ p = 'ONLINE: rollback disengaged \((.*?)\);'; m = 'Back to MK9''s own netcode ({1}).' },
+    @{ p = 'ONLINE: the match is over'; m = 'Match over. The results and rematch screens run on MK9''s netcode; {mode} takes over again at the next fight.'; h = 'Ready in the game'; t = 'good' },
+    @{ p = 'ONLINE: rollback disengaged \(match over\)'; m = $null; h = 'Ready in the game'; t = 'good' },
+    @{ p = 'ONLINE: rollback disengaged \((.*?)\);'; m = 'Back to MK9''s own netcode ({1}).'; h = 'Ready in the game'; t = 'good' },
     @{ p = 'STEAM bridge: steam_api.dll interfaces unavailable'; m = 'Steam is not available to the game. Is Steam running and signed in?' },
     @{ p = 'NETPLAY: first fight frame'; m = 'Fight loaded. Waiting for your opponent to start the same fight...'; kind = 'reset' },
     @{ p = 'GGPO synchronized with peer'; m = 'Connected to your opponent.' },
@@ -55,13 +56,13 @@ $script:LauncherMessages = @(
     @{ p = 'NETPLAY environment matches'; m = 'Game files and mod version match your opponent''s.' },
     @{ p = 'NETPLAY ENVIRONMENT MISMATCH: (.*) differs'; m = 'Your setup differs from your opponent''s: {1}. Use the same mod version (''Check for updates'' at the bottom) and an unmodified game.' },
     @{ p = 'NETPLAY: frame 0 differs'; m = 'The two fights don''t match. Pick the same characters on the same sides, the same stage and settings, then fight again.' },
-    @{ p = 'NETPLAY DESYNC: frame (\d+)'; m = 'OUT OF SYNC at frame {1}: the two screens may now differ. Please save the logs after this fight.'; kind = 'desync' },
+    @{ p = 'NETPLAY DESYNC: frame (\d+)'; m = 'OUT OF SYNC at frame {1}: the two screens may now differ. Please save the logs after this fight.'; kind = 'desync'; h = 'Out of sync'; t = 'bad' },
     # 'desyncstop' (round 3): an online match's session stops once the two games stay different.
-    @{ p = 'NETPLAY: the two games went out of sync'; m = 'The two games went out of sync: the rest of this fight runs on MK9''s own netcode. Please save the logs after it.' },
+    @{ p = 'NETPLAY: the two games went out of sync'; m = 'The two games went out of sync: the rest of this fight runs on MK9''s own netcode. Please save the logs after it.'; h = 'Out of sync: MK9''s own netcode until the next fight'; t = 'bad' },
     @{ p = 'NETPLAY checksums: (\d+) frames matched the peer, (\d+) did not'; m = 'Fight over: {1} frames in sync, {2} out of sync.'; kind = 'reset' },
     @{ p = 'did not join within'; m = 'Your opponent''s game did not join in time. This fight continues on MK9''s own netcode.'; rearm = $true },
     @{ p = 'NETPLAY: the session could not start'; m = 'The connection to your opponent could not be set up (a network port may be in use). This fight continues on MK9''s own netcode.'; rearm = $true },
-    @{ p = 'the other player disconnected'; m = 'Your opponent disconnected. The rest of this fight continues on MK9''s own netcode; the next fight tries again.' },
+    @{ p = 'the other player disconnected'; m = 'Your opponent disconnected. The rest of this fight continues on MK9''s own netcode; the next fight tries again.'; h = 'Your opponent disconnected'; t = 'warn' },
     # A crash: the first line of the DLL's report (src\debug\CrashLog.cpp), so the message comes once per crash. Its
     # other "CRASH?" lines and the "HANG?" lines are matched and not shown: the watchdog writes "HANG? game thread N
     # stalled >3s" and one line per thread and window (48 lines in the field log of 2026-11-11) for a stall the game
@@ -69,20 +70,20 @@ $script:LauncherMessages = @(
     # windows (a dialog, class #32770: a C runtime error, a GGPO assertion; the game stands still behind it), and a game
     # that stays frozen, which the window itself sees by asking Windows whether the game's window still answers
     # (Update-HangWatch below).
-    @{ p = 'CRASH\? code='; m = 'The mod reported a crash. Please save the logs.' },
-    @{ p = 'HANG\?   window [0-9A-Fa-f]+ class ''#32770'''; m = 'The game stopped at an error box (it may be hidden behind the game). Please save the logs.' },
+    @{ p = 'CRASH\? code='; m = 'The mod reported a crash. Please save the logs.'; h = 'The mod reported a crash'; t = 'bad' },
+    @{ p = 'HANG\?   window [0-9A-Fa-f]+ class ''#32770'''; m = 'The game stopped at an error box (it may be hidden behind the game). Please save the logs.'; h = 'The game stopped at an error box'; t = 'bad' },
     @{ p = 'CRASH\?|HANG\?'; m = $null },
     @{ p = 'GGPO p2p stopped'; m = $null; rearm = $true }  # each fight is one session; arm the next one
 )
 
-# $null when no entry matches; else Text ($null: not shown), Rearm, Kind, CheckUpdate, Pattern.
+# $null when no entry matches; else Text ($null: not shown), Rearm, Kind, CheckUpdate, Head, Tone, Pattern.
 function Get-LauncherMessage([string]$line, [string]$mode = 'Rollback') {
     foreach ($e in $script:LauncherMessages) {
         $m = [regex]::Match($line, $e.p)
         if (-not $m.Success) { continue }
         $text = $null
         if ($e.m) { $text = $e.m.Replace('{1}', $m.Groups[1].Value).Replace('{2}', $m.Groups[2].Value).Replace('{mode}', $mode) }
-        return [pscustomobject]@{ Text = $text; Rearm = [bool]$e.rearm; Kind = "$($e.kind)"; CheckUpdate = [bool]$e.check; Pattern = $e.p }
+        return [pscustomobject]@{ Text = $text; Rearm = [bool]$e.rearm; Kind = "$($e.kind)"; CheckUpdate = [bool]$e.check; Head = "$($e.h)"; Tone = "$($e.t)"; Pattern = $e.p }
     }
     $null
 }
@@ -117,16 +118,31 @@ function Get-InjectorResult([int]$code) {
 # Runs "<exe> inject" and never throws: Started = $false with Error (a sentence for the player) when the file is gone
 # (antivirus quarantine) or Windows refuses to start it (blocked). Else Code is the exit code and Output what it printed.
 function Invoke-Injector([string]$exe) {
-    $ErrorActionPreference = 'Continue'  # here only: with 'Stop' the injector's stderr lines would be thrown
     $r = [pscustomobject]@{ Started = $false; Code = -1; Output = ''; Error = '' }
     if (-not [System.IO.File]::Exists($exe)) {
         $r.Error = 'MK9RollbackInjector.exe is missing (often removed by antivirus). Restore it from quarantine or extract the zip again, then add the folder to the exclusions.'
         return $r
     }
     try {
-        $r.Output = (& $exe inject 2>&1 | Out-String)
-        $r.Code = $LASTEXITCODE
-        $r.Started = $true
+        # Started without a window and with its output read here: the window's PowerShell has no console of its own
+        # ("MK9 Rollback.exe" starts it that way), and a console program started plainly from it could open one.
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.Arguments = 'inject'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        try {
+            $out = $p.StandardOutput.ReadToEndAsync()
+            $err = $p.StandardError.ReadToEndAsync()
+            # The injector gives up by itself after 15 s; one that hangs past a minute is stopped (exit code -1: retried).
+            if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch { }; [void]$p.WaitForExit(5000) }
+            $r.Output = "$($out.Result)$($err.Result)"
+            $r.Code = $p.ExitCode
+            $r.Started = $true
+        } finally { $p.Dispose() }
     } catch {
         $e = $_.Exception
         if ($e.InnerException) { $e = $e.InnerException }
@@ -160,22 +176,6 @@ function Move-SessionLogs([string]$dir, [bool]$retry = $false) {
         $old | Move-Item -Destination $prevLogs -Force -ErrorAction SilentlyContinue
     }
     Get-ChildItem -LiteralPath $dir -Filter 'MK9Rollback*.log' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-}
-
-# ---- friend codes ----
-# What the player pasted -> the Steam account ID (32 bits), or 0. Taken: the friend code (the account ID in digits), the
-# 17-digit SteamID64 of a player's account, or a profile link that ends in one. Anything else is refused: until
-# 2026-11-12 every digit of the text was strung together, so "at 9, my code is 123" was taken as the code 9123.
-$script:SteamIdBase = [uint64]76561197960265728
-function ConvertTo-AccountId([string]$text) {
-    $s = "$text".Trim()
-    if ($s -match '^(?:https?://)?(?:www\.)?steamcommunity\.com/profiles/(\d{17})(?:[/?#].*)?$') { $s = $Matches[1] }
-    if ($s -notmatch '^\d{1,17}$') { return [uint64]0 }
-    $v = [uint64]0
-    if (-not [uint64]::TryParse($s, [ref]$v)) { return [uint64]0 }
-    if ($v -gt $script:SteamIdBase) { $v = $v - $script:SteamIdBase }
-    if ($v -ge 1 -and $v -lt 4294967296) { return $v }
-    [uint64]0
 }
 
 # ---- a frozen game ----
@@ -423,7 +423,9 @@ function Get-PrivacyNote($state) {
         '  127.0.0.1 (this PC) and 0.0.0.0 were kept, and so were version numbers.',
         '',
         "Replaced: $($c.SelfId + $c.PeerId) Steam ID(s) ($($state.PeerN) other player(s)), $($c.Ip) IP address(es) ($($state.LanN) home, $($state.IpN) internet), $($c.User) user name(s), $($c.Pc) PC name(s).",
-        'Nothing else was changed.'
+        'Nothing else was changed. Kept as written: the file names of programs on this PC (like dwm.exe) and the',
+        'names of their window types, which MK9 Rollback notes when Windows announces a change, when a window appears',
+        'and when the game stalls. It never notes a window''s title or a folder.'
     )
 }
 
@@ -517,4 +519,81 @@ function Get-ConnectionHint {
         if ("$($a.PhysicalMediaType)" -eq 'Native 802.11' -or "$($a.PhysicalMediaType)" -eq 'Wireless LAN') { return 'You are on Wi-Fi: a cable gives steadier fights.' }
     } catch { }
     ''
+}
+
+# ---- the mark (window icon, header, and launcher\app.ico through tools\make_icon.ps1) ----
+# Drawn here, not loaded from a file, so the window has it on every install, also one that an older version's updater
+# brought (its allow-list takes no image file). A dark tile with a counter-clockwise arrow ("roll back") in the accent
+# colours, and a 9 inside from 32 px up. Returns a 32-bit bitmap of $size x $size; the caller disposes it.
+$script:UiColors = @{
+    Bg = '#0F1114'; Panel = '#171A1F'; Field = '#1C2026'; Border = '#2B3038'; Text = '#E8EAED'; Muted = '#9AA3AF'
+    Accent = '#F26B1D'; AccentHot = '#FF8534'; AccentDown = '#D4570F'; AccentA = '#FFB020'; AccentB = '#F0442C'
+    Good = '#3CCB7F'; Warn = '#FFB020'; Bad = '#FF5A52'; Idle = '#6B7380'
+}
+function New-LogoBitmap([int]$size) {
+    Add-Type -AssemblyName System.Drawing
+    $ss = if ($size -ge 128) { 2 } else { 4 }
+    $n = $size * $ss
+    $big = New-Object System.Drawing.Bitmap($n, $n, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($big)
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+        # the tile
+        $m = [single]($n * 0.03); $w = [single]($n - 2 * $m); $d = [single]($w * 0.46)
+        $tile = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $tile.AddArc($m, $m, $d, $d, 180, 90); $tile.AddArc($m + $w - $d, $m, $d, $d, 270, 90)
+        $tile.AddArc($m + $w - $d, $m + $w - $d, $d, $d, 0, 90); $tile.AddArc($m, $m + $w - $d, $d, $d, 90, 90)
+        $tile.CloseFigure()
+        $all = New-Object System.Drawing.RectangleF(0, 0, $n, $n)
+        $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($all, [System.Drawing.ColorTranslator]::FromHtml('#262A32'),
+            [System.Drawing.ColorTranslator]::FromHtml('#101216'), [single]90)
+        $g.FillPath($bg, $tile)
+        $edge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(70, 255, 255, 255), [single][Math]::Max(1, $n * 0.012))
+        $g.DrawPath($edge, $tile)
+        # the arrow: an open ring, its head at the upper left pointing counter-clockwise
+        $small = $size -lt 32
+        $stroke = [single]($n * $(if ($small) { 0.135 } else { 0.105 }))
+        $rad = [single]($n * $(if ($small) { 0.265 } else { 0.275 }))
+        $cx = [single]($n * 0.5); $cy = [single]($n * 0.515)
+        $hot = New-Object System.Drawing.Drawing2D.LinearGradientBrush($all, [System.Drawing.ColorTranslator]::FromHtml($script:UiColors.AccentA),
+            [System.Drawing.ColorTranslator]::FromHtml($script:UiColors.AccentB), [single]55)
+        $pen = New-Object System.Drawing.Pen($hot, $stroke)
+        $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Flat; $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $a0 = 262.0   # where the ring starts (degrees, clockwise from the right; 270 is the top)
+        $g.DrawArc($pen, [single]($cx - $rad), [single]($cy - $rad), [single](2 * $rad), [single](2 * $rad), [single]$a0, [single]292)
+        $t = $a0 * [Math]::PI / 180
+        $bx = $cx + $rad * [Math]::Cos($t); $by = $cy + $rad * [Math]::Sin($t)       # the middle of the head's base
+        $nx = [Math]::Cos($t); $ny = [Math]::Sin($t)                                   # outward
+        $tx = [Math]::Sin($t); $ty = -[Math]::Cos($t)                                  # counter-clockwise
+        $hw = $stroke * 1.25; $hl = $stroke * 1.55
+        $head = [System.Drawing.PointF[]]@(
+            (New-Object System.Drawing.PointF([single]($bx + $nx * $hw), [single]($by + $ny * $hw))),
+            (New-Object System.Drawing.PointF([single]($bx - $nx * $hw), [single]($by - $ny * $hw))),
+            (New-Object System.Drawing.PointF([single]($bx + $tx * $hl), [single]($by + $ty * $hl))))
+        $g.FillPolygon($hot, $head)
+        if (-not $small) {
+            $font = New-Object System.Drawing.Font('Segoe UI', [single]($n * 0.27), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+            $fmt = New-Object System.Drawing.StringFormat
+            $fmt.Alignment = [System.Drawing.StringAlignment]::Center; $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+            $white = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml('#F4F5F7'))
+            $g.DrawString('9', $font, $white, (New-Object System.Drawing.RectangleF(0, [single]($n * 0.02), $n, $n)), $fmt)
+            $font.Dispose(); $fmt.Dispose(); $white.Dispose()
+        }
+        $tile.Dispose(); $bg.Dispose(); $edge.Dispose(); $hot.Dispose(); $pen.Dispose()
+    } finally { $g.Dispose() }
+    $out = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g2 = [System.Drawing.Graphics]::FromImage($out)
+    try {
+        $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g2.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g2.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $wrap = New-Object System.Drawing.Imaging.ImageAttributes
+        $wrap.SetWrapMode([System.Drawing.Drawing2D.WrapMode]::TileFlipXY)   # no dark fringe at the edges
+        $g2.DrawImage($big, (New-Object System.Drawing.Rectangle(0, 0, $size, $size)), 0, 0, $n, $n, [System.Drawing.GraphicsUnit]::Pixel, $wrap)
+        $wrap.Dispose()
+    } finally { $g2.Dispose(); $big.Dispose() }
+    $out
 }

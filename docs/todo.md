@@ -14,7 +14,91 @@ Do not use `dist\MK9Rollback-netplay-20261028-0107.zip`: its regression had a cu
 **Latest zip for players (2026-11-03): `dist\MK9Rollback-netplay-20261103-2313.zip`** (DLL EE8A69D4…, rollback gate
 and lag_ns80_d2 passed; fixes below).
 
-**2026-11-12 rc33, the latest release (v20261112-1447, DLL A23E54EC; source in 42b79d1): rc31 plus trace lines for the
+**2026-11-12 the launcher: "MK9 Rollback.exe" instead of "Play Online.bat", a window without options, and the fix for
+the window that stayed invisible after "Update now".** Made in the side folder `MK9R_launch` (on 944e794) and merged
+into this working tree at 21:57 on the user's "Yes, merge" (uncommitted, next to the stall fix and SysWatch;
+`build\clang\MK9 Rollback.exe` built with `build.ps1 -LauncherOnly`, rc34's DLL and injector untouched; the self-test
+passes here, 98 of 98). Gated together with rc34 on 2026-11-13 00:41 and released 01:03 as v20261113-0041 (last
+bullets); the source is not committed.
+- The fault: the versions up to v20261112-1447 restart after an update with `Start-Process powershell -WindowStyle
+  Hidden`. Windows applies that request to the first window the new process shows, which is the form itself: the
+  window runs invisible, keeps the one-window mutex, and every new start answers "already open". Seen on the user's PC
+  (the 1447 window of the 20:46 update: present, `Visible = False`).
+- The fix has three parts. (1) The script shows itself when it was started hidden (`ShowSelf -OnlyIfHidden`), which is
+  what an update from an older version runs. (2) Its own restart goes through the program, or through PowerShell with
+  `CreateNoWindow` and no hidden request. (3) A second start asks the open window to come to the front through a named
+  event; an older version's window has no event, so it is found by title and class among PowerShell's windows and
+  shown, also when it is hidden. Only when that fails a box says it is already open and how to end it in Task Manager.
+- `launcher\Launcher.cpp` -> `MK9 Rollback.exe` (x86, no console, icon, file details, asInvoker manifest; built by
+  `build.ps1`, alone with `-LauncherOnly`): starts Windows PowerShell with `CREATE_NO_WINDOW` on
+  `tools\netplay_gui.ps1`, shows a small "Starting" card until the window is up, says what PowerShell printed when the
+  window cannot open, and says to extract the zip when it is alone in a folder.
+- The window: dark, one Play button, a status headline with a coloured dot, a banner with "Update now" when a release
+  is newer. Nothing to choose: it always sends `netcode rollback`, `overlay 1`, `online auto ping`, and sends them
+  again (3 times at most) when the DLL does not echo them within 5 s; after that the button reads TRY AGAIN. Removed:
+  Safe mode, the fixed input delay, the network display choice, Local Versus with friend codes, `netplay_gui.txt`.
+- Two zips per release (`tools\package.ps1`, `tools\publish_release.ps1`): `MK9-Rollback-<stamp>.zip` with the
+  program (what players download, what the new updater installs) and `MK9Rollback-netplay-<stamp>.zip` without it.
+  The updaters up to 1447 look for the second name and refuse a zip holding a file they do not know (checked with the
+  released 1447 updater: it refuses the package, takes the other). The window installed that way then fetches the
+  program from the package (`Complete-Install`), moves `Play Online.bat` into `previous_version` and notes the program
+  in `added_files.txt`, so "Go back to the previous version" returns the older version exactly.
+- Checked on one PC: `tools\launcher_selftest.ps1` 97 of 97. With test-only instance names (`MK9R_LAUNCHER_TEST`): a
+  hidden start shows itself; a second start through the program and through the script restores the open window and
+  starts no second one; an older hidden window (a stand-in) is revealed by both; the start card shows. The released
+  v20261112-1447 zip, updated by its own updater to a test package: every file in place, the program fetched, the
+  window opened by it, and "Go back" returning 1447 file for file.
+- One real start, 2026-11-12 23:00, on the user's "Yes, test Play" (`results\launcher_play_20261112\`): a package made
+  from `build\clang` (rc34's DLL and the program; its zips were not kept) was extracted and "MK9 Rollback.exe" opened
+  as by a double-click. The window was up after 1 s with the dark title bar and its version; Play started the game
+  through Steam, "Mod loaded." came 20 s later, the DLL echoed `netcode rollback`, `overlay 1` and `online auto ping`
+  once each (no repeat needed), hooks installed, no CRASH? or HANG? line. With the game closed the window said so and
+  showed PLAY again; a second start opened no second window; the window closed. The live update lookup against
+  today's latest release (1447, which has only the older zip) answers correctly (not newer, nothing to finish). The
+  user's stuck hidden 1447 window was ended first (22:58).
+- Seen while driving the window from outside: Windows' UI Automation shows its controls as plain panes with their
+  texts (no button or edit roles), so a screen reader reads the texts but not the roles. Whether the window before
+  this work was the same is not known.
+- Not verified: Windows 10. What SmartScreen says to the unsigned program (expected: the
+  same "Windows protected your PC" as for any unsigned download; only code signing removes it). The msvc branch of
+  `build.ps1` does not build the program. The antivirus on this PC (Kaspersky) let the program and the window run; it
+  blocked a test helper of mine that was compiled with PrintWindow and PostMessage, calls the window does not make.
+- For a gate: `build\clang\MK9 Rollback.exe` must exist before `tools\package.ps1` runs (`build.ps1` builds it with
+  the DLL). The gate does not press Play in the window (its menu walk arms the game itself); the real start above
+  covers that part.
+- **The gate passed, 2026-11-13 00:09-00:41, on the user's "Yes, run the gate"** (rc34's DLL DFF13147 in `build\clang`
+  and `build\clang2`, this tree's launcher files; `results\gate_20261113_rc34.txt`, the runs' outputs and game logs
+  kept in `results\gate_20261113_rc34_logs\`): the online smoke; three two-game runs of three fights each (plain,
+  auto re-arm with 3 re-arms per game, 21 delay changes), every checksum report matching, no failed save, no crash,
+  no cut session; the menu walk with 305 key presses, no hang or crash. Checked before it: no game, no launcher
+  window, the PC unlocked; the package's files and its three binaries scanned for personal data (only the project's
+  GitHub address, the SteamID base constant and the log scrubber's own patterns); `src\` equal to rc34's manifest
+  (its 8 differences are the launcher's files); the self-test, 98 of 98. First gate through the new
+  `tools\package.ps1`: `dist\MK9-Rollback-20261113-0041.zip` (11 files, SHA-256 6BAC4C11...) and
+  `dist\MK9Rollback-netplay-20261113-0041.zip` (10 files, no program, no .bat; SHA-256 B9CD5FCF...). Every entry
+  equals this tree's file (DLL DFF13147, injector 5668B2CF, program 6EE9EDC5) and both `.sha256` files match.
+- Seen in that gate's logs, none of it a failure: the slowed game B has one hitch of 380-404 ms at each fight's first
+  frame (387 ms in the stopped gate, 384 ms in the 11-04 run) and four KEYWAIT lines (the F9 poll, on its own thread,
+  waited 55-269 ms for the window manager; the longest at 00:13:45, between fights); game A has none. Other sessions
+  were building and running host tests during the gate (`MK9R_logrotate`, `MK9R_stagescreen`; their
+  `logger_test.exe` is in a KEYWAIT line's processor-time list).
+- **Released 2026-11-13 01:03 as v20261113-0041 (Latest) on the user's "Yes, publish".** Four assets: the package,
+  the zip for the older updaters and their `.sha256` files; downloaded back, all four equal the gated files. The tag
+  sits on 944e794: the release's source is this tree's uncommitted work (the stall fix, SysWatch, the launcher) and
+  is not pushed yet. `README.txt` in the zip calls the program's source public, so that push is owed (the user was
+  asked). The notes name the program and the window without options, the fix, the F9 key read and the Windows event
+  log (which does not remove the stalls yet), how an update from an earlier version goes, the SmartScreen prompt,
+  testing on one PC, no online match through the new window, and that both players must update.
+- The update path against that real release, 01:10 (a copy of the released 1447 zip in a temporary folder, the window
+  with test-only instance names): the 1447 updater finds v20261113-0041, picks `MK9Rollback-netplay-<stamp>.zip`,
+  downloads and installs it; the new window, started hidden the way the 1447 window restarts, shows itself and
+  fetches the program from the package by itself (2 s later it was there, without an internet-zone mark; "Play
+  Online.bat" in `previous_version`); "MK9 Rollback.exe" then hands over to the open window; "Go back" returns 1447
+  file for file. The same passed without a window (the updater's calls in a child process). A first attempt at 01:05
+  stopped at the old updater's "Close the game first" (another session's test game was running) and changed nothing.
+- Not done: an online match through the new window; committing and pushing the source (needs the user's yes).
+
+**2026-11-12 rc33, the release before v20261113-0041 (v20261112-1447, DLL A23E54EC; source in 42b79d1): rc31 plus trace lines for the
 stage and the rematch.** Logging only, the first step of the stage-pick and re-fight features: in a connected
 one-on-one online session the log gets `ONLINEFLOW` lines with values for script natives 670, 671, 672, 1178, 1179,
 1375, 1259 and 1224-1227, `ONLINEMSG` lines for game message 9 "GameSettings" (sent, received) and 10 "ReadyState"
@@ -1687,7 +1771,8 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
           background read of those files at the match's start would hide it (which files: not known yet).
         - Player's PC, 147-238 ms outside boundary, world tick and engine tick in 5 of 22 matches (18:50:17, 18:52:22,
           18:57:39, 19:38:42, 19:39:20; 1.4-39 s before the session's end, no fixed offset), and the friend's game
-          waited 137-176 ms each time. Not explained; rc29's 120 ms sampling shows the stack next time.
+          waited 137-176 ms each time. Worked on 2026-11-12, entry "Stalls of 150-240 ms near a match's end": the
+          render thread waited for the window manager's lock; what held that lock is still not known.
         - "MK9's connection went N ms without a packet" printed 2,210,859 ms and counting on the player's game (a
           socket that never receives): noise. Now a gap counts only on a socket that has ever had a packet
           (OnlineMode.cpp `IdleSocketReceived`); one that received and then stopped still counts, as before.
@@ -2084,14 +2169,155 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
         57% of that evening's): one STARTSYNC line per game and start with the measured one-way trip, whether a
         BALANCE give still follows a start when one PC is the slower one, and how the HUD display looks in a real
         online match.
-      - The audit's other findings, by gain for the risk (none started): the player's 147-238 ms stalls at round ends
-        (lead: the overlay's draw time, 199 ms in the interval of one stall; rc29's stall sampler should name it);
+      - The audit's other findings, by gain for the risk (the first is the next entry, the others not started): the
+        player's 147-238 ms stalls at round ends (lead: the overlay's draw time, 199 ms in the interval of one stall);
         the display path (both PCs fullscreen with vertical sync on, the DISPLAY note never shown by the launcher);
         0-3 ms of arrival margin at delay 1 inside the phase search's deadband (margin-driven phase control, or
         sampling and sending a few ms before the boundary); polling and rolling back in the limiter's idle wait;
         rollback cost (about 90% of the 11.8 MB master image copied per save and load is free sub-heap space); the
         delay chosen from arrival margins instead of the frame-quantized hello ping; smaller ones (game-thread
         priority, a re-poll after a rollback, loss counters, checksum batching).
+    - **Stalls of 150-240 ms near a match's end (the audit's second finding), 2026-11-12: rc31's F9 key poll is where
+      its frame waits, and taking the poll off the render thread does not shorten the stall. The change and the event
+      log built after it (SysWatch, below) were made in the side checkout `D:\Projects\MK9\MK9R_stall2` (on 3f3ce52;
+      DLL 42E40572 in `build\clang_stall2`) and merged into this tree on 2026-11-12 20:40 on the user's "Merge and
+      gate" as rc34 (DLL DFF13147 in `build\clang_rc34`). Its first gate was stopped at 20:49 in the second check and
+      has no verdict; a full gate passed on 2026-11-13 00:09-00:41 together with the new launcher (the launcher entry
+      near the top has it, `results\gate_20261113_rc34.txt`) and it was released 01:03 as v20261113-0041; the source
+      is not committed.**
+      - What the field logs had (2026-11-11, the player's PC, 5 stalls of 147-238 ms): in two of them 183 and 199 ms
+        lay inside the overlay's timed draw (frames of 197 and 218 ms), the engine tick under 1 ms. Up to rc31
+        `Overlay::Draw` calls `GetAsyncKeyState(VK_F9)` once per frame on MKKE's render thread, at display level 0
+        too ("Network display: Off" does not remove it). That call enters the kernel's window manager and waits for
+        its lock, which every program of the desktop session shares.
+      - The wait, shown on this PC: `tests\host\winlock_probe.cpp` (`run.ps1 -Only winlock`; not in the default
+        list, because it stalls every program for the length of each hold; it refuses to start while MKKE runs) keeps
+        the window manager busy with SetWindowRgn on a transparent window: a region of 800,000-2,400,000 one-pixel
+        rectangles replaced by one over half the rows costs 80-95 ms on an idle PC and 90-188 ms beside running
+        games (2.8 million are refused). GetAsyncKeyState in another thread waits as long; GetForegroundWindow and
+        PeekMessage on an empty queue do not.
+      - The change: the key is read every 25 ms on a thread of the overlay's own ("the watcher", `src\debug\
+        Overlay.cpp`). `src\debug\KeyEdge.h` turns the readings into presses, also one shorter than a poll and one
+        that falls into a long wait (`tests\host\keyedge_test.cpp`, 12 checks, default list). The watcher also writes
+        the monitor part of the DISPLAY line, so the render thread makes no window-manager call any more. New log
+        lines: KEYWAIT (a key poll of 50 ms or more, the first 30) and OVERLAYSLOW (a draw of 20 ms or more, with the
+        time of each part); the OVERLAY line gained the poll's counters. `Overlay::Shutdown()` ends the thread at
+        unload (`dllmain.cpp`).
+      - Checked: the ten default host tests and the launcher's self-test pass. Inject, unload, inject, unload on a
+        running game: module gone each time, game alive 12 s later, threads 104 -> 100. **F9 itself was not pressed in
+        a game** (the harness cannot press it; the press logic is covered by its host test only).
+      - Two games on this PC, rc31 (FB5EEBE8) against the change: stages 7,1,15,23 at ns15 d1, `stallsample 50`, a
+        hold every 3 s during the fights (the window manager busy 98-188 ms each; `results\scenarios\h31b_*` and
+        `hfixb_*` in the side checkout).
+        - rc31: every hold inside a session is a HITCH on both games (24 of 24 each, 73-171 ms, median 90 and 96),
+          and the overlay's draw takes 99-170 ms in those frames. Samples: the render thread in win32u's
+          NtUserGetAsyncKeyState called from MK9Rollback.dll+29E10 (112-117 of 123-145 samples a game), the game
+          thread in the render fence.
+        - The change: the draw stays under 5 ms and KEYWAIT lines show the watcher waiting 75-148 ms instead, **but
+          every hold is still a HITCH (26 of 26 each, 78-154 ms, median 94 and 97).** The render thread now waits
+          inside Present. Game A: the NVIDIA driver's wait (96 samples), the Steam overlay's PostMessageA (22), the
+          Steam overlay's GetDpiForMonitor (3). Game B: Direct3D 9's own question to the kernel whether it still owns
+          the display, asked at every Present (NtGdiDdDDIQueryVidPnExclusiveOwnership, 89), PostMessageA (23),
+          GetDpiForMonitor (9). The game thread is sometimes in NtUserPeekMessage.
+        - The same pair without holds (`h31_*`, `hfix_*`; the holder's region had been refused): alike, no frame of
+          100 ms, longest draw 4-5 ms; the key poll's longest call 0.3 ms at 31-33 polls a second.
+        - NETPLAY DESYNC lines in these runs are the harness's intro ones (frame 0 of the second stage, ten lines in
+          the first 200 frames of a later one), in both builds, with holds and without. No crash, no GGPO assertion.
+      - One game alone, fullscreen and in front, against the stand-in opponent (`noai_rollback.ps1 -P2P -Delay 1`,
+        `s31_single_A.log`, `sfix_single_A.log`): rc31 29 of 29 holds a HITCH, 66-166 ms (median 85); the change 29 of
+        29, 69-138 ms (median 86), draw 0 ms, KEYWAIT 67-130 ms. The render thread under the change: Direct3D 9's
+        display-ownership question (101 of 147 samples), the Steam overlay's PostMessageA (26), the NVIDIA driver's
+        wait (4). No desync line in either.
+      - So a fullscreen Direct3D 9 game stops for as long as another program holds the window manager, with the mod
+        or without it; rc31's poll is only the first of several waiters in the frame. The change removes the mod's
+        own waiter and one kernel call per frame, and makes a stall name itself (a KEYWAIT line carries the wait's
+        length). It does not make a stall shorter.
+      - **What held the window manager on the player's PC is not known, but Windows logged the same thing at the
+        start of all five stalls.** Event log `Microsoft-Windows-UniversalTelemetryClient/Operational`, event 61
+        (Windows' telemetry service writing down the battery-saver state, which it does when it is told that the
+        power status changed): 18:50:16.884, 18:52:22.432, 18:57:38.985, 19:38:42.470, 19:39:20.280, each 0-10 ms
+        before the stalled frame began. Each is followed by another 2.0-7.3 s later, and the field log has a second,
+        smaller HITCH there in 4 of 5 (41-55 ms). 18 such events in that hour, the others outside fights. At
+        19:38:42-47 an app-package deployment also ran (AppXDeployment-Server, services installed, firewall rules).
+        - On 2026-11-12 the event appears at every start and every close of a game (103 that day) and at 10:33:39.6 /
+          40.0 / 41.1, where the rc31 gate logged its 52.7 ms draw (both game threads in d3d9's window hook). None
+          falls into a session with deliberate holds: the holder stands in for the cause, it is not the cause.
+        - The PC is a laptop (ASUS ROG Strix G614JV, on AC, battery kept at 80%, NVIDIA GPU, 1920x1200 at 165 Hz).
+          Candidates, none checked: a display or GPU-switch event, a charging-state change, a popup or toast taking
+          the display from the fullscreen game for a moment, a background app update. Windows' battery history
+          (`powercfg /batteryreport`) is too coarse to tell: on AC the whole evening, charge 80% at 18:24 and 79% at
+          22:07, no entry in between.
+        - **Built the same evening (user: "Yes, build it"): `src\debug\SysWatch.cpp` / `.h`, started and stopped by
+          the overlay's watcher thread, writes SYSEVENT lines** so that the next KEYWAIT has its likely cause beside
+          it. It only listens, on a listener thread of its own that sleeps in GetMessage: a hidden top-level window
+          that is never shown (broadcasts do not reach message-only windows), ten power-setting registrations, the
+          effective power mode (powrprof, looked up at run time), and two out-of-context event hooks. Lines: power status (mains, battery percent, charging), power settings (source,
+          percent, battery saver, energy saver, display and monitor state, plan personality, lid, user presence),
+          effective power mode (game mode among them), display mode / device / setting changes, theme, clock, low
+          memory, a registered broadcast's name ("TaskbarCreated" is Explorer restarting); the program that comes to
+          the front, minimize / restore, Alt+Tab, a desktop switch; each window of another program that appears
+          (program, class, size). After a KEYWAIT a second line lists the programs by processor time (total and
+          kernel ms) since the last reading, which the watcher takes once a second while a session runs (2.3-2.6 ms
+          a reading on this PC). Only program file names and window class names are written: no title, no path.
+          At most 40 lines in 10 s and 3000 a run. While it runs the key poll is made at display level 0 too (it
+          then only measures). 'syswatch 0' turns all of it off (default 1).
+        - Host test `tests\host\syswatch_test.cpp` (34 checks, default list): each announcement sent to the hidden
+          window gives its line, another program's new window is named, the processor-time list names a program that
+          worked 300 ms, a flood is cut and counted, Stop leaves no window and no class, a second Start / Stop. Not
+          covered: a real foreground change, and the guard against a parameter that is not a readable address
+          (Windows reads such a parameter on the sender's side). The eleven default host tests pass. All ten power
+          settings and the effective power mode report on this PC ("max performance" at the desk, "game mode" as
+          soon as MK9 is in front: one thing that does change at every game start and end).
+        - **The first build (9AC3546F) kept the window and the hooks on the watcher thread itself, which then waited
+          with MsgWaitForMultipleObjects, and the one-game run with holds (`results\scenarios\sys_single_A.log`,
+          18:40-18:48) showed what that costs: 1 KEYWAIT in 108 holds instead of one per hold.** A thread that waits
+          for messages waits for the window manager when its wait ends, so the timed key poll after it found the
+          window manager free again. The one KEYWAIT (113.1 ms) had the right second line: "winlock_probe.exe 109
+          (kernel 109)" next to MKKE.exe's 140, and the holder's window had its "a window appeared" line. Hence the
+          listener thread; the watcher is back to its plain timed wait.
+        - **With the listener thread (DLL 812FBE80 in `build\clang_stall3`, side checkout, linked with ggpo_rc30),
+          the same one-game run, 19:46-19:53: a KEYWAIT at every hold until the 30-line limit, each followed by its
+          program line, and all 30 program lines name winlock_probe.exe (in 21 it is first, or second after
+          MKKE.exe).** 29 of 29 holds inside sessions are a HITCH as before (66-152 ms: the log does not shorten a
+          stall either), the draw stays under 1 ms, the key poll runs at its old rate, no crash, no GGPO assertion,
+          no desync line. SYSEVENT lines of the run: the ten power settings and "effective power mode: game mode" at
+          the start, and the holder's window when it appeared. Inject / unload / inject / unload on a running game
+          after it: module gone both times, game alive 12 s later, threads 105 -> 100 and 106 -> 101, a "SYSWATCH:
+          stopped" line at each unload.
+        - Not seen in those two runs: a real announcement during a fight (nothing changed on the PC while they ran),
+          a real foreground change, and the whole thing on two PCs.
+        - **Merged and built as rc34, 2026-11-12 20:40 (the user's "Merge and gate"; nothing committed):** the side
+          checkout's files copied into this tree, `build.ps1` and `tests\host\run.ps1` merged by hand with rc33's
+          FlowTrace / 'flow' additions. `tools\launcher_lib.ps1`: the PRIVACY.txt of a log zip now says that the file
+          names of programs and the names of their window types are kept as written (the scrubbing does not touch
+          them). `build\clang_rc34`: DLL DFF13147, injector 5668B2CF, linked with `build\ggpo_rc30\libggpo.a`; its
+          `source_manifest.txt` covers what rc33's did (188 files: 7 changed, 6 new). The twelve default host tests
+          and the launcher self-test (86) pass on the merged tree (`results\hosttests_rc34.txt`,
+          `results\selftest_rc34.txt`); DLL, injector and the changed files scanned for personal data, clean.
+          `build\clang` / `build\clang2` hold rc34 since 20:46 (rc33's binaries: `build\clang_rc33`).
+        - **rc34's gate has no verdict (20:46-20:49, `results\gate_20261112_rc34.txt`):** the online smoke passed;
+          in the first fight of the two-instance regression the gate's three script hosts ended with exit code 1 a
+          few seconds after 20:49:49, without a verdict line and without closing their two games. What was on the
+          desktop is in the games' own SYSEVENT lines: the game minimized at 20:47:50 with another program in front,
+          Task Manager in front at 20:49:31 and its menu open at 20:49:49 (exit code 1 is what its "End task"
+          leaves). The user's own Play Online window (a release folder outside this tree) had been opened at
+          20:46:05, 21 s before the gate started 40 minutes after its go-ahead: the check before a gate looked for
+          games and harness scripts only. It now also refuses to start while a Play Online window is open. The two
+          games played on alone (three scripted fights) until closed at 20:53:39; their logs are
+          `results\scenarios\gate34_stopped_A.log` / `_B.log`: no checksum mismatch, no assertion, no KEYWAIT;
+          hitches as in the earlier gates of the day (A only at session ends, 50 and 58 ms; B, on one core at below
+          normal, 40-54 ms and 380-388 ms at session ends; rc33's gate: A 54-88, B 332-418 ms at session ends).
+        - **The first real desktop events in a log (that stopped run): 126 SYSEVENT lines in six minutes on game A,
+          the limiter never reached.** Foreground changes with program and window class (explorer.exe, claude.exe,
+          WindowsTerminal.exe, Taskmgr.exe, SystemSettings.exe, a mouse vendor's agent), "a window was minimized",
+          "the display mode changed: 1920x1200, 32 bits", and the effective power mode going from "max performance
+          (4)" to "game mode (5)" 270 ms after the game's window came to the front and back to 4 in the same
+          millisecond another program did. None of them came with a key-poll wait of 50 ms or more, and game A logged
+          no hitch at any of them (it was minimized for most of the run). Still not seen: a stall with a real cause,
+          an announcement during a fight in front, anything on two PCs.
+      - The first probe ran at 13:17:05-13:17:10 while another session's gate fight was running (no check for games
+        before it): the 39-42 ms overlay draws both of that gate's games logged then are the probe's. The probe's
+        runner and the batch scripts now refuse to start beside a game.
     - **net8 (84C59BBF: peer-seen 150 ms first-round retry, rayqfix in P2P, render-thread samples; `results\scenarios\
       net8*`, 02:22-03:07, 18 fights, `stallsample 30`): 0 crashes; desyncs only the known harness ones** (DeadPool
       intro frames 176-279 in 4 of 6, PitDay frame 0 in 3 of 6); all 6 Graveyard fights clean. Handshake medians as

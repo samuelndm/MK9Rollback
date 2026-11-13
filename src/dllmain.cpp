@@ -109,6 +109,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     Snapshot::StopPageWarmer();
     ParallelMem::Stop();
     CrashLog::StopWatchdog();
+    Overlay::Shutdown();  // its watcher thread (the F9 key) must be gone before the module is
     CrashLog::Uninstall();
     Logger::Info("[MK9Rollback] ===== unload =====");
     Logger::Close();

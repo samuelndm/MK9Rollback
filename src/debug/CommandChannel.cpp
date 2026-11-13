@@ -1373,6 +1373,8 @@ void Execute(const std::string& line) {
         Rollback::SetStartBarrier(value != 0);
     } else if (!strcmp(verb, "startsync") && sscanf(line.c_str(), "startsync %d", &value) == 1) {
         Rollback::SetStartSync(value != 0);
+    } else if (!strcmp(verb, "syswatch") && sscanf(line.c_str(), "syswatch %d", &value) == 1) {
+        Overlay::SetSysWatch(value != 0);
     } else if (!strcmp(verb, "desyncstop") && sscanf(line.c_str(), "desyncstop %d", &value) == 1) {
         Rollback::SetDesyncStop(value);
     } else if (!strcmp(verb, "handshakepoll") && sscanf(line.c_str(), "handshakepoll %d", &value) == 1) {

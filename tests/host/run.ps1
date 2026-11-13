@@ -1,5 +1,5 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,codewrite,strappend,guardpage,hud,ggpo,logger] [-Seconds 25]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,codewrite,strappend,guardpage,hud,keyedge,syswatch,ggpo,logger] [-Seconds 25]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
 #   finisher  src\net\FinisherRule.h: the frame where a session is handed back to MK9's netcode in the finisher phase;
@@ -21,6 +21,12 @@
 #           sizes and twelve canned states: whole rectangles inside the picture, none dropped, gone half a second after
 #           the state ends, hidden with the game's HUD, a full buffer reported and never overrun; the build time of a
 #           frame and of the faces. Each case is also drawn into build\hosttests\hud\hud_<size>_<state>.bmp.
+#   keyedge  src\debug\KeyEdge.h: one press of F9 is one switch of the display, whatever the overlay's 25 ms polls of
+#           the key see of it (held with auto-repeat, shorter than a poll interval, made while a poll waited, old).
+#   syswatch  src\debug\SysWatch: what Windows announces (power, display, device, setting changes; posted to its hidden
+#           window only) becomes SYSEVENT lines, another program's new window is named by program and class, the
+#           processor-time list names a program that worked, a flood of events is cut, Stop leaves nothing behind
+#           (about 12 s).
 #   ggpo   the patched GGPO library (tools\build_ggpo.ps1) against a hand-made remote on 127.0.0.1 (ggpo_raw_peer.cpp):
 #           a valid 60 Hz session with malformed datagrams of every kind in between; after each kind the peer must still
 #           take the stream. Needs a library with the round 3 exports (ggpo_bye_on_close, ggpo_bind_failed). Then the
@@ -31,12 +37,16 @@
 #           other threads suspended, children killed and exiting mid-burst (about a minute, and a few hundred MB of logs
 #           under build\hosttests\logger, deleted afterwards); then the exits again in a build that drops frame-log
 #           lines early, for the report of dropped lines.
+#   winlock  NOT in the default list (-Only winlock): winlock_probe.cpp keeps the window manager busy three times (about
+#           60-100 ms each on the PC it was written on) and shows that GetAsyncKeyState in another thread waits as long
+#           while PeekMessage on an empty queue and GetForegroundWindow do not: why the overlay reads the F9 key on a
+#           thread of its own. Every program on the PC waits with it, so it refuses to start while MKKE runs.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'), [int]$Seconds = 25)
+      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'ggpo', 'logger'), [int]$Seconds = 25)
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'ggpo', 'logger'
+$known = 'hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'ggpo', 'logger', 'winlock'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -107,7 +117,7 @@ function RunSmall([string]$name, [string]$title, [string[]]$sources, [string[]]$
         return $false
     }
     $lines = @(Get-Content $log)
-    $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm|^largest frame' } | ForEach-Object { Write-Host "  $_" }
+    $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm|^largest frame|^hold \d|^no hold|^note: ' } | ForEach-Object { Write-Host "  $_" }
     return $p.ExitCode -eq 0 -and ($lines -contains 'ALL CHECKS PASSED')
 }
 
@@ -137,6 +147,29 @@ if ($Only -contains 'hud') {
     $ok = RunSmall 'hud_test' 'HUD display: rectangles, fades, sizes' @((Join-Path $PSScriptRoot 'hud_test.cpp'),
                    (Join-Path $root 'src\debug\Hud.cpp')) @() 120 @('-lgdi32') @((Join-Path $out 'hud'))
     if (-not $ok) { $failed += 'hud' }
+}
+
+if ($Only -contains 'keyedge') {
+    $ok = RunSmall 'keyedge_test' 'F9 presses from polls of the key' @((Join-Path $PSScriptRoot 'keyedge_test.cpp')) @('-I', (Join-Path $root 'src\debug')) 30
+    if (-not $ok) { $failed += 'keyedge' }
+}
+
+if ($Only -contains 'syswatch') {
+    $ok = RunSmall 'syswatch_test' 'system events log: announcements, new windows, processor time' @((Join-Path $PSScriptRoot 'syswatch_test.cpp'),
+                   (Join-Path $root 'src\debug\SysWatch.cpp')) @('-I', (Join-Path $root 'src\debug')) 60
+    if (-not $ok) { $failed += 'syswatch' }
+}
+
+if ($Only -contains 'winlock') {
+    # Only when asked for (-Only winlock): during its holds every program on the PC waits for the window manager, a
+    # running game too. It shows which calls wait (winlock_probe.cpp; why the overlay reads F9 on a thread of its own).
+    if (Get-Process MKKE -ErrorAction SilentlyContinue) {
+        Write-Host '== window manager lock: NOT RUN, MKKE is running and would stall with it'
+        $failed += 'winlock'
+    } else {
+        $ok = RunSmall 'winlock_probe' 'window manager lock: which calls wait for it' @((Join-Path $PSScriptRoot 'winlock_probe.cpp')) @() 60 @('-lwinmm', '-lgdi32')
+        if (-not $ok) { $failed += 'winlock' }
+    }
 }
 
 if ($Only -contains 'ggpo') {

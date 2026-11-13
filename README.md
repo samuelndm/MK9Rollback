@@ -6,15 +6,16 @@ players run the mod, and leaves every other match (and Ranked) to the game's own
 
 ## Play
 
-1. Download the latest zip from [Releases](../../releases/latest) and extract it anywhere. Start Steam.
-2. Double-click **Play Online.bat**. (If Windows says it protected your PC: "More info", then "Run anyway".)
-3. Press **Play**. The window starts the game with the mod.
+1. Download **MK9-Rollback-(date).zip** from [Releases](../../releases/latest) and extract it anywhere. Start Steam.
+2. Open **MK9 Rollback.exe**. (If Windows says it protected your PC: "More info", then "Run anyway"; the program is
+   not signed by a company, its source is in `launcher/`.)
+3. Press **Play**. The window starts the game with the mod. There is nothing to set up.
 4. In the game: Online > Player Match, a 1 vs 1 room. Against another player who started the game the same way,
    rollback takes over at the fight start (under the round timer the game shows three connection bars, green is good,
    yellow so-so, red bad, then the ping, R for the frames rolled back and D for the input delay). F9 switches to a
-   line with every number and back; the window's "Network display" box picks In the HUD, Detailed or Off.
+   line with every number and back.
 
-Both players need the same version. The Play Online window checks for a new release when it opens; press
+Both players need the same version. The MK9 Rollback window checks for a new release when it opens; press
 **Update now** (with the game closed) to install it; **Go back to the previous version** undoes the last update. If
 something goes wrong, press "Save logs to the Desktop" and attach the zip to an issue, from both players (send yours
 together with your opponent's). The zip replaces Steam IDs, IP addresses and your Windows user and PC names first;
@@ -36,8 +37,7 @@ The window has a "Having trouble?" button with the same list:
 ## What it does
 
 - Rollback with GGPO, input delay picked from the ping (1 frame up to a 50 ms ping, 2 at a normal one, up to 6) and
-  adjusted between rounds; a PC too slow for the extra replays of 1 frame moves to 2 by itself. The launcher can fix it
-  at 0-3 frames instead (the larger choice of the two players is used).
+  adjusted between rounds; a PC too slow for the extra replays of 1 frame moves to 2 by itself.
 - Whole-game snapshots each frame (fighters, effects, stage cinematics, script state) restored on a misprediction.
 - Checks against desyncs: per-frame gameplay checksums compared with the other player, a build/content fingerprint at
   the session start.
@@ -48,16 +48,23 @@ The window has a "Having trouble?" button with the same list:
   1 frame of delay on a ~25 ms link in the two-game tests).
 - Low latency on the game's side: the controllers are read after the game's frame wait, the input is sent the moment
   it is read, and no snapshot is taken of a frame whose remote input has already arrived.
-- "Safe mode": delay-based lockstep instead of rollback.
+- A delay-based lockstep mode instead of rollback stays in the DLL for testing (`tools\netplay.ps1`); the window
+  always plays rollback.
 
 ## Build
 
 ```powershell
-.\build.ps1                       # DLL + injector with clang (llvm-mingw in ..\tools)
+.\build.ps1                       # DLL, injector and "MK9 Rollback.exe" with clang (llvm-mingw in ..\tools)
+.\build.ps1 -LauncherOnly         # only "MK9 Rollback.exe" (launcher\Launcher.cpp)
 .\tools\build_ggpo.ps1            # the patched GGPO static library (from third_party\ggpo-*)
-.\tools\package.ps1               # dist\MK9Rollback-netplay-<stamp>.zip (+ .sha256)
+.\tools\package.ps1               # dist\MK9-Rollback-<stamp>.zip, what players download (+ .sha256), and
+                                  # MK9Rollback-netplay-<stamp>.zip, which versions before 2026-11 update through
 .\tools\publish_release.ps1 <zip> # GitHub release v<stamp> that the players' updater finds
 ```
+
+"MK9 Rollback.exe" is a small program with the icon and file details of its own that opens the window
+(`tools\netplay_gui.ps1`, Windows PowerShell with Windows Forms) without a console; `tools\launcher_selftest.ps1`
+checks the window's helpers, the updater and the program.
 
 Releases are published only after the release checks (`tools\queued_checks.ps1`: two-game netplay regressions, delay
 changes, re-arming, an 8-minute menu walk). Scenario simulation across stages and network conditions:

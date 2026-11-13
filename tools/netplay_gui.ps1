@@ -1,25 +1,26 @@
-﻿# One-window netplay launcher for players ("Play Online.bat" starts it). Over Steam only: each player shares their
-# Steam friend code (the number on Steam's "Add a Friend" page), pastes the other's, and presses Play. The window then
-# starts the game, injects MK9Rollback, arms the session and translates the log into plain status lines.
-# Sides are chosen without asking: the lower friend code is player 1 (left side), on both PCs alike.
-# The same steps as tools\netplay.ps1, run from a timer so the window stays responsive.
-# Netcode: rollback unless the player ticks "Safe mode" (lockstep: no snapshots or loads). The default was Safe mode
-# until 2026-11-01, when the players chose rollback as the default ("focus on the lag, ping, rollback").
-# In the MK9 Online mode the input delay follows the ping ('online auto ping'): the two games measure the round trip
-# before the fight and both take the larger proposal (rollback 1-6 frames, Safe mode 2-3), then keep measuring and
-# adjust it between rounds.
-# The log-line table, the injector's exit codes, the log reader, the log privacy filter and the other pure helpers are
-# in tools\launcher_lib.ps1 (checked by tools\launcher_selftest.ps1). The update check, the download and saving the logs
-# run in background runspaces, polled by a timer, so the window never freezes on the network.
-#   -NoUpdateCheck       no update check when the window opens
-#   -SnapshotPng <file>  saves a picture of the window 2.5 s after it opens, then closes it (layout check)
-#   -StartCheck          exits at once with code 0: "Play Online.bat" runs this first, in its visible console, to learn
-#                        whether this PC runs the script at all (where a policy forbids scripts, PowerShell says so there)
-param([switch]$NoUpdateCheck, [string]$SnapshotPng = '', [switch]$StartCheck)
+# The MK9 Rollback window ("MK9 Rollback.exe" starts it; before 2026-11 a "Play Online.bat" did). One button: Play.
+# The window starts the game through Steam, injects MK9Rollback, tells it how to play and translates its log into
+# plain status lines. The same steps as tools\netplay.ps1, run from a timer so the window stays responsive.
+# Nothing to choose (2026-11, the player: "remove everything selectable, just make all default"): the game is always
+# told rollback, the network display in the fight's HUD (F9 in a fight switches to the detailed line and back) and
+# MK9's own Online mode with the input delay taken from the ping ('online auto ping': the two games measure the round
+# trip before the fight, both take the larger proposal, and adjust it between rounds). The boxes this window had
+# until then (Safe mode, a fixed input delay, the display, the older Local Versus mode with friend codes) are gone;
+# the DLL still knows those commands (tools\netplay.ps1 and the test harness use them).
+# The log-line table, the injector's exit codes, the log reader, the log privacy filter, the mark and the other pure
+# helpers are in tools\launcher_lib.ps1 (checked by tools\launcher_selftest.ps1). The update check, the download and
+# saving the logs run in background runspaces, polled by a timer, so the window never freezes on the network.
+#   -NoUpdateCheck         no update check when the window opens
+#   -SnapshotPng <file>    saves a picture of the window, then closes it (layout check). The window is then shown
+#                          off the screen and without taking the keyboard, and does not count as the open window.
+#   -SnapshotState <name>  with -SnapshotPng: what the picture shows (idle, starting, running, update, failed)
+#   -StartCheck            exits at once with code 0 (the "Play Online.bat" of the versions before 2026-11 runs this
+#                          first, in its console, to learn whether this PC runs the script at all)
+param([switch]$NoUpdateCheck, [string]$SnapshotPng = '', [switch]$StartCheck, [string]$SnapshotState = 'idle')
 if ($StartCheck) { exit 0 }
 
-# Started hidden ("Play Online.bat"), so nothing may fail silently. A PC that forces PowerShell's Constrained Language
-# Mode (company or school policy, some security software) cannot run this window at all: say so in Notepad.
+# Started without a console, so nothing may fail silently. A PC that forces PowerShell's Constrained Language Mode
+# (company or school policy, some security software) cannot run this window at all: say so in Notepad.
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     $errFile = Join-Path $env:TEMP 'MK9Rollback-launcher-error.txt'
     Set-Content -Path $errFile -Value @('MK9 Rollback cannot open its window on this PC.',
@@ -31,7 +32,7 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 # Any error that stops this script: written to %TEMP%\MK9Rollback-launcher-error.txt and shown.
 trap {
     $errFile = Join-Path $env:TEMP 'MK9Rollback-launcher-error.txt'
-    $msg = "The Play Online window stopped because of an error:`r`n`r`n$($_.Exception.Message)`r`n$($_.InvocationInfo.PositionMessage)"
+    $msg = "The MK9 Rollback window stopped because of an error:`r`n`r`n$($_.Exception.Message)`r`n$($_.InvocationInfo.PositionMessage)"
     try { Set-Content -LiteralPath $errFile -Value $msg -Encoding ascii } catch { }
     $shown = $false
     try {
@@ -44,22 +45,46 @@ trap {
 }
 $ErrorActionPreference = 'Continue'
 
-# Declared before any window exists: Windows then draws the window sharp at 125-200 % display scaling instead of
-# stretching a blurry bitmap (the controls are scaled by AutoScaleMode Dpi below).
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+# Windows calls and a form that can be shown without taking the keyboard (the layout picture). Every use below is
+# guarded: where this cannot be compiled (a blocked compiler), the window still opens, plainer.
 try {
     if (-not ('MK9R.Native' -as [type])) {
-        Add-Type -Namespace MK9R -Name Native -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-[DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr hWnd);
-[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, IntPtr title);
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace MK9R {
+    public static class Native {
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int processId);
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr hWnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, IntPtr title);
+        [DllImport("user32.dll", EntryPoint = "FindWindowExW")] public static extern IntPtr NextWindow(IntPtr parent, IntPtr after, IntPtr className, IntPtr title);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder text, int max);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hWnd, int attribute, ref int value, int size);
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr hWnd, string app, IntPtr idList);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+    }
+    public class QuietForm : System.Windows.Forms.Form {
+        public bool NoActivate;
+        protected override bool ShowWithoutActivation { get { return NoActivate; } }
+    }
+}
 '@
     }
+    # Declared before any window exists: Windows then draws the window sharp at 125-200 % display scaling instead of
+    # stretching a blurry bitmap (the controls are scaled by AutoScaleMode Dpi below).
     [void][MK9R.Native]::SetProcessDPIAware()
+    # Its own button on the taskbar, with its own icon (without this it is grouped under Windows PowerShell's).
+    [void][MK9R.Native]::SetCurrentProcessExplicitAppUserModelID('MK9Rollback.Window')
 } catch { }
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 # An error inside a button or timer handler does not reach the trap above: Windows Forms catches it and shows its own
 # ".NET Framework" error box, again at every tick when a timer step fails. It goes to the status box instead
@@ -67,22 +92,66 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch { }
 [System.Windows.Forms.Application]::add_ThreadException({ param($source, $e) try { HandlerError $e.Exception } catch { } })
 
-# One window at a time: a second one would fight the first over the game and the command file.
-$script:mutex = New-Object System.Threading.Mutex($false, 'Local\MK9RollbackLauncher')
+# One window at a time: a second one would fight the first over the game and the command file. The window that is
+# already open is asked to come to the front (it watches $kShowEvent; "MK9 Rollback.exe" asks the same way).
+# (A self-test sets MK9R_LAUNCHER_TEST and gets names of its own, as in launcher\Launcher.cpp: it neither meets nor
+# disturbs the player's open window.)
+$kTestNames = if ($env:MK9R_LAUNCHER_TEST) { 'Test' } else { '' }
+$kWindowMutex = "Local\MK9RollbackLauncher$kTestNames"
+$kShowEvent = "Local\MK9RollbackLauncherShow$kTestNames"
+$script:mutex = $null
 $script:mutexOwned = $false
-try { $script:mutexOwned = $script:mutex.WaitOne(500) } catch [System.Threading.AbandonedMutexException] { $script:mutexOwned = $true }
-if (-not $script:mutexOwned) {
-    [void][System.Windows.Forms.MessageBox]::Show('The Play Online window is already open.', 'MK9 Rollback', 'OK', 'Information')
-    $first = Get-Process powershell, pwsh -ErrorAction SilentlyContinue |
-        Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'MK9 Rollback - Play Online*' } | Select-Object -First 1
-    if ($first) { try { [void][MK9R.Native]::ShowWindowAsync($first.MainWindowHandle, 9); [void][MK9R.Native]::SetForegroundWindow($first.MainWindowHandle) } catch { } }
-    exit 0
+$script:showEvent = $null
+if (-not $SnapshotPng) {
+    $script:mutex = New-Object System.Threading.Mutex($false, $kWindowMutex)
+    try { $script:mutexOwned = $script:mutex.WaitOne(500) } catch [System.Threading.AbandonedMutexException] { $script:mutexOwned = $true }
+    if (-not $script:mutexOwned) {
+        $asked = $false
+        try {
+            $ev = [System.Threading.EventWaitHandle]::OpenExisting($kShowEvent)
+            try { [void][MK9R.Native]::AllowSetForegroundWindow(-1) } catch { }
+            [void]$ev.Set()
+            $ev.Dispose()
+            $asked = $true
+        } catch { }
+        if (-not $asked) {
+            # An older version's window (it has no such event): found by its title among PowerShell's windows and
+            # brought to the front, also when it is invisible. (The versions before 2026-11 restarted hidden after
+            # "Update now" and then only answered "already open" to every new start.)
+            $shown = $false
+            try {
+                $others = @{}
+                foreach ($p in Get-Process powershell, pwsh -ErrorAction SilentlyContinue) { if ($p.Id -ne $PID) { $others[[uint32]$p.Id] = $true } }
+                $text = New-Object System.Text.StringBuilder 260
+                $h = [IntPtr]::Zero
+                for ($i = 0; $i -lt 20000 -and -not $shown; $i++) {
+                    $h = [MK9R.Native]::NextWindow([IntPtr]::Zero, $h, [IntPtr]::Zero, [IntPtr]::Zero)
+                    if ($h -eq [IntPtr]::Zero) { break }
+                    $owner = [uint32]0
+                    [void][MK9R.Native]::GetWindowThreadProcessId($h, [ref]$owner)
+                    if (-not $others.ContainsKey($owner)) { continue }
+                    [void]$text.Clear(); [void][MK9R.Native]::GetWindowText($h, $text, 260)
+                    if ("$text" -notlike 'MK9 Rollback*') { continue }
+                    [void]$text.Clear(); [void][MK9R.Native]::GetClassName($h, $text, 260)
+                    if ("$text" -notlike 'WindowsForms*') { continue }   # the window itself, not a message box of it
+                    if ([MK9R.Native]::IsIconic($h)) { [void][MK9R.Native]::ShowWindow($h, 9) }                      # SW_RESTORE
+                    elseif (-not [MK9R.Native]::IsWindowVisible($h)) { [void][MK9R.Native]::ShowWindow($h, 5) }     # SW_SHOW
+                    [void][MK9R.Native]::SetForegroundWindow($h)
+                    $shown = [MK9R.Native]::IsWindowVisible($h)
+                }
+            } catch { }
+            if (-not $shown) {
+                [void][System.Windows.Forms.MessageBox]::Show("MK9 Rollback is already open.`r`n`r`nIf you cannot see its window: open Task Manager (Ctrl+Shift+Esc), end `"Windows PowerShell`" there, then open MK9 Rollback again.", 'MK9 Rollback', 'OK', 'Information')
+            }
+        }
+        exit 0
+    }
+    try { $script:showEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $kShowEvent) } catch { }
 }
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $dir = Join-Path $root 'build\clang'
 $log = Join-Path $dir 'MK9Rollback.log'
-$settings = Join-Path $dir 'netplay_gui.txt'
 $kSteamBase = [uint64]76561197960265728
 $libPath = Join-Path $PSScriptRoot 'launcher_lib.ps1'
 $updaterPath = Join-Path $PSScriptRoot 'updater.ps1'
@@ -92,12 +161,13 @@ foreach ($p in @($libPath, $updaterPath)) { if (-not (Test-Path -LiteralPath $p)
 . $updaterPath
 . $libPath
 $installed = Get-InstalledVersion $root
+$kPowerShell = Join-Path $PSHOME 'powershell.exe'
 # Files extracted from a downloaded zip carry the internet zone mark; the injector and the DLL would then be blocked.
 # Only the release's own files, by name (updater.ps1 $kPackageFiles): the zip has no top folder, so this folder may be
 # the player's Downloads or Desktop, and the other files there keep their mark.
 Unblock-PackageFiles $root
-# The DLL writes its log, and this window its settings and commands, next to the DLL. A read-only folder (or one
-# guarded by Windows' ransomware protection, "Controlled folder access", e.g. under Documents) cannot work.
+# The DLL writes its log, and this window its commands, next to the DLL. A read-only folder (or one guarded by
+# Windows' ransomware protection, "Controlled folder access", e.g. under Documents) cannot work.
 $script:readOnly = $false
 if (Test-Path -LiteralPath $dir) {
     $probe = Join-Path $dir "write_test_$PID.tmp"
@@ -108,145 +178,297 @@ function MyAccountId {
     $u = (Get-ItemProperty 'HKCU:\Software\Valve\Steam\ActiveProcess' -ErrorAction SilentlyContinue).ActiveUser
     if ($u) { [uint64]$u } else { [uint64]0 }
 }
-# A friend code (account ID), a 17-digit SteamID64 or a profile link -> account ID; 0 for anything else (launcher_lib).
-function ParseCode([string]$s) { ConvertTo-AccountId $s }
-# Commands to the DLL (launcher_lib Send-LauncherCommand: a file still waiting is merged, not overwritten).
-function Cmd([string[]]$lines) {
-    if (-not (Send-LauncherCommand $dir $lines)) { Say 'Could not pass the command to the game (its folder is busy). Press the button again.' }
+# Commands to the DLL (launcher_lib Send-LauncherCommand: a file still waiting is merged, not overwritten). $false
+# when the file could not be placed; the caller sends again (the watch step, when the DLL's echo does not come).
+function Cmd([string[]]$lines) { [bool](Send-LauncherCommand $dir $lines) }
+
+# ---- colours ----
+# The dark look (launcher_lib $script:UiColors). With Windows' high-contrast setting on, the system's own colours.
+$kHighContrast = [System.Windows.Forms.SystemInformation]::HighContrast
+function Hex([string]$name) { [System.Drawing.ColorTranslator]::FromHtml($script:UiColors[$name]) }
+if ($kHighContrast) {
+    $sc = [System.Drawing.SystemColors]
+    $c = @{ Bg = $sc::Control; Panel = $sc::Control; Field = $sc::Window; Border = $sc::WindowFrame; Text = $sc::ControlText; Muted = $sc::ControlText
+        FieldText = $sc::WindowText; Accent = $sc::Highlight; AccentHot = $sc::Highlight; AccentDown = $sc::Highlight; OnAccent = $sc::HighlightText
+        Good = $sc::ControlText; Warn = $sc::ControlText; Bad = $sc::ControlText; Idle = $sc::ControlText; Link = $sc::HotTrack; LinkOff = $sc::GrayText
+        Quiet = $sc::Control; QuietText = $sc::GrayText; Running = $sc::Control; Banner = $sc::Info; BannerText = $sc::InfoText }
+} else {
+    $c = @{ Bg = Hex 'Bg'; Panel = Hex 'Panel'; Field = Hex 'Field'; Border = Hex 'Border'; Text = Hex 'Text'; Muted = Hex 'Muted'
+        FieldText = [System.Drawing.ColorTranslator]::FromHtml('#D5D9DF'); Accent = Hex 'Accent'; AccentHot = Hex 'AccentHot'; AccentDown = Hex 'AccentDown'
+        OnAccent = [System.Drawing.Color]::White; Good = Hex 'Good'; Warn = Hex 'Warn'; Bad = Hex 'Bad'; Idle = Hex 'Idle'
+        Link = [System.Drawing.ColorTranslator]::FromHtml('#B9C2CE'); LinkOff = [System.Drawing.ColorTranslator]::FromHtml('#5A626D')
+        Quiet = [System.Drawing.ColorTranslator]::FromHtml('#252A32'); QuietText = Hex 'Muted'
+        Running = [System.Drawing.ColorTranslator]::FromHtml('#17301F'); Banner = [System.Drawing.ColorTranslator]::FromHtml('#2B2113'); BannerText = Hex 'Text' }
+}
+function UiFont([single]$size, [switch]$Bold, [switch]$Semi) {
+    if ($Semi) { return New-Object System.Drawing.Font('Segoe UI Semibold', $size) }
+    if ($Bold) { return New-Object System.Drawing.Font('Segoe UI', $size, [System.Drawing.FontStyle]::Bold) }
+    New-Object System.Drawing.Font('Segoe UI', $size)
 }
 
 # ---- window ----
-$form = New-Object System.Windows.Forms.Form
+# Laid out at 96 DPI (100 %); ResumeLayout below scales every position and size to the display's DPI.
+$kVersionText = if ($installed.version) { "Version $($installed.version)" } else { 'Development copy' }
+$form = if ('MK9R.QuietForm' -as [type]) { New-Object MK9R.QuietForm } else { New-Object System.Windows.Forms.Form }
 $form.SuspendLayout()
-$form.Text = "MK9 Rollback - Play Online (version $(if ($installed.version) { $installed.version } else { 'unknown' }))"
-$form.ClientSize = New-Object System.Drawing.Size(460, 650)
-$form.FormBorderStyle = 'FixedDialog'
+$form.Text = 'MK9 Rollback'
+$form.ClientSize = New-Object System.Drawing.Size(460, 598)
+$form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
-$form.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-function Label($text, $x, $y, $w = 420, $h = 22) {
+$form.Font = UiFont 9.75
+$form.BackColor = $c.Bg
+$form.ForeColor = $c.Text
+function Place($control, $parent, $x, $y, $w, $h) {
+    $control.Location = New-Object System.Drawing.Point($x, $y)
+    $control.Size = New-Object System.Drawing.Size($w, $h)
+    $parent.Controls.Add($control)
+    $control
+}
+function Label($parent, [string]$text, $x, $y, $w, $h, $font = $null, $color = $null) {
     $l = New-Object System.Windows.Forms.Label
-    $l.Text = $text; $l.Location = New-Object System.Drawing.Point($x, $y); $l.Size = New-Object System.Drawing.Size($w, $h)
-    $form.Controls.Add($l); $l
+    $l.Text = $text
+    $l.UseMnemonic = $false
+    if ($font) { $l.Font = $font }
+    if ($color) { $l.ForeColor = $color }
+    Place $l $parent $x $y $w $h
 }
-function Button($text, $x, $y, $w, $h = 30) {
-    $b = New-Object System.Windows.Forms.Button
-    $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
-    $form.Controls.Add($b); $b
+function Link($parent, [string]$text, $x, $y, $w, [string]$align = 'MiddleLeft') {
+    $l = New-Object System.Windows.Forms.LinkLabel
+    $l.Text = $text
+    $l.TextAlign = $align
+    $l.LinkBehavior = 'HoverUnderline'
+    $l.LinkColor = $c.Link; $l.VisitedLinkColor = $c.Link; $l.ActiveLinkColor = $c.AccentHot; $l.DisabledLinkColor = $c.LinkOff
+    $l.TabStop = $true
+    Place $l $parent $x $y $w 22
+}
+function Rule($y) {
+    $r = New-Object System.Windows.Forms.Panel
+    $r.BackColor = $c.Border
+    Place $r $form 0 $y 460 1
+}
+$script:dpi = 96.0
+try { $g0 = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:dpi = [double]$g0.DpiX; $g0.Dispose() } catch { }
+function Scaled([int]$at96) { [int][Math]::Round($at96 * $script:dpi / 96.0) }
+# The two buttons are painted here, as a rounded block in the colours of their Tag (SetPlay changes them): Windows
+# Forms' own flat button frames the default button in its text colour and greys a disabled one's text, unreadable on
+# the dark look. With high contrast on, Windows draws them as usual.
+function StyleButton($b, [int]$radius = 6) {
+    $b.UseVisualStyleBackColor = $kHighContrast
+    $b.Tag = @{ Back = $c.Accent; Hot = $c.AccentHot; Down = $c.AccentDown; Fore = $c.OnAccent; Over = $false; Pressed = $false; Radius = $radius }
+    if ($kHighContrast) { return }
+    $b.FlatStyle = 'Flat'
+    $b.FlatAppearance.BorderSize = 0
+    $b.Add_MouseEnter({ param($s, $e) $s.Tag.Over = $true; $s.Invalidate() })
+    $b.Add_MouseLeave({ param($s, $e) $s.Tag.Over = $false; $s.Tag.Pressed = $false; $s.Invalidate() })
+    $b.Add_MouseDown({ param($s, $e) $s.Tag.Pressed = $true; $s.Invalidate() })
+    $b.Add_MouseUp({ param($s, $e) $s.Tag.Pressed = $false; $s.Invalidate() })
+    $b.Add_Paint({ param($s, $e) PaintButton $s $e.Graphics })
+}
+function RoundedPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
+    $d = [single](2 * $r)
+    $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $p.AddArc($x, $y, $d, $d, 180, 90); $p.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
+    $p.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90); $p.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
+    $p.CloseFigure()
+    $p
+}
+function PaintButton($b, $g) {
+    $t = $b.Tag
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $g.Clear($b.Parent.BackColor)
+    $fill = if ($t.Pressed) { $t.Down } elseif ($t.Over) { $t.Hot } else { $t.Back }
+    $r = [single](Scaled $t.Radius)
+    $path = RoundedPath 0 0 $b.Width $b.Height $r
+    $brush = New-Object System.Drawing.SolidBrush($fill)
+    $g.FillPath($brush, $path)
+    $brush.Dispose(); $path.Dispose()
+    # The keyboard's focus mark, once Windows shows such marks (after Tab or Alt): WM_QUERYUISTATE, UISF_HIDEFOCUS.
+    $marks = $false
+    try { $marks = $b.Focused -and (([int64][MK9R.Native]::SendMessage($b.Handle, 0x0129, [IntPtr]::Zero, [IntPtr]::Zero) -band 1) -eq 0) } catch { }
+    if ($marks) {
+        $in = [single](Scaled 3)
+        $ring = RoundedPath $in $in ($b.Width - 2 * $in) ($b.Height - 2 * $in) ([single][Math]::Max(1, $r - $in))
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(190, $t.Fore), [single]1)
+        $g.DrawPath($pen, $ring)
+        $pen.Dispose(); $ring.Dispose()
+    }
+    $flags = [System.Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, HidePrefix'
+    [System.Windows.Forms.TextRenderer]::DrawText($g, $b.Text, $b.Font, $b.ClientRectangle, $t.Fore, $flags)
 }
 
-# Controls of the Local Versus mode only (hidden in the MK9 Online mode, see UpdateMode).
-$codeControls = New-Object System.Collections.ArrayList
-[void]$codeControls.Add((Label '1. Send your code to your friend:' 20 15))
-$myBox = New-Object System.Windows.Forms.TextBox
-$myBox.Location = New-Object System.Drawing.Point(20, 40); $myBox.Size = New-Object System.Drawing.Size(200, 26)
-$myBox.ReadOnly = $true; $myBox.Font = New-Object System.Drawing.Font('Consolas', 12)
-$form.Controls.Add($myBox)
-$copy = Button '&Copy' 230 38 80
-[void]$codeControls.Add($myBox); [void]$codeControls.Add($copy)
+# The header: the mark, the name, what it is, and the installed version.
+$header = New-Object System.Windows.Forms.Panel
+$header.BackColor = $c.Panel
+[void](Place $header $form 0 0 460 84)
+$logo = New-Object System.Windows.Forms.PictureBox
+$logo.SizeMode = 'Zoom'
+$logo.BackColor = $c.Panel
+try { $logo.Image = New-LogoBitmap (Scaled 48) } catch { }
+[void](Place $logo $header 20 18 48 48)
+[void](Label $header 'MK9 Rollback' 80 13 240 32 (UiFont 16 -Semi) $c.Text)
+[void](Label $header 'Rollback netcode for Mortal Kombat Komplete Edition' 82 47 366 20 (UiFont 9) $c.Muted)
+$verLabel = Label $header $kVersionText 300 20 148 18 (UiFont 8.25) $c.Muted
+$verLabel.TextAlign = 'TopRight'
+[void](Rule 84)
 
-[void]$codeControls.Add((Label "2. Paste your friend's code:" 20 80))
-$peerBox = New-Object System.Windows.Forms.TextBox
-$peerBox.Location = New-Object System.Drawing.Point(20, 105); $peerBox.Size = New-Object System.Drawing.Size(200, 26)
-$peerBox.Font = New-Object System.Drawing.Font('Consolas', 12)
-$form.Controls.Add($peerBox)
-$side = Label '' 230 108 220
-[void]$codeControls.Add($peerBox); [void]$codeControls.Add($side)
-# MK9 Online needs no codes (the mod finds the opponent in the game's own connection, 'online auto'); only the Local
-# Versus mode has to be told who the other player is (UpdateMode shows one or the other).
-$onlineNote = Label "No codes needed: press Play, then play anyone in Online > Player Match who also started the game with Play Online.bat." 20 20 420 100
+# What is going on now: a coloured dot, one line, and one sentence of what to do next.
+$dot = Label $form ([string][char]0x25CF) 18 97 22 28 (UiFont 13) $c.Idle
+$headline = Label $form '' 40 98 404 28 (UiFont 12.5 -Semi) $c.Text
+$subline = Label $form '' 21 128 420 38 (UiFont 9) $c.Muted
 
-Label 'Where you fight:' 20 143 120 | Out-Null
-$where = New-Object System.Windows.Forms.ComboBox
-$where.DropDownStyle = 'DropDownList'
-$where.Location = New-Object System.Drawing.Point(140, 140); $where.Size = New-Object System.Drawing.Size(300, 26)
-[void]$where.Items.Add('MK9 Online: Player Match (recommended)')
-[void]$where.Items.Add('Local Versus over Steam (older test mode)')
-$where.SelectedIndex = 0
-$form.Controls.Add($where)
-function IsOnline { $where.SelectedIndex -eq 0 }
-
-$safe = New-Object System.Windows.Forms.CheckBox
-$safe.Text = 'Safe mode (no rollback: try it if fights go out of sync)'
-$safe.Location = New-Object System.Drawing.Point(20, 172); $safe.Size = New-Object System.Drawing.Size(420, 24)
-$form.Controls.Add($safe)
-Label 'Input delay:' 20 200 90 | Out-Null
-# 2026-11-09 (the player: "like the latest games"): a fixed choice next to Auto, as Skullgirls / Fightcade offer and as
-# Infil asked of SF6. Each game proposes its own and the session takes the larger, so a lower choice only applies when
-# the other player's choice (or Auto) is not higher.
-$delayBox = New-Object System.Windows.Forms.ComboBox
-$delayBox.DropDownStyle = 'DropDownList'
-$delayBox.Location = New-Object System.Drawing.Point(110, 197); $delayBox.Size = New-Object System.Drawing.Size(330, 26)
-[void]$delayBox.Items.Add('Auto from the ping (recommended)')
-[void]$delayBox.Items.Add('0 frames (like offline; more rollback, fast PCs only)')
-[void]$delayBox.Items.Add('1 frame')
-[void]$delayBox.Items.Add('2 frames')
-[void]$delayBox.Items.Add('3 frames')
-# The frames of each entry ($null: Auto). 0 (b37, rc21: as smooth as 1 on this PC at a 50 ms ping) applies only when
-# both players pick it; Safe mode (lockstep) always takes its delay from the ping: at 0 it would wait every frame.
-$delayFrames = @($null, 0, 1, 2, 3)
-function FixedDelay { if ($safe.Checked) { $null } else { $delayFrames[$delayBox.SelectedIndex] } }
-$delayBox.SelectedIndex = 0
-$form.Controls.Add($delayBox)
-$delayNote = Label '' 20 224 420 18
-$delayNote.ForeColor = [System.Drawing.Color]::Gray
-# Safe mode (its delay follows the ping, 2-3 frames) and Local Versus (a fixed 2) ignore the box: it is disabled there.
-function UpdateDelayUi {
-    $delayBox.Enabled = (IsOnline) -and -not $safe.Checked
-    $delayNote.Text = if ($safe.Checked) { 'Safe mode picks its own delay from the ping (2-3 frames).' }
-        elseif (-not (IsOnline)) { 'Local Versus uses a fixed delay of 2 frames.' }
-        else { 'Auto: 1 frame up to a 50 ms ping, then 2+. The larger choice of the two players is used.' }
-}
-# The in-game network display: part of the fight's HUD (src\debug\Hud.cpp: connection bars, ping, frames rolled back and
-# input delay under the round timer), the boxed line with all the numbers at the top left (src\debug\Overlay.cpp; F9
-# switches between the two in the game), or nothing. Sent to the game as 'overlay 1|2|0'.
-Label 'Network display:' 20 250 120 | Out-Null
-$overlayBox = New-Object System.Windows.Forms.ComboBox
-$overlayBox.DropDownStyle = 'DropDownList'
-$overlayBox.Location = New-Object System.Drawing.Point(140, 247); $overlayBox.Size = New-Object System.Drawing.Size(300, 26)
-[void]$overlayBox.Items.Add('In the HUD (ping, rollback, delay)')
-[void]$overlayBox.Items.Add('Detailed (all numbers, top left)')
-[void]$overlayBox.Items.Add('Off')
-$overlayLevels = @(1, 2, 0)
-$overlayBox.SelectedIndex = 0
-$form.Controls.Add($overlayBox)
-function ModeName { if ($safe.Checked) { 'Safe mode' } else { 'Rollback' } }
-$script:modeName = 'Rollback'
-
-$play = Button '3. &Play' 20 282 420 40
-$play.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+$play = New-Object System.Windows.Forms.Button
+$play.Font = UiFont 14 -Bold
+StyleButton $play 7
+[void](Place $play $form 20 172 420 54)
 $form.AcceptButton = $play
 
+# Shown only when a newer version is out (ShowUpdateBanner); the status box below then starts lower.
+$banner = New-Object System.Windows.Forms.Panel
+$banner.BackColor = $c.Banner
+$banner.Visible = $false
+[void](Place $banner $form 20 238 420 44)
+$bannerEdge = New-Object System.Windows.Forms.Panel
+$bannerEdge.BackColor = $c.Warn
+[void](Place $bannerEdge $banner 0 0 4 44)
+$bannerLabel = Label $banner '' 16 0 270 44 (UiFont 9.75 -Semi) $c.BannerText
+$bannerLabel.TextAlign = 'MiddleLeft'
+$updBtn = New-Object System.Windows.Forms.Button
+$updBtn.Text = '&Update now'
+$updBtn.Font = UiFont 9.75 -Semi
+$updBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
+StyleButton $updBtn 5
+[void](Place $updBtn $banner 296 7 116 30)
+
+# The status lines, newest at the bottom: a border, then the box with a little air on the left.
+$logEdge = New-Object System.Windows.Forms.Panel
+$logEdge.BackColor = $c.Border
+[void](Place $logEdge $form 20 238 420 240)
+$logBack = New-Object System.Windows.Forms.Panel
+$logBack.BackColor = $c.Field
+[void](Place $logBack $logEdge 1 1 418 238)
 $status = New-Object System.Windows.Forms.TextBox
-$status.Location = New-Object System.Drawing.Point(20, 334); $status.Size = New-Object System.Drawing.Size(420, 150)
 $status.Multiline = $true; $status.ReadOnly = $true; $status.ScrollBars = 'Vertical'; $status.TabStop = $false
-$form.Controls.Add($status)
-$trouble = Button '&Having trouble?' 20 492 130
-$saveLogs = Button '&Save logs to the Desktop' 160 492 280
+$status.BorderStyle = 'None'
+$status.BackColor = $c.Field
+$status.ForeColor = $c.FieldText
+$status.Font = UiFont 9
+[void](Place $status $logBack 10 8 408 224)
+if (-not $kHighContrast) {
+    # The scroll bar in the dark look too (Windows 10 1809 and later; ignored before).
+    $status.Add_HandleCreated({ try { [void][MK9R.Native]::SetWindowTheme($status.Handle, 'DarkMode_Explorer', [IntPtr]::Zero) } catch { } })
+}
+
 # Facts of the last match from the log (launcher_lib Update-MatchFacts) and the Wi-Fi hint (Get-ConnectionHint).
-$matchLabel = Label 'Last match: none yet.' 20 530 420 20
-$matchLabel.ForeColor = [System.Drawing.Color]::DimGray
-$hintLabel = Label '' 20 552 420 20
-$hintLabel.ForeColor = [System.Drawing.Color]::DarkOrange
-$verLabel = Label "Version $(if ($installed.version) { $installed.version } else { '(unknown)' })" 20 584 215 22
-$verLabel.ForeColor = [System.Drawing.Color]::Gray
-$updBtn = Button 'Check for &updates' 240 578 200 30
-$updBtn.FlatStyle = 'Flat'
-$backBtn = Button 'Go &back to the previous version' 180 616 260 26
-$backBtn.FlatStyle = 'Flat'
-$backBtn.Visible = Test-Path -LiteralPath (Join-Path $root 'previous_version')
-# Everything above is laid out at 96 DPI (100 %); ResumeLayout scales every position and size to the display's DPI.
+$matchLabel = Label $form 'Last match: none yet.' 21 486 420 20 (UiFont 9) $c.Muted
+$hintLabel = Label $form '' 21 506 420 20 (UiFont 9) $c.Warn
+[void](Rule 534)
+$trouble = Link $form '&Having trouble?' 19 546 110
+$saveLogs = Link $form '&Save logs to the Desktop' 136 546 166
+$updLink = Link $form '&Check for updates' 300 546 142 'MiddleRight'
+$backLink = Link $form 'Go &back to the previous version' 19 570 240
+$backLink.Visible = Test-Path -LiteralPath (Join-Path $root 'previous_version')
+
+# The window's icon: the mark at the title bar's and the taskbar's sizes. The title bar and the window's edge take the
+# header's colours where Windows can (dark title bar: Windows 10 1809 and later; the colours: Windows 11). Registered
+# before the first thing that makes Windows create the window (the screen question below).
+$script:icons = @()
+try {
+    foreach ($px in @((Scaled 32), (Scaled 16))) {
+        $bmp = New-LogoBitmap $px
+        $script:icons += [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        $bmp.Dispose()
+    }
+    $form.Icon = $script:icons[0]
+} catch { }
+$form.Add_HandleCreated({
+    try {
+        $h = $form.Handle
+        if ($script:icons.Count -eq 2) { [void][MK9R.Native]::SendMessage($h, 0x80, [IntPtr]::Zero, $script:icons[1].Handle) }  # WM_SETICON, the small one
+        if ($kHighContrast) { return }
+        $on = 1
+        if ([MK9R.Native]::DwmSetWindowAttribute($h, 20, [ref]$on, 4) -ne 0) { [void][MK9R.Native]::DwmSetWindowAttribute($h, 19, [ref]$on, 4) }
+        $caption = [int]($c.Panel.R -bor ($c.Panel.G -shl 8) -bor ($c.Panel.B -shl 16))
+        [void][MK9R.Native]::DwmSetWindowAttribute($h, 35, [ref]$caption, 4)
+        $edge = [int]($c.Border.R -bor ($c.Border.G -shl 8) -bor ($c.Border.B -shl 16))
+        [void][MK9R.Native]::DwmSetWindowAttribute($h, 34, [ref]$edge, 4)
+    } catch { }
+})
 # Set after the controls are added: set first, the labels were scaled twice (tested at 125 %).
 $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.ResumeLayout($true)
-# A small screen at a high scaling: scroll instead of cutting the bottom buttons off.
+# A small screen at a high scaling: scroll instead of cutting the bottom links off.
 $work = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
 if ($form.Height -gt $work.Height) { $form.AutoScroll = $true; $form.Height = $work.Height }
 
 function Say([string]$s) {
     $status.AppendText("$(Get-Date -Format 'HH:mm:ss')  $s`r`n")
 }
+# The line under the header. $tone: idle, busy, good, warn or bad (the dot's colour). $sub: the sentence below it
+# ($null keeps the one that is there).
+function SetStatus([string]$text, [string]$tone = 'idle', $sub = $null) {
+    $headline.Text = $text
+    $dot.ForeColor = switch ($tone) { 'busy' { $c.Warn } 'good' { $c.Good } 'warn' { $c.Warn } 'bad' { $c.Bad } default { $c.Idle } }
+    if ($null -ne $sub) { $subline.Text = "$sub" }
+}
+$kSubIdle = 'Press Play: the game starts through Steam with the mod loaded.'
+$kSubInGame = 'In the game: Online > Player Match, a 1 vs 1 room. Rollback takes over when your opponent runs MK9 Rollback too.'
+$kSubFailed = 'The lines below say why. Then press Play again.'
+# The Play button is never greyed out by Windows (its grey text is unreadable on the dark look): a press is ignored
+# while $script:playMode is 'busy', 'running' or 'blocked'.
+#   play     ready to start                     busy     a start is under way
+#   running  the game runs with the mod         retry    the game runs, the mod did not answer: a press sends again
+#   blocked  this folder cannot be written
+$script:playMode = 'play'
+function SetPlay([string]$mode) {
+    $script:playMode = $mode
+    $hot = $mode -eq 'play' -or $mode -eq 'retry'
+    $play.Text = switch ($mode) { 'busy' { 'STARTING...' } 'running' { 'GAME RUNNING' } 'retry' { '&TRY AGAIN' } default { '&PLAY' } }
+    $back = if ($hot) { $c.Accent } elseif ($mode -eq 'running') { $c.Running } else { $c.Quiet }
+    $play.Tag.Back = $back
+    $play.Tag.Hot = if ($hot) { $c.AccentHot } else { $back }
+    $play.Tag.Down = if ($hot) { $c.AccentDown } else { $back }
+    $play.Tag.Fore = if ($hot) { $c.OnAccent } elseif ($mode -eq 'running') { $c.Good } else { $c.QuietText }
+    $play.Cursor = if ($hot) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default }
+    $play.Invalidate()
+}
+# The status box starts under the banner while the banner shows, and keeps its bottom edge.
+$script:logTop = $logEdge.Top
+$script:logBottom = $logEdge.Bottom
+$script:logBackPad = $logEdge.Height - $logBack.Height
+$script:statusPad = $logBack.Height - $status.Height
+# ($script:bannerOn, not $banner.Visible: that reads False for as long as the window itself is not shown yet.)
+$script:bannerOn = $false
+function LayoutLog {
+    $top = if ($script:bannerOn) { $banner.Bottom + ($script:logTop - $play.Bottom) } else { $script:logTop }
+    $logEdge.SetBounds($logEdge.Left, $top, $logEdge.Width, $script:logBottom - $top)
+    $logBack.Height = $logEdge.Height - $script:logBackPad
+    $status.Height = $logBack.Height - $script:statusPad
+}
+function ShowUpdateBanner([string]$version) {
+    $bannerLabel.Text = "Version $version is available"
+    $script:bannerOn = $true
+    $banner.Visible = $true
+    LayoutLog
+}
+# Brings this window to the front: asked by a second start ($kShowEvent), and at the start when Windows was told to
+# start this process hidden. Windows then hides the first window the process shows, which is this one: the versions
+# before 2026-11 restarted that way after an update (Start-Process -WindowStyle Hidden) and stayed invisible, with
+# "already open" for every new start. Their restart still starts this script, so it shows itself.
+function ShowSelf([switch]$OnlyIfHidden) {
+    try {
+        $h = $form.Handle
+        $hidden = -not [MK9R.Native]::IsWindowVisible($h)
+        if ($OnlyIfHidden -and -not $hidden) { return }
+        if ([MK9R.Native]::IsIconic($h)) { [void][MK9R.Native]::ShowWindow($h, 9) }   # SW_RESTORE
+        elseif ($hidden) { [void][MK9R.Native]::ShowWindow($h, 5) }                    # SW_SHOW
+        [void][MK9R.Native]::SetForegroundWindow($h)
+        $form.Activate()
+    } catch { }
+}
+
 # An error no handler caught (the ThreadException handler at the top): one status line and the error file, not a .NET
 # error box. The same error again within a minute is not repeated (launcher_lib Update-ErrorWatch).
 $script:errorWatch = New-ErrorWatch
@@ -257,13 +479,13 @@ function HandlerError($ex) {
             $errFile = Join-Path $env:TEMP 'MK9Rollback-launcher-error.txt'
             $at = ''
             if ($ex -is [System.Management.Automation.IContainsErrorRecord] -and $ex.ErrorRecord.InvocationInfo) { $at = $ex.ErrorRecord.InvocationInfo.PositionMessage }
-            try { Set-Content -LiteralPath $errFile -Value "An error inside the Play Online window:`r`n`r`n$($ex.Message)`r`n$at" -Encoding ascii } catch { }
+            try { Set-Content -LiteralPath $errFile -Value "An error inside the MK9 Rollback window:`r`n`r`n$($ex.Message)`r`n$at" -Encoding ascii } catch { }
             Say "Something went wrong in this window: $text (Saved in $errFile; please send it with your bug report if it keeps happening.)"
         }
-        # A start step that fails at every tick of the timer would leave the Play button greyed out for good.
+        # A start step that fails at every tick of the timer would leave the Play button busy for good.
         if ($script:errorWatch.Count -eq 3 -and $script:state -ne 'idle' -and $script:state -ne 'watch') {
             Say 'This start is given up. Press Play to try again.'
-            GoIdle
+            GoIdle -Failed
         }
     } catch { }
 }
@@ -282,7 +504,7 @@ $troubleLines = @(
 function ShowTrouble {
     [void][System.Windows.Forms.MessageBox]::Show("If the game stutters, freezes or will not connect:`n`n- $($troubleLines -join "`n- ")", 'Having trouble?', 'OK', 'Information')
 }
-$trouble.Add_Click({ ShowTrouble })
+$trouble.Add_LinkClicked({ ShowTrouble })
 
 # ---- background work (update check, download and install, saving the logs, the Wi-Fi check) ----
 # Each job is a runspace of its own; $bgTimer polls them and passes status lines from $bgQueue to the window.
@@ -297,9 +519,12 @@ function Start-BgJob([scriptblock]$code, [hashtable]$params, [scriptblock]$done)
 function DrainQueue {
     while ($script:bgQueue.Count -gt 0) { $s = $script:bgQueue[0]; $script:bgQueue.RemoveAt(0); Say "$s" }
 }
+$script:startTicks = 0
 $bgTimer = New-Object System.Windows.Forms.Timer
 $bgTimer.Interval = 200
 $bgTimer.Add_Tick({
+    if ($script:startTicks -lt 25) { $script:startTicks++; if (-not $SnapshotPng) { ShowSelf -OnlyIfHidden } }
+    if ($script:showEvent) { try { if ($script:showEvent.WaitOne(0)) { ShowSelf } } catch { } }
     DrainQueue
     foreach ($j in @($script:jobs)) {
         if (-not $j.Handle.IsCompleted) { continue }
@@ -314,10 +539,11 @@ $bgTimer.Add_Tick({
 })
 $kCheckJob = { param($updater, $timeout) . $updater; $r = Get-LatestRelease -TimeoutSec $timeout; [pscustomobject]@{ Release = $r; Info = (Get-UpdateError) } }
 $kInstallJob = { param($updater, $release, $root, $queue) . $updater; Install-Update $release $root { param($s) [void]$queue.Add($s) } }
+$kFinishJob = { param($updater, $release, $root, $queue) . $updater; Complete-Install $release $root { param($s) [void]$queue.Add($s) } }
 $kLogsJob = { param($lib, $dir, $dest, $self) . $lib; Save-LogsZip $dir $dest $self }
 $kHintJob = { param($lib) . $lib; Get-ConnectionHint }
 
-# Updates: checked once when the window opens (quietly: only a newer version is mentioned) and on the button.
+# Updates: checked once when the window opens (quietly: only a newer version is mentioned) and on the link.
 $script:release = $null
 $script:updateBusy = $false
 $script:checkQuiet = $false
@@ -325,14 +551,14 @@ function CheckUpdate([switch]$Quiet) {
     if ($script:updateBusy) { return }
     $script:updateBusy = $true
     $script:checkQuiet = [bool]$Quiet
-    $updBtn.Enabled = $false
+    $updLink.Enabled = $false
     if (-not $Quiet) { Say 'Checking for updates...' }
     Start-BgJob $kCheckJob @{ updater = $updaterPath; timeout = $(if ($Quiet) { 4 } else { 10 }) } $onChecked
 }
 $onChecked = {
     param($out, $err)
     $script:updateBusy = $false
-    $updBtn.Enabled = $true
+    $updLink.Enabled = $true
     $Quiet = $script:checkQuiet
     if ($out -and $out.Release) { $script:release = $out.Release }
     if (-not ($out -and $out.Release)) {
@@ -344,34 +570,74 @@ $onChecked = {
         return
     }
     if (Test-UpdateNewer $script:release $installed.version) {
-        Say "UPDATE AVAILABLE: version $($script:release.Version). Close the game, then press 'Update now' at the bottom. Your opponent needs the same version."
-        $updBtn.Text = "&Update now ($($script:release.Version))"
-        $updBtn.BackColor = [System.Drawing.Color]::Orange
-        $updBtn.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
-        $verLabel.Text = "Update available: $($script:release.Version)"
-        $verLabel.ForeColor = [System.Drawing.Color]::DarkOrange
-        $verLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
-        if ($form.Text -notlike '*UPDATE AVAILABLE') { $form.Text = "$($form.Text) - UPDATE AVAILABLE" }
-    } elseif (-not $Quiet) {
-        Say "You have the latest version ($($installed.version))."
+        Say "UPDATE AVAILABLE: version $($script:release.Version). Close the game, then press 'Update now'. Your opponent needs the same version."
+        ShowUpdateBanner $script:release.Version
+        if ($form.Text -notlike '*update available') { $form.Text = "$($form.Text) - update available" }
+    } else {
+        if (-not $Quiet) { Say "You have the latest version ($($installed.version))." }
+        FinishInstall
     }
 }
-# Restarts this window on the files now on disk (after an update or going back).
+# An update installed by a version before 2026-11 could not bring "MK9 Rollback.exe" (that version's updater refuses
+# a zip with a file it does not know, so it is given a zip without it; updater.ps1). The program is fetched here, once,
+# from the same release's full zip, and that version's "Play Online.bat" goes to previous_version.
+$script:finishTried = $false
+function FinishInstall {
+    if ($script:finishTried -or $script:updateBusy -or $script:readOnly) { return }
+    if (-not (Test-InstallIncomplete $script:release $root)) { return }
+    $script:finishTried = $true
+    $script:updateBusy = $true
+    $updLink.Enabled = $false
+    Say 'Finishing the update: fetching "MK9 Rollback.exe", the program that opens this window from now on...'
+    Start-BgJob $kFinishJob @{ updater = $updaterPath; release = $script:release; root = $root; queue = $script:bgQueue } {
+        param($out, $err)
+        $script:updateBusy = $false
+        $updLink.Enabled = $true
+        if ($out -eq $true) { Say 'Done. From now on, open MK9 Rollback with "MK9 Rollback.exe" in its folder ("Play Online.bat" is gone).' }
+        else { Say "It could not be added now$(if ($err) { " ($err)" }); it is tried again the next time this window opens. Until then `"Play Online.bat`" still opens it." }
+        $backLink.Visible = Test-Path -LiteralPath (Join-Path $root 'previous_version')
+    }
+}
+# Restarts this window on the files now on disk (after an update or going back): through "MK9 Rollback.exe" when it
+# is there, else PowerShell directly, with no console and no request to start hidden (see ShowSelf).
 function RestartWindow {
     Say 'Restarting this window...'
     try { $script:mutex.ReleaseMutex(); $script:mutexOwned = $false } catch { }
-    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSScriptRoot\netplay_gui.ps1`""
+    $started = $false
+    foreach ($exe in @((Join-Path $root 'MK9 Rollback.exe'), "$env:MK9R_LAUNCHER")) {
+        if ($started -or -not $exe -or -not (Test-Path -LiteralPath $exe)) { continue }
+        try { Start-Process -FilePath $exe -ErrorAction Stop; $started = $true } catch { }
+    }
+    if (-not $started) {
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo $kPowerShell, "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\netplay_gui.ps1`""
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            [void][System.Diagnostics.Process]::Start($psi)
+            $started = $true
+        } catch { }
+    }
+    if (-not $started) {
+        try { $script:mutexOwned = $script:mutex.WaitOne(0) } catch { }
+        Say 'This window could not restart itself. Close it and open MK9 Rollback again.'
+        return
+    }
     $form.Close()
 }
+function GameBlocksUpdate { $script:state -ne 'idle' -or [bool](Get-Process MKKE -ErrorAction SilentlyContinue) }
+$updLink.Add_LinkClicked({ if (-not $script:updateBusy) { CheckUpdate } })
 $updBtn.Add_Click({
     if ($script:updateBusy) { return }
     if (-not ($script:release -and (Test-UpdateNewer $script:release $installed.version))) { CheckUpdate; return }
-    if ($script:state -ne 'idle' -or (Get-Process MKKE -ErrorAction SilentlyContinue)) { Say 'Close the game first, then press Update now.'; return }
+    if (GameBlocksUpdate) { Say 'Close the game first, then press Update now.'; return }
     $answer = [System.Windows.Forms.MessageBox]::Show("Install version $($script:release.Version)?`n`nYour opponent needs the same version to play with you.", 'MK9 Rollback update', 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
     $script:updateBusy = $true
     $script:installing = $true
-    $updBtn.Enabled = $false; $play.Enabled = $false; $backBtn.Enabled = $false
+    $updLink.Enabled = $false; $backLink.Enabled = $false
+    SetPlay 'busy'
+    $play.Text = 'UPDATING...'
+    SetStatus "Installing version $($script:release.Version)..." 'busy' 'This window restarts by itself when the update is in.'
     Start-BgJob $kInstallJob @{ updater = $updaterPath; release = $script:release; root = $root; queue = $script:bgQueue } $onInstalled
 })
 $onInstalled = {
@@ -381,7 +647,9 @@ $onInstalled = {
     if ($script:closeWanted) { $form.Close(); return }  # closed during the install: no restart
     if ($out -eq $true) { RestartWindow; return }
     if ($err) { Say "The update failed: $err" }
-    $updBtn.Enabled = $true; $play.Enabled = -not $script:readOnly; $backBtn.Enabled = $true
+    $updLink.Enabled = $true; $backLink.Enabled = $true
+    SetStatus 'The update was not installed' 'bad' 'The lines below say why. Your files are as they were.'
+    GoIdle
 }
 # Closing the window stops the background jobs where they are (the end of this file). An install stopped while it
 # copies would leave some files new and some old, with nothing to put the old ones back (updater.ps1 Invoke-FileSwap
@@ -396,86 +664,25 @@ $form.Add_FormClosing({
     $script:closeWanted = $true
 })
 # Undoes the last update (updater.ps1 Restore-PreviousVersion); refused while the game runs, like updating.
-$backBtn.Add_Click({
+$backLink.Add_LinkClicked({
     if ($script:updateBusy) { return }
-    if ($script:state -ne 'idle' -or (Get-Process MKKE -ErrorAction SilentlyContinue)) { Say 'Close the game first, then press the button again.'; return }
+    if (GameBlocksUpdate) { Say 'Close the game first, then press the link again.'; return }
     $prevVer = (Get-InstalledVersion (Join-Path $root 'previous_version')).version
     $answer = [System.Windows.Forms.MessageBox]::Show("Go back to the previous version$(if ($prevVer) { " ($prevVer)" })?`n`nYour opponent needs the same version to play with you.", 'MK9 Rollback', 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
     if (Restore-PreviousVersion $root { param($s) Say $s }) { RestartWindow }
 })
 $form.Add_Shown({
+    if ($SnapshotPng) { return }
+    ShowSelf -OnlyIfHidden
     if (-not $NoUpdateCheck) { CheckUpdate -Quiet }
     Start-BgJob $kHintJob @{ lib = $libPath } { param($out, $err) if ($out) { $hintLabel.Text = "$out" } }
 })
 
-$me = MyAccountId
-if ($me) { $myBox.Text = "$me" } else { $myBox.Text = '(start Steam)' }
-if (Test-Path -LiteralPath $settings) {
-    $saved = @(Get-Content -LiteralPath $settings)
-    $peerBox.Text = "$(@($saved)[0])"
-    # Only an explicit 'safe' line opts in to Safe mode (saved since 2026-11-01); older files ('rollback' or nothing)
-    # open in rollback, the default.
-    $safe.Checked = [bool]($saved | Select-String '^safe$' -Quiet)
-    if ($saved | Select-String '^local$' -Quiet) { $where.SelectedIndex = 1 }
-    $d = $saved | Select-String '^delay=([0-3])$' | Select-Object -First 1
-    if ($d) { $delayBox.SelectedIndex = [array]::IndexOf($delayFrames, [int]$d.Matches[0].Groups[1].Value) }
-    $o = $saved | Select-String '^overlay=([0-2])$' | Select-Object -First 1
-    if ($o) { $overlayBox.SelectedIndex = [array]::IndexOf($overlayLevels, [int]$o.Matches[0].Groups[1].Value) }
-}
-
-function UpdateSide {
-    $p = ParseCode $peerBox.Text
-    if (-not $me -or -not $p) { $side.Text = ''; return }
-    if (IsOnline) { $side.Text = ''; return }  # MK9's online mode decides the sides
-    if ($p -eq $me) { $side.Text = "That's your own code"; return }
-    $side.Text = if ($me -lt $p) { 'You: Player 1 (left)' } else { 'You: Player 2 (right)' }
-}
-function UpdateMode {
-    $codes = -not (IsOnline)
-    foreach ($c in $codeControls) { $c.Visible = $codes }
-    $onlineNote.Visible = -not $codes
-    UpdateDelayUi
-}
-# While the game runs with the mod, a change of the box is sent at once (2026-10-31: players ticked it between two
-# online matches and kept Safe mode, it was only read at Play). A fight already under way keeps its netcode.
-function SaveSettings {
-    Set-Content -Encoding ascii -LiteralPath $settings (@("$($script:peer)") + $(if ($safe.Checked) { 'safe' } else { @() }) + $(if (IsOnline) { @() } else { 'local' }) +
-        $(if ($delayBox.SelectedIndex -gt 0) { "delay=$($delayFrames[$delayBox.SelectedIndex])" } else { @() }) + "overlay=$($overlayLevels[$overlayBox.SelectedIndex])")
-}
-# The input delay of a running game changes the same way as Safe mode: the arm command is sent again.
-$delayBox.Add_SelectedIndexChanged({
-    if ($script:state -ne 'watch') { return }
-    Say 'Input delay changed. It applies from the next fight.'
-    SaveSettings
-    Arm
-})
-$overlayBox.Add_SelectedIndexChanged({
-    SaveSettings
-    if ($script:state -ne 'watch') { return }
-    Cmd @("overlay $($overlayLevels[$overlayBox.SelectedIndex])")
-})
-$safe.Add_CheckedChanged({ UpdateDelayUi })
-$safe.Add_CheckedChanged({
-    if ($script:state -ne 'watch') { return }
-    Say "Netcode changed to $(ModeName). A fight already under way keeps its netcode; the change applies from the next one."
-    SaveSettings
-    Arm
-})
-$peerBox.Add_TextChanged({ UpdateSide })
-$where.Add_SelectedIndexChanged({ UpdateSide; UpdateMode })
-UpdateSide
-UpdateMode
-$copy.Add_Click({
-    if (-not $me) { return }
-    # SetText throws while another program holds the clipboard (a clipboard manager, a remote desktop session).
-    try { [System.Windows.Forms.Clipboard]::SetText("$me"); Say 'Your code is copied. Send it to your friend.' }
-    catch { Say 'The code could not be copied (another program is using the clipboard). Press Copy again, or select the code in box 1 and press Ctrl+C.' }
-})
-
 # For a public bug report: Steam IDs, IP addresses and the user and PC names are replaced in the zip (launcher_lib
 # Save-LogsZip, PRIVACY.txt in the zip says what was replaced).
-$saveLogs.Add_Click({
+$saveLogs.Add_LinkClicked({
+    if (-not $saveLogs.Enabled) { return }
     $saveLogs.Enabled = $false
     Say 'Saving the logs...'
     $selfIds = @()
@@ -497,65 +704,36 @@ $script:tries = 0
 $script:tail = New-LogTail $log
 $script:facts = New-MatchFacts
 $script:ackDue = $null
+$script:armTries = 0
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 
-function Arm([switch]$Next) {
-    # Local Versus needs the other player's code. Play checks it, but the mode can be switched to Local Versus after
-    # Play was pressed in the MK9 Online mode (where the box may be empty), and the Safe mode box and the re-arm after
-    # a fight come here without Play: account 0 or the player's own would be armed, and the next fight would wait for it.
-    if (-not (IsOnline) -and (-not $script:peer -or $script:peer -eq $me)) {
-        Say "Local Versus needs your friend's code: paste it in box 2, then press the button."
-        # Nothing is armed; the game and the mod stay as they are, and the button arms once the code is there.
-        $script:ackDue = $null
-        $script:state = 'watch'
-        $play.Text = 'Not armed (&press to arm)'
-        $play.Enabled = $true
-        return
-    }
-    # One command per mode: Safe mode installs only the lockstep patch set (docs/restructure_plan.md, phase 1). Sent
-    # again on a re-arm or a checkbox change, it only switches the mode (a running fight keeps its netcode).
-    $lines = @($(if ($safe.Checked) { 'netcode safe' } else { 'netcode rollback' }), "overlay $($overlayLevels[$overlayBox.SelectedIndex])")
-    # Local Versus: rollback at 2 frames (the simulated-lag runs of 2026-10-28: delay 1 replayed 4-8 times as many frames
-    # as delay 2 at 40 and 80 ms one way). Online, the delay follows the ping ('online auto ping', src\net\OnlineMode.cpp):
-    # 1 frame up to a 50 ms round trip since rc20 (b34/b35), unless this PC's replays then make slow frames.
-    $delay = if ($safe.Checked) { 3 } else { 2 }
-    $script:modeName = ModeName
-    # The DLL echoes each command it takes ("CMD netcode rollback"); no echo within 5 s: the watch step says so.
+# What the game is told once the mod is loaded, the same on every PC: rollback, the network display in the HUD, and
+# MK9's Online mode with the input delay from the ping (1 frame up to a 50 ms round trip, then 2 and more; OnlineMode
+# DelayFromPing). The DLL echoes each command it takes ("CMD netcode rollback"); with no echo within 5 s the watch
+# step sends them again, twice, before it asks the player (the button becomes TRY AGAIN). Sent again, the commands
+# change nothing in a running fight.
+$kArmLines = @('netcode rollback', 'overlay 1', 'online auto ping')
+$kArmSends = 3
+function Arm([switch]$Again) {
+    if (-not $Again) { $script:armTries = 0 }
+    $script:armTries++
     $script:ackDue = (Get-Date).AddSeconds(5)
-    if ($safe.Checked) { Say 'Netcode: Safe mode (no rollback). Your opponent must tick Safe mode too.' }
-    else { Say 'Netcode: Rollback. Your opponent must leave Safe mode unticked too.' }
-    if (IsOnline) {
-        # Auto: from the ping (OnlineMode DelayFromPing); a fixed choice is this game's proposal (the larger one wins).
-        $fixed = FixedDelay
-        $onlineDelay = if ($null -ne $fixed) { "$fixed" } else { 'ping' }
-        Cmd ($lines + "online auto $onlineDelay")
-        if ($null -ne $fixed) { Say "Input delay: $fixed frame(s) from this side (the larger choice of the two players is used)." }
-        elseif ($safe.Checked -and $delayBox.SelectedIndex -gt 0) { Say 'Safe mode picks its input delay from the ping (2-3 frames).' }
-        Say 'Ready. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.'
-        Say "If your opponent also started the game with Play Online.bat, $($script:modeName) takes over at the start of the fight. Against anyone else, MK9's own netcode is used. Ranked is never touched."
-        $script:state = 'watch'
-        $play.Text = 'Ready (&press to re-arm)'
-        $play.Enabled = $true
-        return
-    }
-    $peer64 = $kSteamBase + $script:peer
-    $player = if ($me -lt $script:peer) { 1 } else { 2 }
-    $lines += 'online off'  # a game that was in the MK9 Online mode before stops watching online fights
-    $lines += "ggpo steamnetplay $peer64 $player $delay"
-    Cmd $lines
-    $sideText = if ($player -eq 1) { 'Player 1 (LEFT side)' } else { 'Player 2 (RIGHT side)' }
-    if ($Next) { Say "Ready for the next fight (you are $sideText): pick it the same way on both PCs." }
-    else {
-        Say "Ready. You are $sideText."
-        Say 'In the game: Versus > Local Versus. Agree with your friend on both characters and the stage, pick them the same on both PCs (P1 left, P2 right), and start the fight within a minute of each other.'
-    }
+    [void](Cmd $kArmLines)
     $script:state = 'watch'
-    $play.Text = 'Waiting for the fight (&press to re-arm)'
-    $play.Enabled = $true
+    SetPlay 'running'
+    if ($Again) { return }
+    SetStatus 'Ready in the game' 'good' $kSubInGame
+    Say 'Ready. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.'
+    Say "If your opponent also runs MK9 Rollback, rollback takes over at the start of the fight. Against anyone else, MK9's own netcode is used. Ranked is never touched."
 }
 
-function GoIdle { $script:state = 'idle'; $play.Enabled = -not $script:readOnly }
+function GoIdle([switch]$Failed) {
+    $script:state = 'idle'
+    $script:ackDue = $null
+    SetPlay $(if ($script:readOnly) { 'blocked' } else { 'play' })
+    if ($Failed) { SetStatus 'The game did not start with the mod' 'bad' $kSubFailed }
+}
 $script:shownDesync = 0
 # The game's own window has taken no message for 5 s (what Windows shows as "Not responding"). Asked of that window
 # only, by its class: the game thread owns it (the "HANG?   window" lines of src\debug\CrashLog.cpp), and the game's
@@ -579,29 +757,34 @@ function GameHung($game) {
 $timer.Add_Tick({
     switch ($script:state) {
         'launch' {
-            if (Get-Process MKKE -ErrorAction SilentlyContinue) { Say 'The game is running. Waiting for its menu...'; $script:state = 'settle'; $script:wait = 0; return }
-            if (++$script:wait -gt 150) { Say 'The game did not start. Start it from Steam, then press Play again.'; GoIdle }
+            if (Get-Process MKKE -ErrorAction SilentlyContinue) {
+                Say 'The game is running. Waiting for its menu...'
+                SetStatus 'Waiting for the game''s menu...' 'busy' 'The mod is loaded once the game has reached its menu.'
+                $script:state = 'settle'; $script:wait = 0
+                return
+            }
+            if (++$script:wait -gt 150) { Say 'The game did not start. Start it from Steam, then press Play again.'; GoIdle -Failed }
         }
         'settle' {
-            if (++$script:wait -ge 15) { $script:state = 'inject'; $script:wait = 0 }
+            if (++$script:wait -ge 15) { $script:state = 'inject'; $script:wait = 0; SetStatus 'Loading the mod...' 'busy' }
         }
         'injectretry' {
             if (++$script:wait -ge 2) { $script:state = 'inject'; $script:wait = 0 }
         }
         'inject' {
             $games = @(Get-Process MKKE -ErrorAction SilentlyContinue)
-            if ($games.Count -gt 1) { Say 'Two copies of the game are running. Close one.'; GoIdle; return }
+            if ($games.Count -gt 1) { Say 'Two copies of the game are running. Close one.'; GoIdle -Failed; return }
             # Closed while this window waited for its menu or between two tries: the injector would end with code 1 and
             # the antivirus text below would be shown for it.
-            if ($games.Count -eq 0) { Say (Get-InjectFailureText $null $false); GoIdle; return }
+            if ($games.Count -eq 0) { Say (Get-InjectFailureText $null $false); GoIdle -Failed; return }
             $files = Test-InstalledFiles $root
-            if (-not $files.Ok) { Say $files.Message; GoIdle; return }
+            if (-not $files.Ok) { Say $files.Message; GoIdle -Failed; return }
             # The last session's logs are kept for "Save logs": a player who restarts after a crash would lose them.
             # Only the first try of a start moves them: another try would replace them with the log of the try before.
             Move-SessionLogs $dir ($script:tries -gt 0)
             # Never throws (launcher_lib): an injector the antivirus removed or blocks is a status line, not an error.
             $run = Invoke-Injector (Join-Path $dir 'MK9RollbackInjector.exe')
-            if (-not $run.Started) { Say $run.Error; GoIdle; return }
+            if (-not $run.Started) { Say $run.Error; GoIdle -Failed; return }
             $r = Get-InjectorResult $run.Code
             if ($r.AlreadyLoaded) {
                 Say 'The mod was already loaded in this game.'
@@ -614,7 +797,7 @@ $timer.Add_Tick({
                 $running = [bool](Get-Process MKKE -ErrorAction SilentlyContinue)
                 if ($running -and $r.Retry -and ++$script:tries -lt 6) { $script:state = 'injectretry'; $script:wait = 0; return }
                 Say (Get-InjectFailureText $r $running)
-                GoIdle
+                GoIdle -Failed
                 return
             }
             $script:state = 'injectwait'; $script:wait = 0
@@ -626,58 +809,76 @@ $timer.Add_Tick({
                 $running = [bool](Get-Process MKKE -ErrorAction SilentlyContinue)
                 if ($running -and ++$script:tries -lt 6) { $script:state = 'inject'; return }
                 Say (Get-InjectFailureText $null $running)
-                GoIdle
+                GoIdle -Failed
             }
         }
         'watch' {
             $game = Get-Process MKKE -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $game) {
-                Say 'The game has closed.'; $script:ackDue = $null; $script:hang = New-HangWatch; $play.Text = '3. &Play'; GoIdle; return
+                Say 'The game has closed.'
+                $script:hang = New-HangWatch
+                GoIdle
+                SetStatus 'Ready to play' 'idle' $kSubIdle
+                return
             }
             # A game that stays frozen (launcher_lib Update-HangWatch; the DLL's "HANG?" lines alone are not shown).
             $hang = Update-HangWatch $script:hang (GameHung $game)
-            if ($hang -eq 'hung') { Say 'The game is not responding (frozen for more than 15 seconds). If it stays frozen, close it, then save the logs.' }
-            elseif ($hang -eq 'back') { Say 'The game is responding again.' }
-            $rearm = $false
+            if ($hang -eq 'hung') {
+                Say 'The game is not responding (frozen for more than 15 seconds). If it stays frozen, close it, then save the logs.'
+                SetStatus 'The game is not responding' 'bad'
+            } elseif ($hang -eq 'back') {
+                Say 'The game is responding again.'
+                SetStatus 'Ready in the game' 'good'
+            }
             foreach ($line in (Read-LogTail $script:tail)) {
-                if ($script:ackDue -and (Test-CommandAck $line)) { $script:ackDue = $null }
+                if ($script:ackDue -and (Test-CommandAck $line)) {
+                    $script:ackDue = $null
+                    if ($script:playMode -eq 'retry') { SetPlay 'running'; SetStatus 'Ready in the game' 'good' $kSubInGame }
+                }
                 if (Update-MatchFacts $script:facts $line) { $matchLabel.Text = Format-MatchFacts $script:facts }
-                $r = Get-LauncherMessage $line $script:modeName
+                $r = Get-LauncherMessage $line 'Rollback'
                 if (-not $r) { continue }
                 if ($r.Kind -eq 'desync' -and $script:shownDesync++) { continue }
                 # a new fight or session starts counting again, so a later desync is shown too
                 if ($r.Kind -eq 'reset') { $script:shownDesync = 0 }
                 if ($r.Text) { Say $r.Text }
+                if ($r.Head) { SetStatus $r.Head $r.Tone }
                 if ($r.CheckUpdate) { CheckUpdate }
-                if ($r.Rearm) { $rearm = $true }
             }
             if ($script:ackDue -and (Get-Date) -gt $script:ackDue) {
-                $script:ackDue = $null
-                Say 'The mod did not answer. Press the button again; if it repeats, save the logs.'
+                if ($script:armTries -lt $kArmSends) { Arm -Again }
+                else {
+                    $script:ackDue = $null
+                    Say 'The mod did not answer. Press TRY AGAIN; if it repeats, close the game, press Play, and save the logs.'
+                    SetStatus 'The mod is not answering' 'bad' 'Press TRY AGAIN. If it repeats, close the game and press Play.'
+                    SetPlay 'retry'
+                }
             }
-            if ($rearm -and -not (IsOnline)) { Arm -Next }  # the online mode re-engages by itself for every match
         }
     }
 })
 
+$kReadOnlyText = 'This folder is read-only (or protected by Windows ransomware protection). Move the MK9 Rollback folder to e.g. C:\Games.'
 $play.Add_Click({
-    if ($script:readOnly) { Say 'This folder is read-only (or protected by Windows ransomware protection). Move the MK9 Rollback folder to e.g. C:\Games.'; return }
-    if (-not $me) { $script:me = MyAccountId; $me = $script:me; if ($me) { $myBox.Text = "$me" } }
-    if (-not $me) { Say 'Start Steam and sign in first.'; return }
-    $script:peer = ParseCode $peerBox.Text
-    if (-not (IsOnline) -and (-not $script:peer -or $script:peer -eq $me)) { Say "Paste your friend's code first (box 2): only the number they sent you."; return }
-    SaveSettings
+    if ($script:playMode -eq 'busy' -or $script:playMode -eq 'running') { return }
+    if ($script:readOnly) { Say $kReadOnlyText; return }
+    if (-not (MyAccountId)) {
+        Say 'Start Steam and sign in first.'
+        SetStatus 'Steam is not running' 'warn' 'Start Steam and sign in, then press Play.'
+        return
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $dir 'MK9RollbackInjector.exe'))) { Say "The mod files are missing next to this launcher ($dir)."; return }
     if ($script:state -eq 'watch') { Arm; return }
     if ($script:state -ne 'idle') { return }
     $files = Test-InstalledFiles $root
-    if (-not $files.Ok) { Say $files.Message; return }
-    $play.Enabled = $false
+    if (-not $files.Ok) { Say $files.Message; SetStatus 'The mod''s files are damaged' 'bad' $kSubFailed; return }
+    SetPlay 'busy'
     $script:tries = 0
     $game = Get-Process MKKE -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $game) {
         Say 'Starting Mortal Kombat through Steam...'
-        Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSScriptRoot\launch_game.ps1`""
+        SetStatus 'Starting the game...' 'busy' 'Steam is starting Mortal Kombat. This can take a minute.'
+        Start-Process $kPowerShell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSScriptRoot\launch_game.ps1`""
         $script:state = 'launch'; $script:wait = 0
     } elseif ((Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).LastWriteTime -gt $game.StartTime)) {
         # This game already has the mod: only what it logs from now on is news.
@@ -686,13 +887,46 @@ $play.Add_Click({
         Arm
     } else {
         Say 'The game is already running. Loading the mod...'
+        SetStatus 'Loading the mod...' 'busy' 'The game is already running.'
         $script:state = 'inject'
     }
 })
 
+SetPlay 'play'
+SetStatus 'Ready to play' 'idle' $kSubIdle
+Say 'Press Play. The game starts with the mod.'
+if ($script:readOnly) {
+    Say $kReadOnlyText
+    SetPlay 'blocked'
+    SetStatus 'This folder cannot be written' 'bad' 'Move the MK9 Rollback folder to e.g. C:\Games, then open it again.'
+}
+
 if ($SnapshotPng) {
+    # What the picture shows: made-up lines, nothing is started.
+    switch ($SnapshotState) {
+        'starting' { SetPlay 'busy'; SetStatus 'Starting the game...' 'busy' 'Steam is starting Mortal Kombat. This can take a minute.'; Say 'Starting Mortal Kombat through Steam...' }
+        'running' {
+            SetPlay 'running'; SetStatus 'Rollback is on' 'good' $kSubInGame
+            Say 'Starting Mortal Kombat through Steam...'; Say 'The game is running. Waiting for its menu...'; Say 'Mod loaded.'
+            Say 'Ready. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.'
+            Say 'Online fight found. Checking whether your opponent runs the mod...'; Say 'Both games run the mod.'
+            Say 'Input delay this match: 1 frame(s).'; Say 'Rollback on. You are player 1.'
+            $matchLabel.Text = 'Last match: input delay 1, ping 34 ms, 3 rollbacks a minute, always in sync.'
+            $hintLabel.Text = 'You are on Wi-Fi: a cable gives steadier fights.'
+        }
+        'update' {
+            Say "UPDATE AVAILABLE: version 20261231-1200. Close the game, then press 'Update now'. Your opponent needs the same version."
+            ShowUpdateBanner '20261231-1200'
+            $backLink.Visible = $true
+        }
+        'failed' { GoIdle -Failed; Say 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe. Press ''Having trouble?'' for what to try, then save the logs if it keeps failing.' }
+    }
+    try { $form.NoActivate = $true } catch { }
+    $form.ShowInTaskbar = $false
+    $form.StartPosition = 'Manual'
+    $form.Location = New-Object System.Drawing.Point(-32000, -32000)
     $snapTimer = New-Object System.Windows.Forms.Timer
-    $snapTimer.Interval = 2500
+    $snapTimer.Interval = 1200
     $snapTimer.Add_Tick({
         $snapTimer.Stop()
         $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
@@ -702,18 +936,16 @@ if ($SnapshotPng) {
         $form.Close()
     })
     $form.Add_Shown({ $snapTimer.Start() })
+    [System.Windows.Forms.Application]::Run($form)
+} else {
+    $timer.Start()
+    $bgTimer.Start()
+    [void]$form.ShowDialog()
 }
-
-$timer.Start()
-$bgTimer.Start()
-if (IsOnline) { Say 'Press Play. The game starts with the mod.' } else { Say 'Both players: start this launcher, swap codes, then press Play.' }
-if ($script:readOnly) {
-    Say 'This folder is read-only (or protected by Windows ransomware protection). Move the MK9 Rollback folder to e.g. C:\Games.'
-    $play.Enabled = $false
-}
-[void]$form.ShowDialog()
 $timer.Stop()
 $bgTimer.Stop()
 foreach ($j in @($script:jobs)) { try { $j.PS.Stop(); $j.PS.Dispose() } catch { } }
+foreach ($i in $script:icons) { try { $i.Dispose() } catch { } }
+if ($script:showEvent) { try { $script:showEvent.Dispose() } catch { } }
 if ($script:mutexOwned) { try { $script:mutex.ReleaseMutex() } catch { } }
 exit 0

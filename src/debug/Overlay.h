@@ -4,7 +4,8 @@
 // In-game status line (todo item 4, docs\status_overlay_plan.md): drawn by MKKE's own Direct3D 9 code path on the
 // rendering thread, just before the EndScene of RHIEndDrawingViewport 0x00666F20 (5-byte CodePatch at 0x00667106).
 // It reads only the stats the game thread publishes here: no game memory, no game calls, no GMalloc, no D3D
-// resources kept across frames.
+// resources kept across frames, and no call into the window manager on the render thread: the F9 key and the monitor
+// behind the DISPLAY line are read by a watcher thread of this file's own (Overlay.cpp, "the watcher thread").
 namespace Overlay {
 
 enum Mode : uint8_t { kOff = 0, kWaiting, kRollback, kLockstep, kSyncTest, kStopped, kInfo };  // kInfo: stopWhy as is
@@ -41,7 +42,8 @@ struct Stats {  // plain data, no pointers
 bool Install();          // verifies the 16 bytes at 0x00667106 first (fail closed); idempotent
 void EnsureInstalled();  // game thread, now and then: re-applies the patch if a CodePatch::RestoreAll removed it
 void Disable();          // unload: the stub becomes a pass-through (call before CodePatch::RestoreAll)
-void RequestDisplayLog();  // the render thread logs the display mode at its next frame (DISPLAY line; each session's start)
+void Shutdown();         // unload, after Disable: waits for the watcher thread to end (up to 5 s)
+void RequestDisplayLog();  // the display mode is logged from the next frame's swap chain (DISPLAY line; each session's start)
 long InFlight();         // render-thread calls inside the draw
 // 0 off; 1 the display that belongs to the game's HUD (Hud.h: a group under the round timer in a fight, a badge before
 // one, nothing otherwise); 2 the boxed line with every number, top left, always (F9 in the game switches 1 <-> 2).
@@ -55,7 +57,10 @@ void RequestShot(const char* path);
 void SetDemo(int n);
 int Demo();
 void Publish(const Stats& s);  // game thread, live frames only
-void LogCounters();            // game thread: draws, draws while resimulating, max draw time
+void LogCounters();            // game thread: draws, draws while resimulating, max draw time, the F9 poll's longest wait
+// 'syswatch 0|1' (default 1): the watcher thread writes down what Windows announces, which program comes to the front
+// and which windows appear (SYSEVENT lines, SysWatch.h), and after a KEYWAIT the programs that used the processor.
+void SetSysWatch(bool on);
 // Render latency: 'framelatency N' asks the IDirect3DDevice9Ex for at most N frames queued ahead of the GPU
 // (SetMaximumFrameLatency, 1..16; D3D9Ex's default is 3); 0 leaves the game's value. Applied on the render thread at the
 // next draw. The probe (event queries, one per presented frame) counts the frames the GPU had not finished at each

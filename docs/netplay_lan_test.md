@@ -4,7 +4,7 @@ Status (2026-10-18): two separate game instances on one PC (`tools/two_instance.
 
 Update (2026-10-25): consecutive rounds now stay in sync too. Round 2 used to split at its first frame for two reasons, both fixed: each game's leftover input history from between rounds (now cleared to the same neutral state at every session start) and the test harness removing the CPU's AI on different frames (the session start now removes AI drones itself). A 3-fight two-instance run with one instance slowed matched every frame of all 4 sessions (about 90 rollbacks per side in the rollback sessions). In single-PC rewind testing, about 3 rewinds in 10,000 replay differently, with no crash; see docs/determinism.md.
 
-**Copying to the second PC:** `tools\package.ps1` builds `dist\MK9Rollback-netplay-<date>.zip` with the DLL, the injector, the scripts and this page, plus a README with the commands. Extract it anywhere on both PCs.
+**Copying to the second PC:** `tools\package.ps1` builds `dist\MK9-Rollback-<date>.zip` with the program that opens the window, the DLL, the injector, the scripts and this page, plus a README with the commands. Extract it anywhere on both PCs.
 
 **Untested part, needs you:** until 2026-10-18 21:10 a real controller never reached a netplay session; only the test harness's scripted input did. The DLL now reads every local controller and the keyboard during a session, and sends them as the local player's input. That still needs a person pressing buttons. Quick check on one PC: arm netplay and move. If the fighter does not respond, send the logs (see "What to send back"). The `INPUT capture:` lines show which pads are read. Before that, the path was tested on loopback against a stand-in peer (`tools/ggpo_peer.exe`). This page is the procedure for the first test with two real PCs. It needs two PCs on the same network, each with MK Komplete Edition (Steam) and this repository's build.
 
@@ -15,18 +15,17 @@ Each PC runs a **local Versus** match: the same characters, stage and round sett
 - The DLL sends each PC's local input to the other through GGPO.
 - Each game simulates both fighters and rolls back when the remote input arrives late.
 
-## Easiest: the Play Online window (over Steam)
+## Easiest: the MK9 Rollback window (over Steam)
 
-The package has `Play Online.bat` at the top (in the repository: `tools\Play Online.bat`, which runs `tools\netplay_gui.ps1`). Each player opens it and presses Play; the window starts the game, injects the DLL, arms the mod and shows the log as plain status lines. "Where you fight" has two choices:
+The package has `MK9 Rollback.exe` at the top (in the repository: `build\clang\MK9 Rollback.exe` after `build.ps1`; it opens `tools\netplay_gui.ps1` without a console). Each player opens it and presses Play; the window starts the game, injects the DLL, arms the mod and shows the log as plain status lines. There is nothing to choose: it always sends `netcode rollback`, `overlay 1` and `online auto ping` (rollback, the display in the HUD, the input delay from the ping), and both players go to Online > Player Match in the game (next section).
 
-- **MK9 Online: Player Match (recommended)**, the default. No codes: both players go to Online > Player Match in the game (next section). "Input delay" is Auto (from the ping) or a fixed 0 to 3 frames; "Safe mode" is lockstep instead of rollback (both players must choose the same).
-- **Local Versus over Steam (older test mode)**. Each player sends the code from box 1 (the Steam friend code, the account ID from `HKCU\Software\Valve\Steam\ActiveProcess\ActiveUser`) and pastes the other player's code in box 2 (a friend code or a 17-digit SteamID64, nothing else). The window arms a Steam session (rollback with 2 frames of input delay, or lockstep at delay 3 with "Safe mode"), picks the sides without asking (the lower code is player 1) and re-arms after every fight. The players still pick the same Versus fight in the game (see Playing).
+The choices the window had until 2026-11-12 are gone from it: a fixed input delay, "Safe mode" (lockstep), the network display's start state, and the older "Local Versus over Steam" mode with friend codes. Their commands stay in the DLL for testing (`tools\netplay.ps1`, or a line in `build\clang\MK9Rollback_cmd.txt`). Before 2026-11 the package was opened by a `Play Online.bat`; an update from such a version replaces it with the program by itself.
 
 "Save logs to the Desktop" zips the logs for a bug report (send it together with your opponent's zip). Steam IDs become steam-self / steam-peer1, ..., IP addresses lan-ip-N / ip-N, and the Windows user and PC names `<user>` / `<pc>`; PRIVACY.txt in the zip lists what was replaced. "Having trouble?" lists the usual fixes for stutter and connection problems.
 
-## Inside MK9's own online mode (the main mode of "Play Online.bat")
+## Inside MK9's own online mode (what the window arms)
 
-"MK9 Online: Player Match" in the window arms `online auto ping` (or `online auto <frames>` with a fixed input delay) instead of a Versus session. Then:
+The window arms `online auto ping` (`online auto <frames>` fixes the input delay instead; not offered in the window) instead of a Versus session. Then:
 - **Meeting:** the two players meet through MK9's own Online menu, in a **1 vs 1** Player Match (invite or private room). King of the Hill rooms and Ranked matches always use MK9's own netcode: in King of the Hill, spectators receive the fighters' inputs through the exchange the mod replaces.
 - **Handshake:** when an online fight is active and the game's own Steam P2P connection is with the opponent, each DLL sends a hello on Steam channel 79.
 - **Takeover:** once both hellos arrive, rollback starts at the first fight frame of the current fight, or of the next one if the current fight has already started.
@@ -50,7 +49,7 @@ The log lines of interest are those starting with `ONLINE`, plus the usual NETPL
 
 ## Quick start (one command per PC)
 
-`tools\netplay.ps1` starts the game through Steam if needed, injects the DLL, arms the session and then prints the session status. From a Command Prompt in the extracted folder, with the same PowerShell options as `Play Online.bat` (a plain `tools\netplay.ps1 ...` is refused where Windows does not allow scripts, its default):
+`tools\netplay.ps1` starts the game through Steam if needed, injects the DLL, arms the session and then prints the session status. From a Command Prompt in the extracted folder, with these PowerShell options (a plain `tools\netplay.ps1 ...` is refused where Windows does not allow scripts, its default):
 
 PC A (its peer is PC B):
 ```
@@ -102,7 +101,7 @@ The manual steps follow, for reference.
 
 ## What to send back
 
-From both PCs: open `Play Online.bat` (the game need not run) and press "Save logs to the Desktop", then send the zip it makes. It holds `build\clang\MK9Rollback.log`, `MK9Rollback_frames.log` and the logs of the session before, with Steam IDs, IP addresses and the Windows user and PC names replaced; the files in `build\clang` themselves are not cleaned, so do not post those. Of interest:
+From both PCs: open `MK9 Rollback.exe` (the game need not run) and press "Save logs to the Desktop", then send the zip it makes. It holds `build\clang\MK9Rollback.log`, `MK9Rollback_frames.log` and the logs of the session before, with Steam IDs, IP addresses and the Windows user and PC names replaced; the files in `build\clang` themselves are not cleaned, so do not post those. Of interest:
 - `GGPO p2p stopped: N frames, N loads, ...`
 - any `CRASH?` / `HANG?` lines;
 - `NETPLAY checksums: N frames matched the peer, M did not`, plus any `NETPLAY DESYNC: frame ...` lines. Each peer sends the gameplay checksum (life, meter, positions, RNG) of every frame 24 frames after it, when it can no longer be rolled back. The other peer compares it with its own.
@@ -156,15 +155,15 @@ Then use the same `ggpo netplay ...` / `ggpo steamnetplay ...` commands as above
 ## Network display and troubleshooting
 
 In a fight the display is part of the HUD, under the round timer: three connection bars, the round trip (`22 MS`), `R` with the
-most frames rolled back in the last second (not in Safe mode) and `D` with the input delay. The bars are green (round trip up to
+most frames rolled back in the last second (not in lockstep) and `D` with the input delay. The bars are green (round trip up to
 60 ms, little rollback, no stalls), yellow (61-120 ms, 3-4 frames of rollback, or a wait of 150 ms or more for the opponent) or red
 (above 120 ms, 5+ frames of rollback, a wait of 500 ms or more, or an opponent that stopped responding). A Wi-Fi mark stands at the
 side of each player whose PC is on Wi-Fi. A note under the group explains a hiccup for a few seconds ("Connection hiccup", "This PC
 hitched" when the freeze came from this PC, "Opponent not responding"). Before the fight (character select, loading) a badge says
 `ROLLBACK READY` with the ping, or why MK9's own netcode will play. In a fight on MK9's netcode a small `MK9 NETCODE` tag stands in
 the group's place, with the reason for the first seconds. The display hides with the game's HUD in a finisher. F9 switches to the
-detailed line at the top left (rtt, ping, rollback depths, loads, kbps, queue, waits) and back; the window's "Network display" box
-chooses the start state (In the HUD, Detailed or Off, sent to the game as `overlay 1|2|0`). When a session stops, a note says why in
+detailed line at the top left (rtt, ping, rollback depths, loads, kbps, queue, waits) and back; the window always starts it in the
+HUD (`overlay 1`; `overlay 2` is the detailed line and `overlay 0` none). When a session stops, a note says why in
 plain words and that MK9's own netcode plays the rest of the match.
 
 If the game stutters, freezes or will not connect:

@@ -1,5 +1,6 @@
-# Checks the Play Online window's helpers (tools\launcher_lib.ps1) and the updater (tools\updater.ps1) with temporary
-# folders and fixture data only: no game, no network, no window.
+# Checks the MK9 Rollback window's helpers (tools\launcher_lib.ps1), the updater (tools\updater.ps1) and, where one is
+# built, "MK9 Rollback.exe" (launcher\Launcher.cpp) with temporary folders and fixture data only: no game, no network,
+# no window.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\launcher_selftest.ps1
 # Prints PASS/FAIL per check; the exit code is the number of failures.
 $ErrorActionPreference = 'Continue'
@@ -47,7 +48,8 @@ function New-FixtureZip([string]$path, [hashtable]$entries) {
 function Sha-Text([string]$zip) { "$((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash)  $(Split-Path -Leaf $zip)" }
 
 try {
-    # ---- fixture release v1 (installed) and v2 (the update) ----
+    # ---- fixture release v1 (installed: a version before 2026-11, opened by "Play Online.bat") and v2 (the update:
+    # a package of today, opened by "MK9 Rollback.exe") ----
     $dll1 = [Text.Encoding]::ASCII.GetBytes('dll version one'); $dll2 = [Text.Encoding]::ASCII.GetBytes('dll version two, longer')
     $v1 = @{
         'version.txt' = "version=20261101-1200`r`ndll=$(Sha $dll1)"; 'README.txt' = 'readme 1'; 'Play Online.bat' = '@echo one'
@@ -56,7 +58,7 @@ try {
         'docs\netplay_lan_test.md' = 'doc 1'
     }
     $v2 = @{
-        'version.txt' = "version=20261110-1200`r`ndll=$(Sha $dll2)"; 'README.txt' = 'readme 2'; 'Play Online.bat' = '@echo two'
+        'version.txt' = "version=20261110-1200`r`ndll=$(Sha $dll2)"; 'README.txt' = 'readme 2'; 'MK9 Rollback.exe' = 'program 2'
         'build\clang\MK9Rollback.dll' = $dll2; 'build\clang\MK9RollbackInjector.exe' = 'inj 2'
         'tools\netplay_gui.ps1' = '# gui 2'; 'tools\updater.ps1' = '# upd 2'; 'tools\netplay.ps1' = '# np 2'; 'tools\launch_game.ps1' = '# lg 2'
         'tools\launcher_lib.ps1' = '# lib 2 (new file)'; 'docs\netplay_lan_test.md' = 'doc 2'
@@ -85,7 +87,9 @@ try {
     Check 'zip allow-list rejects an unexpected file' (-not (Install-UpdateFromZip $odd (Sha-Text $odd) $root $null '20261110-1200'))
     Check 'zip allow-list: entry names' ((Get-ReleaseEntryPath '/abs.txt') -eq $null -and (Get-ReleaseEntryPath 'C:\x\version.txt') -eq $null -and
         (Get-ReleaseEntryPath 'tools/launcher_lib.ps1') -eq 'tools\launcher_lib.ps1' -and (Get-ReleaseEntryPath 'tools\sub\x.ps1') -eq $null -and
-        (Get-ReleaseEntryPath 'tools/') -eq '' -and (Get-ReleaseEntryPath 'Play Online.bat') -eq 'Play Online.bat')
+        (Get-ReleaseEntryPath 'tools/') -eq '' -and (Get-ReleaseEntryPath 'Play Online.bat') -eq 'Play Online.bat' -and
+        (Get-ReleaseEntryPath 'MK9 Rollback.exe') -eq 'MK9 Rollback.exe' -and (Get-ReleaseEntryPath 'tools\MK9 Rollback.exe') -eq $null -and
+        (Get-ReleaseEntryPath 'Other.exe') -eq $null)
     Check 'checksum mismatch changes nothing' ((-not (Install-UpdateFromZip $goodZip ('0' * 64) $root $null)) -and (Same-Hashes $orig (Get-TreeHashes $root)))
     Check 'nothing changed by the refused zips' (Same-Hashes $orig (Get-TreeHashes $root))
 
@@ -115,7 +119,10 @@ try {
     $prevOk = -not (Test-Path -LiteralPath (Join-Path $root 'previous_version\marker.txt')) -and -not (Test-Path -LiteralPath (Join-Path $root 'previous_version.new'))
     foreach ($k in $v1.Keys) { if ($prevHashes[$k] -ne $orig[$k]) { $prevOk = $false } }
     Check 'good install swaps previous_version (old files in, older backup gone)' $prevOk
-    Check 'good install lists the added file' ((Get-Content -LiteralPath (Join-Path $root 'previous_version\added_files.txt')) -contains 'tools\launcher_lib.ps1')
+    $addedList = @(Get-Content -LiteralPath (Join-Path $root 'previous_version\added_files.txt'))
+    Check 'good install lists the added files' ($addedList -contains 'tools\launcher_lib.ps1' -and $addedList -contains 'MK9 Rollback.exe') ($addedList -join ', ')
+    Check 'good install with the program takes "Play Online.bat" away (kept in previous_version)' (-not (Test-Path -LiteralPath (Join-Path $root 'Play Online.bat')) -and
+        $prevHashes['Play Online.bat'] -eq $orig['Play Online.bat'])
     Check 'good install keeps the settings' ((Get-Content -LiteralPath (Join-Path $root 'build\clang\netplay_gui.txt')) -eq 'settings stay')
     Check 'installed version is the new one' ((Get-InstalledVersion $root).version -eq '20261110-1200')
 
@@ -132,7 +139,7 @@ try {
         'SKIP  Restore-PreviousVersion file checks (2): a game is running; run this test again with the game closed'
     } else {
         $origNoPrev = @{}; foreach ($k in $orig.Keys) { if ($k -notlike 'previous_version\*') { $origNoPrev[$k] = $orig[$k] } }
-        Check 'Restore-PreviousVersion puts the old files back and removes the added one' ($ok -and (Same-Hashes $origNoPrev $back)) ($lines -join ' | ')
+        Check 'Restore-PreviousVersion puts the old files back (the .bat too) and removes the added ones (the program too)' ($ok -and (Same-Hashes $origNoPrev $back)) ($lines -join ' | ')
         Check 'Restore-PreviousVersion removes previous_version' (-not (Test-Path -LiteralPath (Join-Path $root 'previous_version')) -and -not (Test-Path -LiteralPath (Join-Path $root 'previous_version.undo')))
         Check 'Restore-PreviousVersion without a backup says so' (-not (Restore-PreviousVersion $root $null))
     }
@@ -229,7 +236,11 @@ try {
     $m5 = Get-LauncherMessage 'ONLINE: the other player runs Safe mode, this game Rollback: both must pick' 'Safe mode'
     $m6 = Get-LauncherMessage '[21:25:49.291] GGPO p2p stopped (match over): 7249 frames, 0 loads'
     $m7 = Get-LauncherMessage 'ONLINE: the session starts at the first fight frame of this fight' 'Safe mode'
-    Check 'message: groups, {mode}, rearm, kind' ($m4.Text -eq 'Input delay this match: 2 frame(s).' -and $m5.Text -like 'Your opponent uses Safe mode, you use Rollback*' -and
+    $m8 = Get-LauncherMessage '[21:13:30.001] ONLINE: this game controls player 2'
+    $m9 = Get-LauncherMessage 'NETPLAY DESYNC: frame 12'
+    Check 'message: the headline and its tone for the window''s status line' ($m8.Head -eq 'Rollback is on' -and $m8.Tone -eq 'good' -and $m8.Text -eq 'Rollback on. You are player 2.' -and
+        $m9.Head -eq 'Out of sync' -and $m9.Tone -eq 'bad' -and $m5.Head -and $m5.Tone -eq 'warn' -and $m4.Head -eq '' -and $m4.Tone -eq '') "$($m8.Head) / $($m8.Tone) / $($m9.Head) / $($m9.Tone)"
+    Check 'message: groups, {mode}, rearm, kind' ($m4.Text -eq 'Input delay this match: 2 frame(s).' -and $m5.Text -like 'Your opponent''s mod runs in Safe mode and yours in Rollback: both must update MK9 Rollback*' -and
         $m6.Rearm -and $null -eq $m6.Text -and $m7.Text -eq 'Safe mode takes over when this fight starts.' -and $m7.Kind -eq 'reset' -and
         (Get-LauncherMessage 'NETPLAY DESYNC: frame 12').Kind -eq 'desync')
     Check 'command acknowledgement lines' ((Test-CommandAck '[21:12:03.582] CMD netcode rollback') -and (Test-CommandAck '[21:12:03.718] CMD online auto ping') -and
@@ -343,14 +354,61 @@ try {
     Check 'session logs: the next start replaces previous_logs' ((Logs-In $ld) -eq 0 -and (Logs-In (Join-Path $ld 'previous_logs')) -eq 1 -and (Get-Content -LiteralPath $prevLog) -eq 'session two')
     Check 'session logs: the settings file stays' ((Get-Content -LiteralPath (Join-Path $ld 'netplay_gui.txt')) -eq 'settings stay')
 
-    # ---- 14. friend codes ----
-    Check 'friend code: the code, a SteamID64 (old and 7656120...), a profile link' ((ConvertTo-AccountId ' 123456789 ') -eq 123456789 -and
-        (ConvertTo-AccountId '76561198000000022') -eq 39734294 -and (ConvertTo-AccountId '76561200000000044') -eq 2039734316 -and
-        (ConvertTo-AccountId '76561202255233023') -eq 4294967295 -and (ConvertTo-AccountId 'https://steamcommunity.com/profiles/76561198000000022/') -eq 39734294)
-    $refused = @('', '   ', 'abc', 'at 9, my code is 123', '12 34', '1234abc', '0', '-5', '4294967296', '76561197960265728', '76561202255233024',
-        '99999999999999999999', 'https://steamcommunity.com/id/john123') | Where-Object { (ConvertTo-AccountId $_) -ne 0 }
-    Check 'friend code: anything else is refused' (-not $refused) "taken: $($refused -join ' | ')"
-
+    # ---- 14. an update through a version before 2026-11, and the program fetched afterwards ----
+    # Those versions' updaters take a zip only when every entry passes the list they carry; the frozen copy of it:
+    Check 'the older updaters'' list is unchanged' (($kLegacyReleaseFiles -join ' ') -eq ('^tools\\[^\\]+\.ps1$ ^build\\clang\\MK9Rollback\.dll$ ^build\\clang\\MK9RollbackInjector\.exe$ ' +
+        '^docs\\[^\\]+\.md$ ^version\.txt$ ^README\.txt$ ^Play Online\.bat$'))
+    function Passes-Legacy([string]$rel) { foreach ($p in $kLegacyReleaseFiles) { if ($rel -match $p) { return $true } }; $false }
+    $legacyKeys = @($v2.Keys | Where-Object { $_ -ne 'MK9 Rollback.exe' })
+    Check 'the zip for the older updaters: every file but the program passes their list' (-not @($legacyKeys | Where-Object { -not (Passes-Legacy $_) }) -and -not (Passes-Legacy 'MK9 Rollback.exe'))
+    $lstage = Join-Path $tmp 'legacy stage'
+    $v2legacy = @{}; foreach ($k in $legacyKeys) { $v2legacy[$k] = $v2[$k] }
+    Write-Files $lstage $v2legacy
+    $legacyZip = Join-Path $tmp 'MK9Rollback-netplay-20261110-1200.legacy.zip'
+    Compress-Archive -Path "$lstage\*" -DestinationPath $legacyZip
+    $root2 = Join-Path $tmp 'install [2]'
+    Write-Files $root2 $v1
+    $orig2 = Get-TreeHashes $root2
+    # What an older updater does with that zip: every file replaced, "Play Online.bat" left as it is, no program.
+    $ok = Install-UpdateFromZip $legacyZip (Sha-Text $legacyZip) $root2 $null '20261110-1200'
+    Check 'the zip for the older updaters installs, keeps "Play Online.bat" and brings no program' ($ok -and (Test-Path -LiteralPath (Join-Path $root2 'Play Online.bat')) -and
+        -not (Test-Path -LiteralPath (Join-Path $root2 'MK9 Rollback.exe')) -and (Get-InstalledVersion $root2).version -eq '20261110-1200')
+    $as = @{ full = [pscustomobject]@{ name = 'MK9-Rollback-20261110-1200.zip'; browser_download_url = 'u1' }; fullSha = [pscustomobject]@{ name = 'MK9-Rollback-20261110-1200.zip.sha256'; browser_download_url = 'u2' }
+        old = [pscustomobject]@{ name = 'MK9Rollback-netplay-20261110-1200.zip'; browser_download_url = 'u3' }; oldSha = [pscustomobject]@{ name = 'MK9Rollback-netplay-20261110-1200.zip.sha256'; browser_download_url = 'u4' } }
+    $pick1 = Select-ReleaseAssets @($as.old, $as.oldSha, $as.full, $as.fullSha)
+    $pick2 = Select-ReleaseAssets @($as.old, $as.oldSha, $as.full)
+    $pick3 = Select-ReleaseAssets @($as.old, $as.fullSha)
+    Check 'release assets: the package first, else the older updaters'' zip, never a zip without its checksum' ($pick1.Full -and $pick1.Zip.browser_download_url -eq 'u1' -and $pick1.Sha.browser_download_url -eq 'u2' -and
+        (-not $pick2.Full) -and $pick2.Zip.browser_download_url -eq 'u3' -and $pick2.Sha.browser_download_url -eq 'u4' -and $null -eq $pick3)
+    $relNow = [pscustomobject]@{ Version = '20261110-1200'; Full = $true }
+    Check 'an install without the program is seen as unfinished, for its own version''s package only' ((Test-InstallIncomplete $relNow $root2) -and
+        -not (Test-InstallIncomplete ([pscustomobject]@{ Version = '20261111-0000'; Full = $true }) $root2) -and
+        -not (Test-InstallIncomplete ([pscustomobject]@{ Version = '20261110-1200'; Full = $false }) $root2) -and -not (Test-InstallIncomplete $relNow $root) -and
+        -not (Test-InstallIncomplete $null $root2))
+    $before2 = Get-TreeHashes $root2
+    $otherStage = Join-Path $tmp 'other stage'
+    $v3 = @{}; foreach ($k in $v2.Keys) { $v3[$k] = $v2[$k] }; $v3['version.txt'] = "version=20261111-0000`r`ndll=$(Sha $dll2)"
+    Write-Files $otherStage $v3
+    $otherZip = Join-Path $tmp 'MK9-Rollback-20261111-0000.zip'
+    Compress-Archive -Path "$otherStage\*" -DestinationPath $otherZip
+    $lines.Clear()
+    $no1 = Complete-InstallFromZip $otherZip (Sha-Text $otherZip) $root2 { param($s) [void]$lines.Add($s) }
+    $no2 = Complete-InstallFromZip $goodZip ('0' * 64) $root2 $null
+    Check 'finishing an install: another version''s package or a damaged download changes nothing' ((-not $no1) -and (-not $no2) -and (Same-Hashes $before2 (Get-TreeHashes $root2))) ($lines -join ' | ')
+    $ok = Complete-InstallFromZip $goodZip $goodSha $root2 $null
+    $after2 = Get-TreeHashes $root2
+    $kept = $true
+    foreach ($k in $before2.Keys) { if ($k -ne 'Play Online.bat' -and $k -notlike 'previous_version\*' -and $after2[$k] -ne $before2[$k]) { $kept = $false } }
+    Check 'finishing an install: the program is added, no other file is touched' ($ok -and $kept -and $after2['MK9 Rollback.exe'] -eq (Get-TreeHashes $stage)['MK9 Rollback.exe']) "kept $kept"
+    Check 'finishing an install: "Play Online.bat" moves into previous_version and the program is noted there' ((-not $after2.ContainsKey('Play Online.bat')) -and
+        $after2['previous_version\Play Online.bat'] -eq $orig2['Play Online.bat'] -and
+        (@(Get-Content -LiteralPath (Join-Path $root2 'previous_version\added_files.txt')) -contains 'MK9 Rollback.exe') -and -not (Test-InstallIncomplete $relNow $root2))
+    if ($gameRuns) {
+        'SKIP  going back after a finished install (1): a game is running; run this test again with the game closed'
+    } else {
+        $ok = Restore-PreviousVersion $root2 $null
+        Check 'going back after a finished install returns the older version as it was (the .bat, no program)' ($ok -and (Same-Hashes $orig2 (Get-TreeHashes $root2)))
+    }
     # ---- 15. only the release's files are unblocked (the zip may sit in Downloads next to anything) ----
     $dl = Join-Path $tmp 'Downloads [x]'
     $strays = @('holiday.jpg', 'other-setup.exe', 'tools\someone-elses.ps1', 'docs\notes.md', 'build\clang\payload.exe', 'sub\tools\netplay.ps1')
@@ -388,7 +446,7 @@ try {
 
     # ---- 17. the scripts themselves ----
     $parseErrors = @()
-    foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'updater.ps1', 'netplay.ps1', 'launch_game.ps1', 'package.ps1') {
+    foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'updater.ps1', 'netplay.ps1', 'launch_game.ps1', 'package.ps1', 'publish_release.ps1', 'make_icon.ps1') {
         $f = Join-Path $PSScriptRoot $s
         if (-not (Test-Path -LiteralPath $f)) { continue }
         $tokens = $null; $errs = $null
@@ -396,11 +454,13 @@ try {
         foreach ($e in @($errs)) { $parseErrors += "$s line $($e.Extent.StartLineNumber): $($e.Message)" }
     }
     Check 'the scripts parse without errors in this PowerShell' (-not $parseErrors) ($parseErrors -join ' | ')
-    # "Play Online.bat" runs this first: it must end at once with code 0, before anything of the window exists.
+    # The "Play Online.bat" of the versions before 2026-11 runs this first (it stays after an update until the program
+    # is fetched): it must end at once with code 0, before anything of the window exists.
     function Run-Hidden([string]$exe, [string]$arguments, [int]$timeoutMs = 30000) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo $exe, $arguments
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+        $psi.EnvironmentVariables['MK9R_LAUNCHER_TEST'] = '1'  # "MK9 Rollback.exe" then prints what it would show in a box
         $p = [System.Diagnostics.Process]::Start($psi)
         $p.StandardInput.Close()  # a "pause" reads the end of the input and goes on
         $read = $p.StandardOutput.ReadToEndAsync()
@@ -411,38 +471,41 @@ try {
     $sc = Run-Hidden 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\netplay_gui.ps1`" -StartCheck"
     Check 'netplay_gui.ps1 -StartCheck ends at once with code 0' ($sc.Done -and $sc.Code -eq 0) "done $($sc.Done), code $($sc.Code)"
 
-    # ---- 18. "Play Online.bat" as tools\package.ps1 writes it (a developer tree; the package itself is not built) ----
-    $pkg = Join-Path $PSScriptRoot 'package.ps1'
-    if (Test-Path -LiteralPath $pkg) {
-        $tokens = $null; $errs = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($pkg, [ref]$tokens, [ref]$errs)
-        $batAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -like '@echo off*' }, $true)
-        $crlfAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'CrLf' }, $true)
-        $batDir = Join-Path $tmp 'bat test'
-        $bat = Join-Path $batDir 'Play Online.bat'
-        New-Item -ItemType Directory -Force -Path $batDir | Out-Null
-        $written = $false
-        if ($batAst -and $crlfAst) {
-            . ([scriptblock]::Create($crlfAst.Extent.Text))  # package.ps1's own CrLf
-            CrLf $batAst.Value | Set-Content -Encoding ascii -LiteralPath $bat
-            $written = $true
-        }
-        $bytes = if ($written) { [System.IO.File]::ReadAllBytes($bat) } else { @() }
-        $bareLf = 0
-        for ($i = 0; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -eq 10 -and ($i -eq 0 -or $bytes[$i - 1] -ne 13)) { $bareLf++ } }
-        Check 'Play Online.bat: found in package.ps1, written with CRLF line ends, ASCII' ($written -and $bytes.Length -gt 0 -and $bareLf -eq 0 -and $bytes[$bytes.Length - 1] -eq 10 -and
-            -not @($bytes | Where-Object { $_ -gt 126 })) "$bareLf line(s) end in LF only"
-        if ($written) {
-            $r0 = Run-Hidden 'cmd.exe' "/c `"`"$bat`"`""
-            Check 'Play Online.bat: without the tools folder it says to extract the zip' ($r0.Done -and $r0.Code -eq 1 -and $r0.Output -like '*Extract the whole zip first*') "code $($r0.Code): $($r0.Output)"
-            # A PC that refuses the script: PowerShell ends with an error before any window (here a stand-in that does).
-            Write-Files $batDir @{ 'tools\netplay_gui.ps1' = 'param([switch]$StartCheck) "stand-in: scripts are disabled on this system"; exit 1' }
-            $r1 = Run-Hidden 'cmd.exe' "/c `"`"$bat`"`""
-            Check 'Play Online.bat: a readable line and a pause when PowerShell refuses the script' ($r1.Done -and $r1.Code -eq 1 -and
-                $r1.Output -like '*MK9 Rollback cannot open its window*' -and $r1.Output -match 'Press any key|\. \. \.') "code $($r1.Code): $($r1.Output)"
-        }
-    }
-} finally {
+    # ---- 18. "MK9 Rollback.exe" (the newest one built in this tree, or the one of a release folder) ----
+    $program = @(Get-ChildItem -Path (Join-Path $PSScriptRoot '..\build\*\MK9 Rollback.exe'), (Join-Path $PSScriptRoot '..\MK9 Rollback.exe') -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    if (-not $program) {
+        'SKIP  "MK9 Rollback.exe" checks (6): none is built (.\build.ps1 -LauncherOnly)'
+    } else {
+        $pd = Join-Path $tmp 'program test'
+        $pexe = Join-Path $pd 'MK9 Rollback.exe'
+        New-Item -ItemType Directory -Force -Path $pd | Out-Null
+        Copy-Item -LiteralPath $program[0].FullName -Destination $pexe
+        $vi = (Get-Item -LiteralPath $pexe).VersionInfo
+        Check 'MK9 Rollback.exe: named as a program of its own in its file details' ($vi.FileDescription -eq 'MK9 Rollback' -and $vi.ProductName -eq 'MK9 Rollback' -and $vi.OriginalFilename -eq 'MK9 Rollback.exe') "$($vi.FileDescription) / $($vi.ProductName)"
+        $r0 = Run-Hidden $pexe ''
+        Check 'MK9 Rollback.exe: alone in a folder (opened from inside the zip) it says to extract the zip' ($r0.Done -and $r0.Code -eq 1 -and $r0.Output -like '*Extract the whole zip first*') "code $($r0.Code): $($r0.Output)"
+        # A PC that refuses the script: PowerShell ends with an error before any window (here a stand-in that does).
+        Write-Files $pd @{ 'tools\netplay_gui.ps1' = '"stand-in: scripts are disabled on this system"; exit 1' }
+        $r1 = Run-Hidden $pexe ''
+        Check 'MK9 Rollback.exe: says what PowerShell printed when the window cannot open' ($r1.Done -and $r1.Code -eq 1 -and
+            $r1.Output -like '*could not open its window*' -and $r1.Output -like '*stand-in: scripts are disabled on this system*') "code $($r1.Code): $($r1.Output)"
+        # The script reported its error itself (its own box) and printed nothing: no second message.
+        Write-Files $pd @{ 'tools\netplay_gui.ps1' = 'exit 1' }
+        $r2 = Run-Hidden $pexe ''
+        Check 'MK9 Rollback.exe: silent when the script ended without printing' ($r2.Done -and $r2.Code -eq 1 -and -not "$($r2.Output)".Trim()) "code $($r2.Code): $($r2.Output)"
+        # Arguments reach the script as typed, and the script runs in the 64-bit PowerShell on 64-bit Windows.
+        Write-Files $pd @{ 'tools\netplay_gui.ps1' = 'param([string]$A, [switch]$B) if ($A -eq "x y" -and $B -and [Environment]::Is64BitProcess -eq [Environment]::Is64BitOperatingSystem -and $env:MK9R_LAUNCHER) { exit 0 }; "got [$A] [$B] 64-bit: $([Environment]::Is64BitProcess)"; exit 1' }
+        $r3 = Run-Hidden $pexe '-A "x y" -B'
+        Check 'MK9 Rollback.exe: passes its arguments on, starts the 64-bit PowerShell, names itself to the script' ($r3.Done -and $r3.Code -eq 0) "code $($r3.Code): $($r3.Output)"
+        # The source tree's layout: the program in build\<name>\, the scripts two folders up.
+        $pd2 = Join-Path $tmp 'program tree'
+        Write-Files $pd2 @{ 'tools\netplay_gui.ps1' = 'exit 0' }
+        New-Item -ItemType Directory -Force -Path (Join-Path $pd2 'build\clang') | Out-Null
+        Copy-Item -LiteralPath $program[0].FullName -Destination (Join-Path $pd2 'build\clang\MK9 Rollback.exe')
+        $r4 = Run-Hidden (Join-Path $pd2 'build\clang\MK9 Rollback.exe') ''
+        Check 'MK9 Rollback.exe: finds the scripts two folders up (build\<name>\ in the source tree)' ($r4.Done -and $r4.Code -eq 0) "code $($r4.Code): $($r4.Output)"
+    }} finally {
     Get-ChildItem -LiteralPath $tmp -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
