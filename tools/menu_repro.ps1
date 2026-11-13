@@ -34,6 +34,22 @@ if (-not $Passive) {  # what the launcher sends
 }
 "mode: $(if ($Passive) { 'passive (mod loaded, rollback not armed)' } else { 'armed like the launcher' })"
 $game = Get-Process MKKE | Select-Object -First 1
+# A handle taken while the game runs: only through it can the exit time and code be read once the game is gone.
+$gameHandle = try { $game.Handle } catch { $null }
+# What to say about a game that exited during the walk. Without the handle its exit time reads as nothing, and
+# Get-Date then threw in place of the "GAME EXITED" report (rc32's gate, 2026-11-12); the code would read as 0.
+# The mod writes its PROCESS EXIT line when the game runs its own exit, not when the game is killed.
+function ExitReport($game, $handle, [string]$log) {
+    $at = if ($handle) { try { $game.ExitTime } catch { $null } }
+    $code = if ($handle) { try { $game.ExitCode } catch { $null } }
+    $own = Select-String $log -Pattern '^\[(\d\d:\d\d:\d\d)[^\]]*\] PROCESS EXIT' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $when = if ($at) { $at.ToString('HH:mm:ss') } elseif ($own) { $own.Matches[0].Groups[1].Value }
+            else { "a time not known, before $(Get-Date -Format HH:mm:ss)" }
+    $what = if ($null -ne $code) { 'exit code 0x{0:X8}' -f $code } else { 'exit code not known' }
+    $how = if ($own) { 'its log has a PROCESS EXIT line: the game ran its own exit (a quit or a closed window), it was not killed' }
+           else { 'no PROCESS EXIT line in its log: killed from outside, or gone without one' }
+    "GAME EXITED at $when ($what; $how)"
+}
 for ($w = 0; $w -lt 240 -and -not (Select-String $log -Pattern 'FPUGUARD' -SimpleMatch -Quiet); $w++) { Start-Sleep 1 }  # first tick
 Start-Sleep 8
 Focus | Out-Null
@@ -56,7 +72,7 @@ while ((Get-Date) -lt $end -and -not (Bad) -and -not $game.HasExited) {
 }
 $b = Bad
 $levels = @(Select-String $log -Pattern 'timeline restart').Count - $restarts
-"menus: $moves key presses, $levels timeline restart(s) (level loads); $(if ($b) { "FROZE: $($b.Line.Substring(0, [Math]::Min(200, $b.Line.Length)))" } elseif ($game.HasExited) { "GAME EXITED at $(Get-Date $game.ExitTime -Format HH:mm:ss) (exit code 0x{0:X8})" -f $game.ExitCode } else { 'no hang or crash' })"
+"menus: $moves key presses, $levels timeline restart(s) (level loads); $(if ($b) { "FROZE: $($b.Line.Substring(0, [Math]::Min(200, $b.Line.Length)))" } elseif ($game.HasExited) { ExitReport $game $gameHandle $log } else { 'no hang or crash' })"
 "game responding: $((Get-Process MKKE -ErrorAction SilentlyContinue | Select-Object -First 1).Responding)"
 Select-String $log -Pattern 'MEMORY gf|MKHEAPS' | Select-Object -Last 2 | ForEach-Object Line
 # The quarantine must stay off in the menus (no session): an 'on' line or a pressure release here is a failure.
@@ -66,3 +82,4 @@ $pr = @(Select-String $log -Pattern 'QUARANTINE pressure release' -SimpleMatch).
 Copy-Item $log "$root\results\${Name}.log" -ErrorAction SilentlyContinue
 Copy-Item "$dir\MK9Rollback_frames.log" "$root\results\${Name}_frames.log" -ErrorAction SilentlyContinue
 Get-Process MKKE -ErrorAction SilentlyContinue | Stop-Process -Force
+if ($game) { $game.Close() }  # gives the handle back

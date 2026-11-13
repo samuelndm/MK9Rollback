@@ -34,14 +34,24 @@ Add-Type -Name Idle -Namespace QueuedChecks -MemberDefinition @'
 [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int p);
 [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(int f);  // int: PowerShell reads 0x80000003 as a negative Int32
 '@
+# The lock screen is up: its LogonUI runs in this session while the PC is locked and ends when it is unlocked.
+function Locked {
+    $session = (Get-Process -Id $PID).SessionId
+    [bool](Get-Process LogonUI -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+}
 function Free {
     $l = New-Object QueuedChecks.Idle+L
     $l.cb = 8
     [QueuedChecks.Idle]::GetLastInputInfo([ref]$l) | Out-Null
     $idle = [int](([Environment]::TickCount - $l.t) / 1000)
+    # The foreground window's program; none when no window is in front, as behind the lock screen (seen 2026-11-12).
+    # Before 2026-11-13 that case asked for process id 0, whose name is "Idle": it passed the "not LockApp" test
+    # below, so a locked PC counted as free, and a menu walk started there cannot focus the game.
     $p = 0
-    [QueuedChecks.Idle]::GetWindowThreadProcessId([QueuedChecks.Idle]::GetForegroundWindow(), [ref]$p) | Out-Null
-    $fg = (Get-Process -Id $p -ErrorAction SilentlyContinue).Name
+    $h = [QueuedChecks.Idle]::GetForegroundWindow()
+    if ($h -ne [IntPtr]::Zero) { [QueuedChecks.Idle]::GetWindowThreadProcessId($h, [ref]$p) | Out-Null }
+    $fg = if ($p) { (Get-Process -Id $p -ErrorAction SilentlyContinue).Name }
+    if (Locked) { return $false }
     # 4 min, under the display's 5-min idle timeout: at 5 min the display was already off and Windows' 15-min
     # away timer running, so the PC locked mid-run and the menu walk could not focus the game (2026-10-30).
     # No game running either: gamepad input does not reset the idle time, so a player in an MK9 match with a
@@ -102,6 +112,10 @@ while (-not $Now -and -not (Free)) {
     Start-Sleep 30
 }
 "checks start $(Get-Date)"
+# -Now skips the wait above. The two-game checks run behind the lock screen; the menu walk does not (rc33's gate).
+if ((Locked) -and -not ($LagMatrix -or $RegressRepeat -gt 0 -or $PeerLossOnly -or $SoakOnly)) {
+    "note: the PC is locked. The menu walk needs the game in front and will not pass$(if (-not $MenuOnly -and -not $MenuRepro) { '; the other checks run, and -MenuOnly <this output> reruns the walk alone once the PC is unlocked' })."
+}
 # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED: no display timeout, standby or lock while the games run
 # (a video player's request; it ends with this PowerShell or the reset at the end).
 [QueuedChecks.Idle]::SetThreadExecutionState(0x80000003) | Out-Null
