@@ -16,10 +16,10 @@ and lag_ns80_d2 passed; fixes below).
 
 **2026-11-12 the launcher: "MK9 Rollback.exe" instead of "Play Online.bat", a window without options, and the fix for
 the window that stayed invisible after "Update now".** Made in the side folder `MK9R_launch` (on 944e794) and merged
-into this working tree at 21:57 on the user's "Yes, merge" (uncommitted, next to the stall fix and SysWatch;
+into this working tree at 21:57 on the user's "Yes, merge" (next to the stall fix and SysWatch;
 `build\clang\MK9 Rollback.exe` built with `build.ps1 -LauncherOnly`, rc34's DLL and injector untouched; the self-test
 passes here, 98 of 98). Gated together with rc34 on 2026-11-13 00:41 and released 01:03 as v20261113-0041 (last
-bullets); the source is not committed.
+bullets); source in 8ba7fe1.
 - The fault: the versions up to v20261112-1447 restart after an update with `Start-Process powershell -WindowStyle
   Hidden`. Windows applies that request to the first window the new process shows, which is the form itself: the
   window runs invisible, keeps the one-window mutex, and every new start answers "already open". Seen on the user's PC
@@ -84,9 +84,8 @@ bullets); the source is not committed.
   `logger_test.exe` is in a KEYWAIT line's processor-time list).
 - **Released 2026-11-13 01:03 as v20261113-0041 (Latest) on the user's "Yes, publish".** Four assets: the package,
   the zip for the older updaters and their `.sha256` files; downloaded back, all four equal the gated files. The tag
-  sits on 944e794: the release's source is this tree's uncommitted work (the stall fix, SysWatch, the launcher) and
-  is not pushed yet. `README.txt` in the zip calls the program's source public, so that push is owed (the user was
-  asked). The notes name the program and the window without options, the fix, the F9 key read and the Windows event
+  sits on 944e794, the commit before the source (8ba7fe1, the bullet after the next). The notes name the program and
+  the window without options, the fix, the F9 key read and the Windows event
   log (which does not remove the stalls yet), how an update from an earlier version goes, the SmartScreen prompt,
   testing on one PC, no online match through the new window, and that both players must update.
 - The update path against that real release, 01:10 (a copy of the released 1447 zip in a temporary folder, the window
@@ -96,7 +95,17 @@ bullets); the source is not committed.
   Online.bat" in `previous_version`); "MK9 Rollback.exe" then hands over to the open window; "Go back" returns 1447
   file for file. The same passed without a window (the updater's calls in a child process). A first attempt at 01:05
   stopped at the old updater's "Close the game first" (another session's test game was running) and changed nothing.
-- Not done: an online match through the new window; committing and pushing the source (needs the user's yes).
+- **Source pushed 2026-11-13 as 8ba7fe1 on the user's "Yes, push source"** (27 files: the stall fix and SysWatch, the
+  launcher, their tests and docs; `tools\Play Online.bat` removed). Made in a clean checkout of 944e794 with the
+  release's files; `tests\host\run.ps1` as the release's manifest has it (`build\clang_rc34\source_manifest.txt`),
+  because another session's log-rotation work had reached this tree after the gate (`src\debug\Logger.cpp`,
+  `tests\host\logger_test.cpp`, lines of `run.ps1`: not in the release, not committed). Checked there: every file of
+  the manifest equal apart from the launcher's; the zip's scripts equal the commit; a build with
+  `build\ggpo_rc30\libggpo.a` equals the released DLL and injector in every code and data section (the debug
+  sections differ with the folder the compiler ran in) and the released program in all but its build time stamp;
+  the twelve host tests and the self-test pass (97 there: the check on a real game log has no log in a clean
+  checkout); 3081 added lines scanned for personal data, clean.
+- Not done: an online match through the new window.
 
 **2026-11-12 rc33, the release before v20261113-0041 (v20261112-1447, DLL A23E54EC; source in 42b79d1): rc31 plus trace lines for the
 stage and the rematch.** Logging only, the first step of the stage-pick and re-fight features: in a connected
@@ -2183,8 +2192,8 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
       DLL 42E40572 in `build\clang_stall2`) and merged into this tree on 2026-11-12 20:40 on the user's "Merge and
       gate" as rc34 (DLL DFF13147 in `build\clang_rc34`). Its first gate was stopped at 20:49 in the second check and
       has no verdict; a full gate passed on 2026-11-13 00:09-00:41 together with the new launcher (the launcher entry
-      near the top has it, `results\gate_20261113_rc34.txt`) and it was released 01:03 as v20261113-0041; the source
-      is not committed.**
+      near the top has it, `results\gate_20261113_rc34.txt`) and it was released 01:03 as v20261113-0041; source in
+      8ba7fe1.**
       - What the field logs had (2026-11-11, the player's PC, 5 stalls of 147-238 ms): in two of them 183 and 199 ms
         lay inside the overlay's timed draw (frames of 197 and 218 ms), the engine tick under 1 ms. Up to rc31
         `Overlay::Draw` calls `GetAsyncKeyState(VK_F9)` once per frame on MKKE's render thread, at display level 0
