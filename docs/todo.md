@@ -2324,6 +2324,214 @@ part, rollback depths; `src\rollback\FramePace.cpp`). Tools: `tools\scenario_mat
           millisecond another program did. None of them came with a key-poll wait of 50 ms or more, and game A logged
           no hitch at any of them (it was minimized for most of the run). Still not seen: a stall with a real cause,
           an announcement during a fight in front, anything on two PCs.
+        - (rc34 was then gated and released by the launcher session, 2026-11-13 00:41 / 01:03, v20261113-0041; see
+          that session's entry.)
+      - **rc35 = the released rc34 + the log-writer fix of 2026-11-13 01:05 (`src\debug\Logger.cpp`; the tree is
+        90d369a + Logger.cpp, logger_test.cpp, run.ps1), gate of 2026-11-13 02:22-02:44 on the user's "Yes, gate rc35":
+        every check passed but the menu walk; not released, not committed.** `build\clang_rc35`: DLL 300D3B55 (its
+        injector and program were not used: `build\clang` keeps the released 5668B2CF / 6EE9EDC5, their sources being
+        unchanged; the released set is complete in `build\clang_rc34`). 12 host tests and the launcher self-test pass
+        (`results\hosttests_rc35.txt`, `results\selftest_rc35.txt`). Gate output `results\gate_20261113_rc35.txt`,
+        game logs kept in `results\gate_20261113_rc35_logs\`: online smoke passed; regression, auto re-arm and delay
+        changes each 3 fights, 6 checksum reports, 0 mismatching, 0 crashes, 0 cut sessions; lockstep lag and peer
+        loss passed; menu walk "MKKE window is not in the foreground" (the PC locked itself at 02:34:02, during the
+        second run). The walk alone is queued (`-MenuOnly`, started by a waiter once the PC is unlocked, untouched for
+        four minutes and free of games, launcher windows and scripts); it builds the zips if it passes.
+        - **Seen in this gate and in no kept log before it (37 logs with the stall sampler since 2026-11-11, rc34's
+          gate two hours earlier among them): game B stopped as a whole process three times, 268-396 ms, each in the
+          first second of a fight** (02:26:18 regression fight 1; 02:41:45 and 02:43:07 delay-change fights 2 and 3;
+          6 of 9 fights without). B's own line: "the sampler thread did not run for 359 ms (asked 10 ms): the whole
+          game process (or the PC) was stopped"; its HITCH lines show neither the boundary nor the engine tick (0.1
+          and 1-3 ms). Game A kept running and waited for B each time (STALLHOLD, 183-400 ms hitches with "wait"
+          166-381 ms); A's sampler ran every 33 ms throughout, so the PC as a whole did not stop. No SYSEVENT line
+          within seconds of the three moments. B's log writes were slow in the same run (LOGIO: longest write 416 to
+          4349 ms in five of nine sessions; rc34's gate: 1-19 ms; the stopped rc34 run of 20:51 also had one of
+          2750 ms).
+        - What the PC was doing, from Windows' own logs: it had entered screen-off standby at 02:19:02 (Kernel-Power
+          506, idle timeout) and was woken at 02:22:21 by the gate's own synthetic mouse input (507 "Input Mouse"),
+          nine seconds into the gate; `LogonUI` was already running then although Winlogon logged the lock only at
+          02:34:02, which is why both the gate script's new test and mine called the PC locked at 02:22. Task Manager,
+          opened by the user at 20:49:31, was still running (the one KEYWAIT of the gate, 84.7 ms at 02:29:01 in B,
+          lists it with 5.6 s of processor time in 49 s; Task Manager's usual priority is high, not read here). RAM
+          was 90-95% in use (727-1553 MB free), about as in rc34's gate. The harness gives B core 0 only, at
+          below-normal priority, so anything busier on that core stops all of B.
+        - **Not established: whether the log-writer change has any part in it.** Against: the change runs on the log
+          writer's own thread, the diff has nothing that stops other threads, and a starved or suspended process is
+          what the lines describe. For: it is the only difference in the DLL, and the stops appeared in the first gate
+          with it. No rc34 / rc35 pair was run under the same conditions; that needs another game run and the user's
+          word. Until then rc35 is not recommended for release.
+        - **Read in the code and the kept logs, 2026-11-13 08:30 (no game run): the change was not on the path these
+          games took.** Outside a frame-log rotation (at 48 MB; B's frame log ended each run at 2.5 MB) and the death
+          of the writer's thread, the diff adds one comparison per frame-log write (`FramesReady`) and one per Flush or
+          Close (`NoteClosed`); none of the six kept logs has a `LOGGER:` line, so neither of those two paths was
+          entered. The stop line times only the sampler's own timer wait (`FramePace.cpp`: asked 10 ms, back after
+          268-396 ms), so no lock of the logger can produce it. In B that thread runs at priority 8 (highest, in a
+          below-normal process), the level of any ordinary thread of another program, and the log writer at 5, under
+          the game thread's 6: a core 0 that something else keeps busy gives both symptoms, the stops and log writes
+          that wait for seconds. The slow write is in rc34's DLL too (2750 ms in the stopped run of 20:51). Where B's
+          frames of 100 ms or more fall: in rc34's gate one per session, 380-404 ms at +33.2 s (the fight's end), and
+          none in a session's first seconds; in rc35's gate the same one in all nine sessions, plus in three of them a
+          cluster in the first four seconds (129-421 ms at +0.8 to +3.7 s) with the stop at +1.3 to +1.4 s. What kept
+          core 0 busy in those three starts is not known.
+        - **From the log-writer fix's own session, 2026-11-13 08:25 (kept logs and source only, no game; added on the
+          user's "Yes, add it"): the same stop is in two kept logs of 2026-11-08, five days before the change.**
+          `results\scenarios\cpu11a_slowB_ns30_d2_slowB_B.log` and `cpu11b_slowB_ns30_d2_slowB_B.log` (DLL CB32186E,
+          B on one core at below-normal priority as in the gate, sampler switched on by `stallsample 30`, no stall or
+          pause command sent): "the sampler thread did not run for 294 / 245 ms" in cpu11a's third fight and "425 /
+          394 / 291 ms" in cpu11b's second, the first of each at gf 100038 / 100037, its line 0.9-1.0 s after the FIGHT
+          line (rc35's three: gf 100051 / 100047 / 100053, 1.2-1.3 s after it). So the first bullet's "in no kept log
+          before it" holds for the logs since 2026-11-11 only; the stops are older than the change and come with a
+          slowed B about one second into an online fight. Two more things from rc35's own gate: game A ran the same
+          DLL with log writes of 0-1 ms and no stop, and in B stops and slow writes do not go together (longest write
+          per session: regression 916 ms with a stop / 2419 / 0, auto re-arm 2453 / 0 / 0, delay change 416 / 4349
+          with a stop / 0 with a stop; one stop without a single slow write, three slow writes without a stop). Still
+          not known: what stops B there (in cpu11b and at 02:26:17 the game thread's sample next to the stop is inside
+          steamclient.dll). The whole of it: that session's hand-over note `logger-rotation-exit-fault.md` (outside
+          the repository), last section.
+        - The pair, on the user's "Yes, run the pair" (2026-11-13 08:11): `pair_run.ps1` (the session's scratchpad)
+          runs the gate's regression four times, rc34, rc35, rc35 with delay changes, rc34 with delay changes, 3 fights
+          each, from folders of its own (`build\pair_rc34`, `build\pair_rc35` and their `_b`; `-Dirs`), all with the
+          released injector, so `build\clang` / `build\clang2` keep rc35's DLL. Output `results\pair_20261113.txt`.
+          Not started at 08:20 because a game was open. That game was this session's own: the menu walk's waiter had
+          started the walk at 08:17:11 and the walk its game at 08:17:24, and stopping the waiter at 08:18 ended the
+          scripts, not the game. It stayed open until 09:23:55 (closed at the PC, an ordinary exit in its log), and
+          the pair waited that hour for it. The menu walk is still on hold.
+        - **The pair ran 09:29-09:58 (4 of 4 runs, 12 fights, 24 checksum reports, none mismatching, no game left
+          open, `build\clang` / `build\clang2` still 300D3B55). It did not clear rc35: rc34 0 of 6 sessions with a
+          whole-process stop of game B, rc35 1 of 6** (run 2, first session: 247 ms and 210 ms, 0.9 and 1.2 s into
+          the session, 09:39:48). Game A: none in either build. Files `results\pair_20261113.txt`,
+          `results\pair_20261113_<n>_<build>_<kind>.txt` and `_A.log` / `_B.log`.
+          - With the gates of the night before, same harness, back to back: **rc35 4 of 15 sessions, rc34 0 of 15**
+            (rc34 0 of 18 with the stopped gate of 20:53). Chance alone gives 4-0 about one time in 20. In every kept
+            log since the sampler exists (2026-11-06): game B 878 sessions before rc35, a stop in two logs only (both
+            2026-11-08, 15 minutes apart, DLL CB32186E); game A 922 sessions, never.
+          - Not a matter of degree. Long frames in the first 4 s of a session, game B: rc34, 15 sessions, nothing over
+            64 ms but one of 108 ms; rc35, the four sessions with a stop have a cluster of 150 to 420 ms from +0.8 to
+            +3.7 s, its other eleven look like rc34's.
+          - What is the same in both builds: memory 92 to 96% in use in every run (600 to 1200 MB free of 16 GB); the
+            slow log writes (rc34 1666 and 3283 ms in the pair, rc35 582 and 2614 ms), which are the writer thread
+            (priority 5) waiting behind the game thread (6) on B's one core; the environment print (once a process,
+            15 to 47 ms); Task Manager open (57 processor seconds a run until the PC locked itself at 09:43:37, 11 to
+            12 after). Windows announced nothing at the stops (no SYSEVENT line within seconds), and no other session
+            ran a command then.
+          - What the two DLLs differ in: `src\debug\Logger.cpp` only (the two `source_manifest.txt` compared; the
+            build script's change between them adds the launcher and leaves the DLL's command as it was). Read again
+            line by line: outside a rotation the change is one comparison a write and two globals set at Open. No
+            rotated frame log exists in any folder. So no way is known by which the change could stop a thread, and
+            the count still says the rc35 binary behaves differently in this harness. Both stand; neither is
+            explained away.
+          - One more observation: at the second stop game A's own game thread (normal priority, any processor) was
+            129 ms late in the game's own code (sample at 0052B884, the return of the call B's game thread sat in at
+            both stops, 0052B881), and A's frame and B's stop ended in the same millisecond (09:39:48.353). Something
+            outside B's process took part at least that once.
+          - Not done: finding what had the processor during a stop. The log cannot say it today. A line for it
+            (processor time by processor, with interrupt and deferred-call time, by thread of the game and by
+            program, across the stop) would name the cause here and in the field stalls too; the cleanest test is
+            that line built into both Logger.cpp versions the same minute, run alternately with 6 fights a run. Needs
+            the user's yes (code in the DLL, about 50 minutes of test games). Until then rc35 is not recommended for
+            release, and every later candidate built from this tree carries the same Logger.cpp.
+          - Built on the user's "Yes, build and run" (2026-11-13 11:14), in the worktree `D:\Projects\MK9\MK9R_stopwho`
+            (on 90d369a, uncommitted, not in this tree): `src\debug\StopWho.{h,cpp}` and its calls in the stall
+            sampler (`FramePace.cpp`) and the overlay's watcher (`Overlay.cpp`), host test `stopwho` (20 of 20: a
+            program kept to one processor and stopped there by a thread of its own, by another program at a higher
+            priority, and not at all; the lines told the three apart and named the thread and the program). After
+            each "the sampler thread did not run" line come three STALLWHO lines: the game's processors over the stop
+            (idle, programs, deferred driver calls, interrupts, and this game's own share), this game's threads and
+            the other programs' threads since the last reading (thread id, priority, ms). The same three are written
+            for every session's first two seconds, stop or not. Cost: the processors' times are read every 40 ms
+            during a session (17 to 75 microseconds a reading), every thread on the PC once a second by the watcher.
+            Two DLLs built the same minute, one with each Logger.cpp: `build\clang_rc34w` (8BC8F9FC, HEAD's
+            Logger.cpp) and `build\clang_rc35w` (AA2F0174, this tree's). Not for release as they are (no switch to
+            turn the readings off).
+          - **Its run, 2026-11-13 11:29-12:14: each build stopped once, so the stop is not the log-writer change's.**
+            Scratchpad `pair_run.ps1 -Tag stopwho_20261113`; `results\stopwho_20261113.txt` and
+            `results\stopwho_20261113_<run>_<build>_<kind>_A.log / _B.log`. Four two-game runs of 6 fights in the
+            order rc34w plain, rc35w plain, rc35w delaychange, rc34w delaychange; the PC's screen was off or locked
+            for all four. 24 fights ended, 48 checksum reports, none mismatching, no crash, no game left open.
+            Game B: rc34w 1 of 12 sessions with a whole-process stop (250 ms at 12:11:59, 1.1 s into session 5 of
+            run 4), rc35w 1 of 12 (301 ms at 11:50:48, 1.3 s into session 6 of run 2). Game A: none.
+            - What the lines say, alike at both stops: processor 0 (the only one B may use) idle 0 ms, programs
+              313 / 266 ms of the 312 / 281 ms read, deferred driver calls 0 ms, interrupts 0 / 16 ms, "this game's
+              own threads used 313 / 266 ms", pages read from the disk 0 / 1. So nothing outside the game took the
+              processor and the game was not held on a disk read: its own threads used the whole stop.
+            - Which threads: in the 1301 / 1067 ms up to the end of the stop the busiest is a thread of NVIDIA's
+              Direct3D driver inside the game (`starts at nvd3dum.dll+45A344`, base priority 7, read at priority 8
+              after the first stop and 11 after the second) with 594 / 438 ms; render thread 94 / 94 ms, game thread
+              63 / under 31 ms (both priority 6); then more threads of the same driver routine at priority 1 with
+              31-47 ms each. The sampler runs at 8 here (highest, in a below-normal process), so only something at
+              or above 8 keeps it from running for 250 ms, and the driver's threads are the only ones of the game
+              that were read there.
+            - It is there in every session, stop or not, in both builds (the "first two seconds" lines of all 48
+              sessions; in B that window is 2.8-3.4 s long because the watcher itself runs late): in game B that
+              driver thread uses 1453-1844 ms of the one processor, the game thread 172-453 ms, the render thread
+              234-547 ms, idle 0 ms; the two sessions with a stop (1750 and 1672 ms) are not apart from the rest. In
+              game A (all 32 processors) the same thread uses 281-438 ms of 2.4 s at priority 10 (base 9) beside a
+              game thread and a render thread with a processor each. Driver: NVIDIA 32.0.16.1692 of 2026-09-03.
+            - So the stop is a product of the harness's slowed game B (one processor, below-normal class): at a
+              fight's start the graphics driver's threads want more than half of that processor at a priority above
+              the game's own threads, and now and then they keep everything else off it for 250-400 ms. Over all
+              runs since rc34's gate: 6 of 54 game-B sessions, about 1 in 9; the same stop is in the two kept logs
+              of 2026-11-08. **A STALL "the sampler thread did not run" in game B in the first seconds of a session,
+              with no SYSEVENT near it, is this and says nothing about the candidate.**
+            - The counts, read again: run side by side in the same hour (the pair and this run) the builds with
+              this tree's Logger.cpp have 2 of 18 sessions with a stop, those with HEAD's 1 of 18. The 4-to-0 of
+              before leaned on the two gates, run at different hours (rc35's behind the lock screen, rc34's not).
+              With the gates it is 5 of 27 against 1 of 27, which chance alone gives about 1 time in 10.
+            - Not settled: how the stop's time divides between the driver's base-7 thread and its priority-1
+              threads (the per-thread reading covers the second before the stop, not the stop alone; Windows lifts
+              threads that have starved to priority 15 for a moment, which would fit the priority-1 ones); what the
+              driver works on at a fight's start; why most sessions get through without a stop. None of it bears on
+              the log writer.
+            - For rc35: the doubt is answered; what its gate still lacks is the menu walk (`-MenuOnly`, needs the
+              PC unlocked; `build\clang` / `clang2` still hold 300D3B55 from before the gate's start). StopWho stays
+              in its worktree: as a tool it is ready; in a release it would need a switch and a gate of its own, and
+              it fires only on a whole-process stop, which no field log has shown yet.
+          - The menu walk of 14:14:30-14:23:54 (on the user's "Yes, run it"; `results\gate_20261113_rc35_menu.txt`,
+            `results\menu_repro.log`): **no verdict**. Start pressed 14:15:53; 300 key presses over 7 min 46 s with
+            no hang, crash, hitch or foreground change in the game's log. From 14:23:39 other windows came to the
+            front (the Alt+Tab view, the Claude app, Windows search, the taskbar), the game was minimized twice and
+            the walk pulled it back each time (`menu_repro.ps1` refocuses the game before every key). At 14:23:51,
+            two seconds before the walk's 8 minutes were over, the game ran its own exit on the game thread (exit
+            code 0). The script counts any exit as a failure, so no zip. Whether the window was closed by hand or
+            keys reached a quit prompt during the tussle is not established; nothing points at the candidate. The
+            walk had been started with a 20 s idle time while the user was working at the PC: that was the mistake.
+            Armed again 15:57 on the user's "continue" with the 240 s idle time and a display-on request for the
+            walk's length (scratchpad `menu_wait.ps1`; the walk's posted keys do not count as input, so the screen
+            would otherwise switch off mid-walk); it gives up after 8 h.
+          - **The rerun passed, 16:01:20-16:10:46: rc35's gate is complete** (two-game checks 02:22-02:44 in
+            `results\gate_20261113_rc35.txt`, the walk in `results\gate_20261113_rc35_menu.txt`, the same DLL
+            300D3B55 throughout). 306 key presses, no hang or crash, game responding, no hitch, no window change in
+            the game's log, quarantine never on. Zips: `dist\MK9-Rollback-20261113-1610.zip` (SHA-256 B4934C6E...)
+            and `dist\MK9Rollback-netplay-20261113-1610.zip` (05CBCECC...). Checked (scratchpad `cand_after.ps1`):
+            the DLL inside both is 300D3B55; against the released 0041 zips only `build\clang\MK9Rollback.dll`,
+            `README.txt` and `version.txt` differ; every scan hit is in a file identical to the released one (the
+            repository's name, the SteamID64 base constant, the launcher's path-scrubbing code); the tree equals the
+            build's source manifest (192 files). **Not published** (needs the user's yes).
+            - Before publishing: the updater compares version stamps as text (`tools\updater.ps1`, Test-UpdateNewer)
+              and 1610 is later than the two ungated combined test zips of the same afternoon (`MK9R_all\dist`,
+              1444 and 1519). Installs of those would be offered rc35 as an update and lose what they are testing.
+          - **Published 2026-11-13 16:19 as v20261113-1610 (Latest)** on the user's "Yes, publish"
+            (`tools\publish_release.ps1`; title "MK9 Rollback 20261113-1610"; four assets: both zips and their
+            .sha256). GitHub's SHA-256 digests of all four equal the local files; the updater's own query returns
+            the new tag; the tag sits on 90d369a (the source of the log-writer fix is not pushed yet). The real
+            update path passed with no game: a copy of the released 0041 package, by its own
+            `tools\updater.ps1 -Apply`, became 1610 with all 11 files equal to the package, then `-Restore` returned
+            0041 exactly. Not exercised: the window's "Update now" button, an online match on rc35, two PCs. Both
+            players must update together (another DLL print: `HelloProto` says "different builds of the mod" and
+            MK9's own netcode plays). The combined test zips 1444 / 1519 are now offered this update by their
+            window (a button; nothing installs by itself); a later combined zip needs a stamp after 1610.
+          - **Source pushed 2026-11-13 17:06 as d99d7d0** on the user's "Yes, push source": `src\debug\Logger.cpp`,
+            `tests\host\logger_test.cpp`, `tests\host\run.ps1` (258 lines added, 14 removed). Checked first in a
+            clean checkout of 90d369a plus the three files: equal to rc35's build manifest (apart from a git-ignored
+            tool binary), a rebuild with `build\ggpo_rc30\libggpo.a` equal to the released DLL and injector in every
+            code and data section (the build id and two debug sections differ with the folder's name) and to the
+            program in every section, the added lines scanned clean. The host tests were not run again there (a game
+            of the user's was open); the same files had passed all twelve when rc35 was built
+            (`results\hosttests_rc35.txt`, 01:31). The release's tag stays on 90d369a, the commit before.
+        - Two things the gate showed about the stall log itself: (1) a KEYWAIT outside a session reads processor time
+          over the whole gap since the last reading (49 s here), because readings are only taken during sessions,
+          which makes its program line of little use there; (2) behind a screen that is off the log still writes the
+          start-up values and the lock-screen events ("the desktop was switched", LockApp.exe in front at 02:34:02).
       - The first probe ran at 13:17:05-13:17:10 while another session's gate fight was running (no check for games
         before it): the 39-42 ms overlay draws both of that gate's games logged then are the probe's. The probe's
         runner and the batch scripts now refuse to start beside a game.
