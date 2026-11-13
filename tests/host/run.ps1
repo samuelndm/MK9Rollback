@@ -36,7 +36,8 @@
 #   logger  src\debug\Logger: bursts from four threads, a 60 Hz loop beside a flat-out logger, Flush / TryInfo with the
 #           other threads suspended, children killed and exiting mid-burst (about a minute, and a few hundred MB of logs
 #           under build\hosttests\logger, deleted afterwards); then the exits again in a build that drops frame-log
-#           lines early, for the report of dropped lines.
+#           lines early, for the report of dropped lines, and in one that rotates the frame log every 32 KB, for the
+#           exit that comes in the middle of a rotation and for the rotation that cannot open its new file.
 #   winlock  NOT in the default list (-Only winlock): winlock_probe.cpp keeps the window manager busy three times (about
 #           60-100 ms each on the PC it was written on) and shows that GetAsyncKeyState in another thread waits as long
 #           while PeekMessage on an empty queue and GetForegroundWindow do not: why the overlay reads the F9 key on a
@@ -254,7 +255,8 @@ if ($Only -contains 'logger') {
         $ok = $LASTEXITCODE -eq 0
         # A failed run keeps its files (the test names the child's folder): the exit failures come about once in several
         # hundred children, and this line used to delete the only evidence (2026-11-12: one child's frame lines absent
-        # and not reported, 1 of 660 exits that day; the run before and 480 exits after it passed).
+        # and not reported, 1 of 660 exits that day and once more that evening; the second one's files showed an exit
+        # inside a rotation of the frame log, see the last run below).
         if ($ok) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
         else { Write-Host "  the run's files are kept in $work (deleted by the next run)" }
     }
@@ -271,6 +273,27 @@ if ($Only -contains 'logger') {
         Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
         & (Join-Path $out 'logger_test_drops.exe') $work exitonly 1 drops | Where-Object { $_ -match 'FAIL|ALL CHECKS|not in the files|dropped over|files kept' } |
             ForEach-Object { Write-Host "  $_" }
+        $ok = $LASTEXITCODE -eq 0
+        if ($ok) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
+        else { Write-Host "  the run's files are kept in $work (deleted by the next run)" }
+    }
+    # The same exits with a 32 KB frame log, which rotates a few hundred times in a child's life: about a third of the
+    # children exit while the writer is inside a rotation, with the file closed (at 3 MB: about 1 in 700). The lines
+    # still in memory must reach the files then too; the run fails if no child exited there. Before the fix of
+    # 2026-11-12 those lines went to a closed handle: 24 of 60 children failed here.
+    # Then, in the same build, a rotation whose open fails (the test takes the file's name in between): the main log
+    # must say so and count every line dropped, and the file must open again once it can. Before 2026-11-13 the frame
+    # log stayed closed for the rest of the session without a word.
+    if ($ok) {
+        $ok = Build 'logger_test_rotate.exe' @('-std=c++20', '-O2', '-fno-exceptions', '-fno-rtti', '-static', '-DUNICODE', '-D_UNICODE',
+                                               '-DWIN32_LEAN_AND_MEAN', '-Wall', '-municode', '-DMK9R_LOG_FRAME_CAP=32768LL', '-I', $dbg,
+                                               (Join-Path $PSScriptRoot 'logger_test.cpp'), (Join-Path $dbg 'Logger.cpp'))
+    }
+    if ($ok) {
+        $work = Join-Path $out 'logger_rotate'
+        Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+        & (Join-Path $out 'logger_test_rotate.exe') $work exitonly 1 rotations |
+            Where-Object { $_ -match 'FAIL|ALL CHECKS|not in the files|inside a rotation|files kept' } | ForEach-Object { Write-Host "  $_" }
         $ok = $LASTEXITCODE -eq 0
         if ($ok) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
         else { Write-Host "  the run's files are kept in $work (deleted by the next run)" }

@@ -464,9 +464,14 @@ static int ChildExit(const wchar_t* dir, int ms) {
 // Frame-log text is dropped, by design, while more of it waits for the disk than the logger's cap (a stalled or starved
 // writer; the main log says how many lines). Children that had such lines, over all rounds.
 static int gDropChildren = 0;
+// Children whose exit came while the writer was inside a rotation of the frame log (the main log says so): the Flush in
+// DLL_PROCESS_DETACH then finds the file closed and has to open it again for the lines still in memory. About 1 exit in
+// 700 at the suite's 3 MB cap, a third of them at 32 KB. Over all rounds.
+static int gRotateChildren = 0;
+static const char kRotationNote[] = "LOGGER: the frame log was closed for its rotation when the thread writing it died; opened again";
 static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
     printf("== 60 children: 3 threads log flat out, ExitProcess at a random point, Info+Flush in DLL_PROCESS_DETACH ==\n");
-    int ok = 0, gaps = 0, missing = 0, maxUs = 0, lostChildren = 0, dropChildren = 0, lateChildren = 0;
+    int ok = 0, gaps = 0, missing = 0, maxUs = 0, lostChildren = 0, dropChildren = 0, lateChildren = 0, rotateChildren = 0;
     long long lines = 0, droppedLines = 0, lateRounds = 0;
     static int kept = 0;
     for (int k = 0; k < 60; ++k) {
@@ -490,7 +495,7 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         int next[3] = {0, 0, 0}, done[3] = {-2, -2, -2};
-        bool sawDetach = false;
+        bool sawDetach = false, inRotation = false;
         int us = -1, bad = 0, late = 0;
         long long dropped = 0;  // frame lines the main log reports as dropped
         unsigned lostNotes = 0; // main-log lines it reports as lost
@@ -511,6 +516,8 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
                 dropped += n;
             } else if (sscanf(m, "LOGGER: %u main-log line(s) lost%n", &n, &end) == 1 && end) {
                 lostNotes += n;
+            } else if (!strncmp(m, kRotationNote, sizeof kRotationNote - 1)) {
+                inRotation = true;
             } else if (strncmp(m, "LOGGER:", 7)) {
                 ++bad;
             } else if (k < 3 || bad) {
@@ -542,6 +549,7 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
             bad += (int)lostNotes;
         }
         dropChildren += dropped > 0;
+        rotateChildren += inRotation;
         droppedLines += dropped;
         gaps += bad;
         if (!sawDetach) printf("  child %d: no DETACH line, exit code %08lX, main log %d EX lines\n", k, xc, next[0] + next[1] + next[2]);
@@ -575,7 +583,9 @@ static void PhaseExit(const wchar_t* base, const wchar_t* exe) {
     printf("  frame-log lines dropped over the cap on text waiting for the disk: %lld in %d of 60 children, every absent line reported\n",
            droppedLines, dropChildren);
     printf("  threads still logging after the shutdown flag was set: %lld rounds in %d of 60 children\n", lateRounds, lateChildren);
+    printf("  exits inside a rotation of the frame log: %d of 60 children, the file opened again for the lines in memory\n", rotateChildren);
     gDropChildren += dropChildren;
+    gRotateChildren += rotateChildren;
 }
 static void PhaseChild(const wchar_t* base, const wchar_t* exe, const wchar_t* mode) {
     const bool flush = !wcscmp(mode, L"child"), paced = !wcscmp(mode, L"childpaced");
@@ -603,6 +613,106 @@ static void PhaseChild(const wchar_t* base, const wchar_t* exe, const wchar_t* m
     printf("  child %s TerminateProcess (exit %lu): %d of %d Info and %d of %d Frame lines on disk\n",
            flush ? "Flush() then" : paced ? "1 Info+1 Frame per ms, no Flush, then" : "burst, no Flush, then", code, mi, n, fi, n);
     if (flush) CHECK(code == 7 && mi == n && fi == n, "child lines");
+}
+
+// ---------------- closed: the open that ends a rotation fails ----------------
+// A rotation renames the frame log and opens a new one. A second thread takes the name in between, as a directory, so
+// that the open fails (in a build with a small MK9R_LOG_FRAME_CAP: the log rotates every few ms, the thread gets there
+// within a few rotations). The log then says so, counts the lines it drops, and opens the file again once the name is
+// free: every line missing from the files must be in a count, and every line after the reopening on disk.
+static wchar_t gTakePath[MAX_PATH];
+static volatile LONG gTaken = 0, gStopTake = 0;
+static DWORD WINAPI TakeName(LPVOID) {
+    for (;;) {
+        if (gStopTake) return 0;
+        if (CreateDirectoryW(gTakePath, nullptr)) break;
+    }
+    gTaken = 1;
+    return 0;
+}
+static void PhaseClosed(const wchar_t* base) {
+    printf("== closed: the frame log's name is taken between a rotation's rename and its open; then given back ==\n");
+    std::wstring d = Dir(base, L"closed");
+    swprintf(gTakePath, MAX_PATH, L"%ls\\MK9Rollback_frames.log", d.c_str());
+    RemoveDirectoryW(gTakePath);  // what a stopped run left
+    Logger::Open(d.c_str());
+    gTaken = 0;
+    gStopTake = 0;
+    HANDLE th = CreateThread(nullptr, 0, TakeName, nullptr, 0, nullptr);
+    int i = 0;
+    const long long t0 = Qpc();
+    // 4000 lines (a file and more) per Sleep(1): at least one rotation each time, and far below what the writer writes,
+    // so no line is dropped for waiting (that has its own test).
+    while (!gTaken && Us(Qpc() - t0) < 30e6) {
+        for (int k = 0; k < 4000; ++k) Logger::Frame("CL i%d", i++);
+        Sleep(1);
+    }
+    gStopTake = 1;
+    WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
+    const int atTaken = i;
+    const double takenMs = Us(Qpc() - t0) / 1000;
+    if (!gTaken) {
+        CHECK(false, "closed: the frame log's name was never free for the other thread in 30 s (%d lines): not exercised", i);
+        Logger::Close();
+        return;
+    }
+    for (int k = 0; k < 3000; ++k) Logger::Frame("CL i%d", i++);
+    Logger::Flush();  // the open fails again; this says the count so far
+    bool freed = false;
+    for (int k = 0; k < 200 && !(freed = RemoveDirectoryW(gTakePath) != 0); ++k) Sleep(5);
+    CHECK(freed, "closed: the directory could not be removed, error %lu", GetLastError());
+    for (int k = 0; k < 500; ++k) Logger::Frame("CL i%d", i++);  // less than a file: no further rotation
+    Logger::Flush();
+    Logger::Close();
+
+    int failed = 0, again = 0, counts = 0, other = 0;
+    unsigned long err = 0;
+    long long reported = 0, waitDropped = 0;
+    const int malformed = ForEachLine(d + L"\\MK9Rollback.log", [&](const std::string& l) {
+        const char* m = Msg(l);
+        unsigned n;
+        unsigned long e;
+        int end = 0;
+        if (!m) return (void)++other;
+        if (sscanf(m, "LOGGER: the frame log cannot be opened after its rotation (error %lu)%n", &e, &end) == 1 && end) {
+            ++failed, err = e;
+        } else if (sscanf(m, "LOGGER: the frame log is closed (error %lu at its last open): %u frame-log line(s) dropped%n", &e, &n, &end) == 2 && end) {
+            reported += n, ++counts;
+        } else if (sscanf(m, "LOGGER: the frame log is open again; %u frame-log line(s) were dropped%n", &n, &end) == 1 && end) {
+            reported += n, ++again;
+        } else if (sscanf(m, "LOGGER: %u frame-log line(s) dropped%n", &n, &end) == 1 && end) {
+            waitDropped += n;
+        } else {
+            if (other++ < 3) printf("  closed: unexpected main-log line: %.160s\n", m);
+        }
+    });
+    // The file the failed rotation completed, then the one opened after the name was free again.
+    long long first[2] = {-1, -1}, last[2] = {-1, -1};
+    int bad = 0;
+    const wchar_t* names[2] = {L"\\MK9Rollback_frames.old.log", L"\\MK9Rollback_frames.log"};
+    for (int f = 0; f < 2; ++f) {
+        const int r = ForEachLine(d + names[f], [&](const std::string& l) {
+            int v;
+            if (sscanf(l.c_str(), "CL i%d", &v) != 1 || (last[f] >= 0 && v != last[f] + 1)) return (void)++bad;
+            if (first[f] < 0) first[f] = v;
+            last[f] = v;
+        });
+        bad += r < 0 ? 1 : r;
+    }
+    const long long missing = first[1] - last[0] - 1;
+    CHECK(failed == 1 && again == 1, "closed: %d lines say the open failed, %d that the file is open again (1 and 1 wanted)", failed, again);
+    CHECK(!bad && !other && !malformed, "closed: %d bad frame-log lines, %d unexpected and %d malformed main-log lines", bad, other, malformed);
+    CHECK(last[0] >= 0 && first[1] > last[0] && last[0] < atTaken + 3000 && first[1] >= atTaken + 3000,
+          "closed: old file ends at line %lld, new one begins at %lld; the name was taken near line %d", last[0], first[1], atTaken);
+    CHECK(last[1] == i - 1, "closed: the new file ends at line %lld, the last line logged was %d", last[1], i - 1);
+    // Lines dropped for waiting (none expected) are in neither count's range for certain: they only widen the check.
+    CHECK(reported <= missing && missing <= reported + waitDropped,
+          "closed: %lld lines are in neither file, the main log reports %lld dropped while the file was closed (+ %lld for waiting)",
+          missing, reported, waitDropped);
+    printf("  a rotation's open failed (error %lu, name taken after %d lines, %.0f ms): %lld lines in neither file, %lld reported in %d\n"
+           "  main-log lines; the file open again once the name was free, lines %lld..%lld on disk\n",
+           err, atTaken, takenMs, missing, reported, counts + again, first[1], last[1]);
 }
 
 static int CmpFormat(const wchar_t* a, const wchar_t* b) {
@@ -641,11 +751,22 @@ int wmain(int argc, wchar_t** argv) {
 #else
     printf("##### new Logger.cpp #####\n");
 #endif
-    if (argc >= 3 && !wcscmp(argv[2], L"exitonly")) {  // exitonly [rounds] [drops]
+    if (argc >= 3 && !wcscmp(argv[2], L"closedonly")) {  // closedonly [rounds], in a build with a small MK9R_LOG_FRAME_CAP
+        const int rounds = argc >= 4 ? _wtoi(argv[3]) : 1;
+        for (int r = 0; r < rounds; ++r) PhaseClosed(base);
+        printf("%s (%d failures)\n", gFail ? "FAILED" : "ALL CHECKS PASSED", gFail);
+        return gFail;
+    }
+    if (argc >= 3 && !wcscmp(argv[2], L"exitonly")) {  // exitonly [rounds] [drops | rotations]
         const int rounds = argc >= 4 ? _wtoi(argv[3]) : 5;
         for (int r = 0; r < rounds; ++r) PhaseExit(base, exe);
         // A build with a small MK9R_LOG_PENDING_FRAME_CAP: the drop report itself is under test.
         if (argc >= 5 && !wcscmp(argv[4], L"drops")) CHECK(gDropChildren > 0, "no child dropped a frame-log line: the drop report was not exercised");
+        // A build with a small MK9R_LOG_FRAME_CAP: the exit inside a rotation is under test, and the rotation whose open fails.
+        if (argc >= 5 && !wcscmp(argv[4], L"rotations")) {
+            CHECK(gRotateChildren > 0, "no child exited inside a rotation of the frame log: that exit was not exercised");
+            PhaseClosed(base);
+        }
         printf("%s (%d failures)\n", gFail ? "FAILED" : "ALL CHECKS PASSED", gFail);
         return gFail;
     }

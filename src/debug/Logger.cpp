@@ -76,6 +76,12 @@ size_t gSegDone = 0, gSegLen = 0;
 // gDroppedFrames / gLostMain taken with the pending text, until the main log says them (NoteLosses): kept here, not
 // in a local of the writer, so that a Flush after its death still says them.
 unsigned gNoteDropped = 0, gNoteLost = 0;
+// The frame log is closed (gFramesH invalid though gFramesOn) inside RotateFrames, and stays closed when the open that
+// ends the rotation fails: gFramesError is then that open's error (0 otherwise) and every later write tries the open
+// again. Frame-log text that comes meanwhile is dropped; gClosedLines counts its lines until the main log says them.
+// Before 2026-11-13 the file stayed closed for the rest of the session and nothing said so.
+DWORD gFramesError = 0;
+unsigned gClosedLines = 0;
 
 using ShutdownFn = BOOLEAN(NTAPI*)();
 ShutdownFn gShutdown = nullptr;  // ntdll's RtlDllShutdownInProgress
@@ -260,22 +266,85 @@ void WriteAll(HANDLE h, const char* p, size_t n) {
     }
 }
 
-HANDLE OpenIn(const wchar_t* dir, const wchar_t* name) {
+void Note(const char* fmt, ...);  // a main-log line straight to the file, after everything written so far
+
+HANDLE OpenIn(const wchar_t* dir, const wchar_t* name, DWORD alsoShare = 0) {
     wchar_t path[MAX_PATH];
     swprintf(path, MAX_PATH, L"%ls\\%ls", dir, name);
     // FILE_APPEND_DATA without FILE_WRITE_DATA: every write goes to the end, like the "a" streams before.
-    return CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                       nullptr);
+    return CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | alsoShare, nullptr, OPEN_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
+// While the file is closed gFramesH holds no handle: a thread that dies in here (process exit, Close's TerminateThread)
+// must not leave the number of a closed handle behind. Windows gives that number to the next handle opened, the rename's
+// own for one, and the Flush after the thread's death wrote the lines waiting in memory to it: every write failed
+// (error 6, or 5 on the rename's handle) and the lines were gone, unreported. RecoverOut opens the file again instead.
+// 2026-11-12: the host test's exit children, about 1 exit in 700 at the test's 3 MB cap.
 void RotateFrames() {
     wchar_t cur[MAX_PATH], old[MAX_PATH];
     swprintf(cur, MAX_PATH, L"%ls\\MK9Rollback_frames.log", gDir);
     swprintf(old, MAX_PATH, L"%ls\\MK9Rollback_frames.old.log", gDir);
-    CloseHandle(gFramesH);
+    const HANDLE h = gFramesH;
+    gFramesH = INVALID_HANDLE_VALUE;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    CloseHandle(h);
     MoveFileExW(cur, old, MOVEFILE_REPLACE_EXISTING);
-    gFramesH = OpenIn(gDir, L"MK9Rollback_frames.log");
     gFrameBytes = 0;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gFramesH = OpenIn(gDir, L"MK9Rollback_frames.log");
+    if (gFramesH == INVALID_HANDLE_VALUE) {  // see gFramesError; the main log's text of this round is already written
+        gFramesError = GetLastError();
+        Note("LOGGER: the frame log cannot be opened after its rotation (error %lu): frame-log lines are dropped until it "
+             "can", gFramesError);
+    }
+}
+
+// Opens the frame log if it is closed (see gFramesError). False: closed, and it cannot be opened now. Only called with
+// frame-log text to write or for a log that a rotation closed, never for one that Open could not open (it gets no text).
+bool OpenFrames(DWORD alsoShare = 0) {
+    if (gFramesH != INVALID_HANDLE_VALUE) return true;
+    const HANDLE h = OpenIn(gDir, L"MK9Rollback_frames.log", alsoShare);
+    if (h == INVALID_HANDLE_VALUE) {
+        gFramesError = GetLastError();
+        return false;
+    }
+    LARGE_INTEGER size;
+    gFrameBytes = GetFileSizeEx(h, &size) ? size.QuadPart : 0;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gFramesH = h;
+    return true;
+}
+
+// The count is cleared after its line is written, as in NoteLosses.
+void NoteOpenAgain() {
+    Note("LOGGER: the frame log is open again; %u frame-log line(s) were dropped while it was closed", gClosedLines);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gClosedLines = 0;
+    gFramesError = 0;
+}
+
+// Before frame-log text is written, after the main log's text of the same round: a frame log that an earlier rotation
+// left closed is tried again. False: still closed, the text is to be counted as dropped (DropClosed).
+bool FramesReady() {
+    if (gFramesH != INVALID_HANDLE_VALUE) return true;
+    if (!OpenFrames()) return false;
+    NoteOpenAgain();
+    return true;
+}
+
+void DropClosed(const char* p, size_t n) {
+    if (n) gClosedLines += (unsigned)CountNl(p, n);
+}
+
+// What a closed frame log has dropped since the main log last said so. Said at a Flush and at Close only: the writer's
+// own rounds would say it ten times a second, they say it when the file opens again (NoteOpenAgain).
+void NoteClosed() {
+    if (!gClosedLines) return;
+    if (gFramesH != INVALID_HANDLE_VALUE) return NoteOpenAgain();  // the thread that opened it died before it said so
+    Note("LOGGER: the frame log is closed (error %lu at its last open): %u frame-log line(s) dropped", gFramesError, gClosedLines);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    gClosedLines = 0;
 }
 
 void WriteMain(const char* p, size_t n) {
@@ -301,6 +370,7 @@ void WriteSeg(LONG sink, HANDLE h, long long& bytes, Buf& o, size_t k) {
 // As before: the line that takes the file past the cap is the old file's last one.
 void WriteOutFrames() {
     Buf& o = gOutFrames;
+    FramesReady();
     while (o.done < o.len && gFramesH != INVALID_HANDLE_VALUE) {
         const char* p = o.p + o.done;
         const size_t n = o.len - o.done;
@@ -309,9 +379,10 @@ void WriteOutFrames() {
         WriteSeg(2, gFramesH, gFrameBytes, o, nl ? (size_t)(nl - p) + 1 : n);
         if (nl) RotateFrames();
     }
+    DropClosed(o.p + o.done, o.len - o.done);  // the file is closed: whole lines, a rotation ends on one
 }
 
-void Note(const char* fmt, ...) {  // a main-log line straight to the file, after everything written so far
+void Note(const char* fmt, ...) {
     Line l;
     const size_t off = Stamp(l.stack);
     va_list ap;
@@ -347,7 +418,15 @@ void TakeLossCounts() {
 }
 
 // The writer's buffers after their writer died (gIoLock orphaned): what the in-progress write did not get to the file.
+//
+// The frame log may be closed. With no error recorded its writer died inside RotateFrames: closed, and renamed or not.
+// The file that has the name now (the full one if the rename did not happen, else a new one) takes the lines still in
+// memory, so the two files stay in order. FILE_SHARE_DELETE: a rename the dead thread was in keeps its own handle on the
+// file (without it the open fails with error 32).
 void RecoverOut() {
+    const bool closed = gFramesOn && gFramesH == INVALID_HANDLE_VALUE;
+    const bool inRotation = closed && !gFramesError;
+    const bool opened = closed && OpenFrames(FILE_SHARE_DELETE);  // before the frame log's handle is read below
     struct {
         LONG sink;
         Buf* o;
@@ -363,13 +442,25 @@ void RecoverOut() {
             e.o->done = gSegDone + (size_t)w;
             *e.bytes = size.QuadPart;
         }
-        if (e.o->done < e.o->len) {
+        if (e.o->done < e.o->len && e.sink == 2 && e.h == INVALID_HANDLE_VALUE) {
+            DropClosed(e.o->p + e.o->done, e.o->len - e.o->done);
+        } else if (e.o->done < e.o->len) {
             WriteAll(e.h, e.o->p + e.o->done, e.o->len - e.o->done);
             *e.bytes += (long long)(e.o->len - e.o->done);
         }
         e.o->len = e.o->done = 0;
     }
     gSeg = 0;
+    // Said after the main log's own text, not ahead of it. The first also tells a reader why MK9Rollback_frames.log is
+    // larger than its cap (the rename had not happened) or holds only the last lines (it had).
+    if (inRotation && opened)
+        Note("LOGGER: the frame log was closed for its rotation when the thread writing it died; opened again for the "
+             "lines still in memory");
+    else if (inRotation)
+        Note("LOGGER: the frame log was closed for its rotation when the thread writing it died and cannot be opened "
+             "again (error %lu): frame-log lines are dropped until it can", gFramesError);
+    else if (opened)
+        NoteOpenAgain();
     NoteLosses();  // what the dead writer had taken with that text
 }
 
@@ -405,8 +496,12 @@ void SwapAndWrite() {
 void WritePendingDirect() {
     WriteMain(gPendMain.p, gPendMain.len);
     gPendMain.len = 0;
-    WriteAll(gFramesH, gPendFrames.p, gPendFrames.len);
-    gFrameBytes += (long long)gPendFrames.len;
+    if (gPendFrames.len && FramesReady()) {
+        WriteAll(gFramesH, gPendFrames.p, gPendFrames.len);
+        gFrameBytes += (long long)gPendFrames.len;
+    } else {
+        DropClosed(gPendFrames.p, gPendFrames.len);
+    }
     gPendFrames.len = 0;
     TakeLossCounts();
     NoteLosses();
@@ -431,6 +526,7 @@ void DrainSync(DWORD ioMs, DWORD pendMs) {
         const int pend = Take(&gPendLock, pendMs, &tid);
         if (pend != 0) WritePendingDirect();
         if (pend > 0) LeaveCriticalSection(&gPendLock);
+        NoteClosed();
         return;
     }
     if (gOpen) {
@@ -446,6 +542,7 @@ void DrainSync(DWORD ioMs, DWORD pendMs) {
                  "again",
                  tid, pendMs, (unsigned)gPendMain.len, (unsigned)gPendFrames.len);
         }
+        NoteClosed();
     }
     LeaveCriticalSection(&gIoLock);
 }
@@ -514,6 +611,8 @@ bool Open(const wchar_t* directory) {
     gMainH = OpenIn(directory, L"MK9Rollback.log");
     gFramesH = OpenIn(directory, L"MK9Rollback_frames.log");
     gMainBytes = gFrameBytes = 0;
+    gFramesError = 0;
+    gClosedLines = 0;
     LARGE_INTEGER size;
     if (gMainH != INVALID_HANDLE_VALUE && GetFileSizeEx(gMainH, &size)) gMainBytes = size.QuadPart;
     if (gFramesH != INVALID_HANDLE_VALUE && GetFileSizeEx(gFramesH, &size)) gFrameBytes = size.QuadPart;
@@ -571,6 +670,7 @@ void Close() {
                   "written", tid, (unsigned)gPendMain.len, (unsigned)gPendFrames.len);
         SetClosed();
     }
+    NoteClosed();
     if (gMainH != INVALID_HANDLE_VALUE) CloseHandle(gMainH);
     if (gFramesH != INVALID_HANDLE_VALUE) CloseHandle(gFramesH);
     gMainH = gFramesH = INVALID_HANDLE_VALUE;
