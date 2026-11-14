@@ -43,6 +43,9 @@ bool Install();          // verifies the 16 bytes at 0x00667106 first (fail clos
 void EnsureInstalled();  // game thread, now and then: re-applies the patch if a CodePatch::RestoreAll removed it
 void Disable();          // unload: the stub becomes a pass-through (call before CodePatch::RestoreAll)
 void Shutdown();         // unload, after Disable: waits for the watcher thread to end (up to 5 s)
+bool SheetHeld();        // the stage screen's picture texture is on the device (after Disable the render thread's next
+                         // frame releases it: the unload waits for that before it removes the stub)
+int SheetsMade();        // how often that texture was made since the DLL loaded ('stagestatus')
 void RequestDisplayLog();  // the display mode is logged from the next frame's swap chain (DISPLAY line; each session's start)
 long InFlight();         // render-thread calls inside the draw
 // 0 off; 1 the display that belongs to the game's HUD (Hud.h: a group under the round timer in a fight, a badge before

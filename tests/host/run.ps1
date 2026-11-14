@@ -1,5 +1,6 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,codewrite,strappend,guardpage,hud,keyedge,syswatch,ggpo,logger] [-Seconds 25]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,stagepick,stagehold,refightvote,presslatch,codewrite,strappend,guardpage,hud,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
+#                        [-Seconds 25] [-GameDir <the folder that holds DiscContentPC>]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
 #   finisher  src\net\FinisherRule.h: the frame where a session is handed back to MK9's netcode in the finisher phase;
@@ -10,6 +11,26 @@
 #   flow    src\net\FlowDecode.h: the text of the stage / rematch trace lines (ONLINEFLOW, ONLINEMSG): message 9
 #           "GameSettings" and message 10 "ReadyState" decoded from their bytes (a player's name never reaches the
 #           text), the traced script natives, which calls of a polled native get a line, every text bounded.
+#   stagepick  src\net\StagePick.h: the stage pick packet next to the hello (a release without it drops it; any bytes are
+#           read safely), the choice between two picks (the same ticket in both games, a fair coin), and 6000 exchanges
+#           between two simulated games over links that lose, delay, repeat and reorder datagrams: a game is confirmed
+#           only when the other one has the same result, and what the settings message carries is what both expect.
+#   stagehold  src\net\StageHold.h: the stage screen that opens by itself keeps MK9 on the character select (which of the
+#           script's questions it answers, for how long at the most) and decides when the drawn arena is written. 5200
+#           match starts between two simulated games: no link makes them write two different arenas, a game that does
+#           not hold makes both write nothing, and over a link that loses up to four packets in a row both write or
+#           neither does. The "note:" lines count the starts in which one game alone wrote (links that lose most
+#           packets, links that die).
+#   refightvote  src\net\RefightVote.h: the choice after an online match (RE-FIGHT / CHANGE FIGHTER OR ARENA / LEAVE). The
+#           table of the two picks, the presses that answer MK9's own rematch box (against a model of that box written
+#           from its script: an accept, a leave, a leave after an accept, a box that reads late), and 6000 exchanges of
+#           the two picks between two simulated games over links that lose, delay and reorder datagrams: a game acts on a
+#           re-fight only when both chose it.
+#   presslatch  src\game\PressLatch.h: a press that falls between two samples of the controls, for a panel of the mod. A
+#           key's release held back until MK9 has sampled the key (every order of down, up, sample and posted release;
+#           3000 taps through a simulated main loop with pauses of up to 400 ms: all lost ones arrive, none twice, no
+#           key left down), and the pads' reading thread (sources, the rule that a source counts only once MK9's own
+#           sampler has shown it, two threads on the latch, 3000 presses through the same loop).
 #   codewrite  src\hook\CodePatch + src\common\ThreadWalk.h: code patched while 48 threads run (all suspended for a write
 #           and running after it, a write under a running thread refused), and 56 writes (what arming makes in one game
 #           frame) inside half a second. The program is not called "codepatch": Windows takes a 32-bit program with
@@ -27,6 +48,25 @@
 #           window only) becomes SYSEVENT lines, another program's new window is named by program and class, the
 #           processor-time list names a program that worked, a flood of events is cut, Stop leaves nothing behind
 #           (about 12 s).
+#   arenapics  src\debug\ArenaPics.cpp: the reader of the stage screen's arena pictures (the game's own small pictures,
+#           read from the player's installed game, none of them in the mod). LZO1X against streams the test writes
+#           (every kind of instruction, cut-off and damaged ones, buffers that end at a page without access); a
+#           package in MK9's layout that the test writes itself (what is read, what is left out, every pixel), 4000
+#           damaged copies of it; the names; the reading thread where the game's file is missing. The same for what
+#           MK9's own arena select is drawn with (two fonts as sheets of letters, six frame pieces, the movie that
+#           says where each letter stands): a package with all of it, every letter's box, pen, advance and kerning,
+#           every pixel of the pieces, nineteen forms that are refused with their reason while the pictures are read
+#           all the same, 1200 damaged copies. With the installed game (found through Steam's library list, or
+#           -GameDir): its 29 pictures, one for each of the 28 arenas a player may pick, its lettering and pieces.
+#           Without it the test says so and checks its own packages only.
+#   stagescreen  src\debug\StageScreen.cpp: the stage screen of an online match (feature plan 4.2), without the game. For
+#           eight picture sizes and thirteen canned states, in its three forms (the list of names, plain picture
+#           tiles, MK9's look with the game's lettering and frame pieces): whole rectangles on the panel and inside the
+#           picture, none dropped, every stage name whole in its cell or under its tile, every picture in its tile,
+#           every letter drawn pixel for pixel from inside the atlas; the cursor's steps, the roulette's timing (the
+#           same on both screens), the names made from the stage table, a damaged state. Pictures in
+#           build\hosttests\stagescreen (stage_*: names, tiles_*: plain tiles, look_*: MK9's look; with the installed
+#           game's art when it was found, with the test's own stand-in otherwise; those stay in build\).
 #   ggpo   the patched GGPO library (tools\build_ggpo.ps1) against a hand-made remote on 127.0.0.1 (ggpo_raw_peer.cpp):
 #           a valid 60 Hz session with malformed datagrams of every kind in between; after each kind the peer must still
 #           take the stream. Needs a library with the round 3 exports (ggpo_bye_on_close, ggpo_bind_failed). Then the
@@ -44,10 +84,11 @@
 #           thread of its own. Every program on the PC waits with it, so it refuses to start while MKKE runs.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'ggpo', 'logger'), [int]$Seconds = 25)
+      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'presslatch', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
+      [int]$Seconds = 25, [string]$GameDir = '')
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'startsync', 'flow', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'ggpo', 'logger', 'winlock'
+$known = 'hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'presslatch', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -118,13 +159,58 @@ function RunSmall([string]$name, [string]$title, [string[]]$sources, [string[]]$
         return $false
     }
     $lines = @(Get-Content $log)
-    $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm|^largest frame|^hold \d|^no hold|^note: ' } | ForEach-Object { Write-Host "  $_" }
+    $lines | Where-Object { $_ -match '^FAIL|checks,|^56 writes|never pause|guard page\(s\)|without the re-arm|^largest frame|^hold \d|^no hold|^note: |^the game.s file|was not given|^the tiles. pictures|was not read' } |
+        ForEach-Object { Write-Host "  $_" }
     return $p.ExitCode -eq 0 -and ($lines -contains 'ALL CHECKS PASSED')
+}
+
+# The installed game's arena package (the stage screen's pictures are read from it at run time): under -GameDir, or
+# in one of Steam's libraries. Empty when the game is not installed here: the tests then use their own pictures.
+function ArenaPackage {
+    $rel = 'DiscContentPC\Asset\ui_ps_arenaSelect.xxx'
+    $dirs = @()
+    if ($GameDir) { $dirs += $GameDir }
+    $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+    if ($steam) {
+        $libs = @($steam)
+        $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+        if (Test-Path $vdf) { $libs += [regex]::Matches((Get-Content $vdf -Raw), '"path"\s+"([^"]+)"') | ForEach-Object { $_.Groups[1].Value -replace '\\\\', '\' } }
+        $dirs += $libs | ForEach-Object { Join-Path $_ 'steamapps\common\MortalKombat_KompleteEdition' }
+    }
+    foreach ($d in $dirs) {
+        $f = Join-Path $d $rel
+        if (Test-Path $f) { return (Resolve-Path $f).Path }
+    }
+    return ''
 }
 
 if ($Only -contains 'flow') {
     $ok = RunSmall 'flow_test' 'stage / rematch trace text' @((Join-Path $PSScriptRoot 'flow_test.cpp')) @('-I', (Join-Path $root 'src\net')) 30
     if (-not $ok) { $failed += 'flow' }
+}
+
+if ($Only -contains 'stagepick') {
+    $net = Join-Path $root 'src\net'
+    $ok = RunSmall 'stagepick_test' 'stage picks: packet, coin, two games over bad links' @((Join-Path $PSScriptRoot 'stagepick_test.cpp'),
+                   (Join-Path $net 'HelloProto.cpp')) @('-I', $net) 120
+    if (-not $ok) { $failed += 'stagepick' }
+}
+
+if ($Only -contains 'stagehold') {
+    $net = Join-Path $root 'src\net'
+    $ok = RunSmall 'stagehold_test' 'stage hold: the wait on the character select, and when both games write the drawn arena' @((Join-Path $PSScriptRoot 'stagehold_test.cpp')) @('-I', $net) 120
+    if (-not $ok) { $failed += 'stagehold' }
+}
+
+if ($Only -contains 'refightvote') {
+    $net = Join-Path $root 'src\net'
+    $ok = RunSmall 'refightvote_test' 'choice after a match: the two picks, the presses on MK9''s own box, two games over bad links' @((Join-Path $PSScriptRoot 'refightvote_test.cpp')) @('-I', $net) 120
+    if (-not $ok) { $failed += 'refightvote' }
+}
+
+if ($Only -contains 'presslatch') {
+    $ok = RunSmall 'presslatch_test' 'press latch: a press between two samples of the controls' @((Join-Path $PSScriptRoot 'presslatch_test.cpp')) @('-I', (Join-Path $root 'src\game')) 120
+    if (-not $ok) { $failed += 'presslatch' }
 }
 
 if ($Only -contains 'codewrite') {
@@ -171,6 +257,26 @@ if ($Only -contains 'winlock') {
         $ok = RunSmall 'winlock_probe' 'window manager lock: which calls wait for it' @((Join-Path $PSScriptRoot 'winlock_probe.cpp')) @() 60 @('-lwinmm', '-lgdi32')
         if (-not $ok) { $failed += 'winlock' }
     }
+}
+
+if ($Only -contains 'arenapics') {
+    $pkg = ArenaPackage
+    $exeArgs = @((Join-Path $out 'arenapics'))
+    if ($pkg) { $exeArgs += "`"$pkg`"" }
+    $ok = RunSmall 'arenapics_test' 'arena pictures: LZO, package reader, damaged files' @((Join-Path $PSScriptRoot 'arenapics_test.cpp'),
+                   (Join-Path $root 'src\debug\ArenaPics.cpp')) @() 240 @() $exeArgs
+    if (-not $ok) { $failed += 'arenapics' }
+}
+
+if ($Only -contains 'stagescreen') {
+    # The pictures stay in build\hosttests\stagescreen for a look (every state at 1920x1080, 1280x720 and 960x600).
+    $pkg = ArenaPackage
+    $exeArgs = @((Join-Path $out 'stagescreen'), '-')
+    if ($pkg) { $exeArgs += "`"$pkg`"" }
+    $ok = RunSmall 'stagescreen_test' 'stage screen: grid, tiles, picks, roulette, banner' @((Join-Path $PSScriptRoot 'stagescreen_test.cpp'),
+                   (Join-Path $root 'src\debug\StageScreen.cpp'), (Join-Path $root 'src\debug\StageSkin.cpp'), (Join-Path $root 'src\debug\Hud.cpp'),
+                   (Join-Path $root 'src\debug\ArenaPics.cpp')) @() 240 @('-lgdi32') $exeArgs
+    if (-not $ok) { $failed += 'stagescreen' }
 }
 
 if ($Only -contains 'ggpo') {

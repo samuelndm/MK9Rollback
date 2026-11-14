@@ -56,4 +56,25 @@ bool Demo(int n, Overlay::Stats* s);
 // Forget the fades and the faces (the host test, between cases).
 void Reset();
 
+// ---- The same faces and rectangles for the mod's panels (StageScreen.cpp). Rendering thread, after Prepare. ----
+struct Canvas {  // the vertices being written; 'dropped' counts rectangles that found the buffer full
+    Vtx* v;
+    int n, cap, dropped;
+};
+struct Frame {  // the 16:9 frame centred in the picture (MK9 letterboxes to it); u: pixels per 1/1080 of its height
+    int x, y, w, h;
+    float u;
+};
+Frame FrameOf(const View& v);
+bool FacesFor(const View& v);  // Prepare built the two faces for this picture size
+enum FaceId : int { kMainFace = 0, kSmallFace = 1 };  // 30 and 21 units of the frame's 1080; capitals only
+void Rect(Canvas& c, int x0, int y0, int x1, int y1, uint32_t argb);
+int Width(FaceId f, const char* s);
+// y: the baseline. Returns the width. edge false: the glyphs without their dark edge, for text on a panel's own dark
+// ground (a third of the rectangles).
+int Write(Canvas& c, FaceId f, const char* s, int x, int y, uint32_t rgb, int alpha, bool edge = true);
+int EmOf(FaceId f);     // em height in pixels
+int CapOf(FaceId f);    // height of a capital letter
+int ReachOf(FaceId f);  // width of the dark edge
+
 }  // namespace Hud

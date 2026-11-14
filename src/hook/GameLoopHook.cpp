@@ -13,6 +13,8 @@
 #include "../game/Input.h"
 #include "../game/MK9Game.h"
 #include "../net/FlowTrace.h"
+#include "../net/Refight.h"
+#include "../net/StageFlow.h"
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
 #include "../rollback/StateHash.h"
@@ -203,6 +205,8 @@ void __fastcall HkEngineTick(void* engine, void* /*edx*/, float dt) {
     InFlightGuard g;
     ++gEngineTicks;
     gLastDt = dt;
+    Refight::Tick();                    // the choice after an online match: its panel over MK9's rematch box (idle elsewhere)
+    StageFlow::Tick();                  // the stage screen's panel: its controls, packets and countdown (idle unless switched on)
     CommandChannel::RunFrame();         // scripted input / test commands, after the sampler, before the fight update
     Rollback::RecordInputs();
     gFightedThisTick = false;

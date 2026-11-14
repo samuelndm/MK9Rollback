@@ -12,9 +12,11 @@
 #include "../hook/ObjectHooks.h"
 #include "../rollback/FramePace.h"
 #include "../rollback/RollbackManager.h"
+#include "ArenaPics.h"
 #include "Hud.h"
 #include "KeyEdge.h"
 #include "Logger.h"
+#include "StageScreen.h"
 #include "SysWatch.h"
 
 // Site (docs\status_overlay_plan.md 2.3, checked against the disassembly 2026-10-29): RHIEndDrawingViewport 0x00666F20,
@@ -36,6 +38,7 @@ volatile LONG gDraws = 0, gResimDraws = 0, gMaxUs = 0;
 volatile LONG gHudDraws = 0, gHudMaxVerts = 0, gHudDropped = 0;
 volatile LONG gWinDraws = 0, gWinSumUs = 0, gWinMaxUs = 0;  // since the last LogCounters (at most a few thousand draws)
 volatile LONG gFirstLogged = 0;
+volatile LONG gPicDraws = 0;  // frames with the stage screen's pictures on them
 
 Overlay::Stats gBuf[2];
 volatile LONG gFront = 0;
@@ -99,6 +102,123 @@ using Vtx = Hud::Vtx;  // x, y, z, rhw, colour
 constexpr int kMaxV = 96000;
 Vtx gV[kMaxV];  // render thread only
 int gN = 0;
+// The stage screen (StageScreen.cpp) is a page of text: its own buffer, used only while that panel is shown. The largest
+// frame in tests/host/stagescreen_test.cpp (48 cells of the longest name, 1440 lines) is two thirds of it.
+constexpr int kStageMaxV = 360000, kStageChunkV = 60000;
+Vtx gSV[kStageMaxV];
+
+// ---- the stage screen's arena pictures and MK9 look (ArenaPics.h, StageSkin.h) ----
+// The one thing this display keeps on the device: a texture of 2048 x 1024 (ArenaPics' atlas: the arena pictures, the
+// game's frame pieces and its lettering), made when the panel first shows tiles and released three seconds after it
+// last did (and when the display is switched off), so nothing of it is on the device during a fight. MK9's device is
+// a Direct3D 9Ex device (the log's GPULATENCY line): there a texture lives in the default pool; on a plain device it
+// would live in the managed pool, which survives a reset of the device by itself.
+struct TVtx {  // D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1
+    float x, y, z, rhw;
+    uint32_t color;
+    float u, v;
+};
+TVtx gPV[StageScreen::kMaxCells * 6];  // render thread only, like everything here
+IDirect3DTexture9* gSheetTex = nullptr;
+IDirect3DDevice9* gSheetDev = nullptr;
+ULONGLONG gSheetUsedAt = 0;
+bool gSheetEx = false;
+uint32_t gSheetVersion = 0;    // StageSkin::Version() when the texture was last filled
+int gSheetFilled = 0;
+volatile LONG gSheetMade = 0;  // how often the texture was made ('stagestatus')
+volatile LONG gSheetHeld = 0;  // for the unloading thread: a texture is on the device
+volatile LONG gLookDrawn = 0;
+
+void ReleaseSheet() {
+    if (gSheetTex) gSheetTex->Release();
+    gSheetTex = nullptr;
+    gSheetDev = nullptr;
+    InterlockedExchange(&gSheetHeld, 0);
+}
+
+// The atlas' pixels into the texture: when it is made, and again when the look's lettering was scaled anew (another
+// picture size) while the texture was held.
+bool FillSheet(IDirect3DTexture9* tex, bool isEx, const uint32_t* px, HRESULT* hr) {
+    D3DLOCKED_RECT lr{};
+    if (FAILED(*hr = tex->LockRect(0, &lr, nullptr, isEx ? D3DLOCK_DISCARD : 0)) || !lr.pBits) return false;
+    for (int y = 0; y < ArenaPics::kAtlasH; ++y)
+        memcpy(static_cast<uint8_t*>(lr.pBits) + (size_t)y * lr.Pitch, px + (size_t)y * ArenaPics::kAtlasW, (size_t)ArenaPics::kAtlasW * 4);
+    tex->UnlockRect(0);
+    return true;
+}
+
+IDirect3DTexture9* SheetTexture(IDirect3DDevice9* dev) {
+    const uint32_t* px = ArenaPics::Atlas();
+    if (!px || !ArenaPics::Usable()) {
+        ReleaseSheet();
+        return nullptr;
+    }
+    LARGE_INTEGER t0, t1, fq;
+    QueryPerformanceCounter(&t0);
+    HRESULT hr = S_OK;
+    const uint32_t version = StageSkin::Version();
+    if (gSheetTex && gSheetDev == dev) {
+        if (gSheetVersion == version) return gSheetTex;
+        if (FillSheet(gSheetTex, gSheetEx, px, &hr)) {
+            gSheetVersion = version;
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&fq);
+            if (gSheetFilled++ < 6)
+                Logger::Info("ARENAPICS: the texture filled again (new lettering) in %.2f ms", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)(fq.QuadPart ? fq.QuadPart : 1));
+            return gSheetTex;
+        }
+    }
+    ReleaseSheet();
+    IDirect3DDevice9Ex* ex = nullptr;
+    const bool isEx = SUCCEEDED(dev->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&ex))) && ex;
+    if (ex) ex->Release();
+    IDirect3DTexture9* tex = nullptr;
+    const char* why = nullptr;
+    hr = dev->CreateTexture(ArenaPics::kAtlasW, ArenaPics::kAtlasH, 1, isEx ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8, isEx ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &tex,
+                            nullptr);
+    if (FAILED(hr) || !tex) why = "CreateTexture";
+    else if (!FillSheet(tex, isEx, px, &hr)) why = "LockRect";
+    if (why) {
+        if (tex) tex->Release();
+        char text[100];
+        snprintf(text, sizeof text, "the display gave no texture (%s, %08lX)", why, (unsigned long)hr);
+        ArenaPics::Refuse(text);  // the flow goes back to the list of names
+        Logger::Info("ARENAPICS: %s; the stage screen shows names", text);
+        return nullptr;
+    }
+    gSheetTex = tex;
+    gSheetDev = dev;
+    gSheetEx = isEx;
+    gSheetVersion = version;
+    InterlockedExchange(&gSheetHeld, 1);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&fq);
+    InterlockedIncrement(&gSheetMade);
+    if (gSheetMade <= 4)
+        Logger::Info("ARENAPICS: the texture of the pictures and the lettering made (%dx%d, %s) in %.2f ms; released again three seconds after the panel",
+                     ArenaPics::kAtlasW, ArenaPics::kAtlasH, isEx ? "default pool, Direct3D 9Ex" : "managed pool",
+                     (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)(fq.QuadPart ? fq.QuadPart : 1));
+    return tex;
+}
+
+// The pictures as two triangles each, cut from the sheet half a texel inside their place (no neighbour bleeds in).
+int PictureQuads(const StageScreen::Pic* pics, int n) {
+    int v = 0;
+    for (int i = 0; i < n && i < StageScreen::kMaxCells; ++i) {
+        const StageScreen::Pic& p = pics[i];
+        if (p.slot >= ArenaPics::kSlots) continue;
+        const float x0 = (float)p.x0 - 0.5f, y0 = (float)p.y0 - 0.5f, x1 = (float)p.x1 - 0.5f, y1 = (float)p.y1 - 0.5f;
+        const float u0 = ((float)(p.slot % 8 * ArenaPics::kSide) + 0.5f) / (float)ArenaPics::kAtlasW;
+        const float u1 = ((float)((p.slot % 8 + 1) * ArenaPics::kSide) - 0.5f) / (float)ArenaPics::kAtlasW;
+        const float v0 = ((float)(p.slot / 8 * ArenaPics::kSide) + 0.5f) / (float)ArenaPics::kAtlasH;
+        const float v1 = ((float)((p.slot / 8 + 1) * ArenaPics::kSide) - 0.5f) / (float)ArenaPics::kAtlasH;
+        const TVtx a{x0, y0, 0, 1, 0xFFFFFFFF, u0, v0}, b{x1, y0, 0, 1, 0xFFFFFFFF, u1, v0}, d{x0, y1, 0, 1, 0xFFFFFFFF, u0, v1},
+            e{x1, y1, 0, 1, 0xFFFFFFFF, u1, v1};
+        gPV[v++] = a, gPV[v++] = b, gPV[v++] = d;
+        gPV[v++] = b, gPV[v++] = e, gPV[v++] = d;
+    }
+    return v;
+}
 
 void Quad(float x0, float y0, float x1, float y1, DWORD c) {
     if (gN + 6 > kMaxV) return;
@@ -449,18 +569,28 @@ void Draw(IDirect3DDevice9* dev) {
                      faces ? "" : "; the status line is drawn the old way");
         t0 = tb;  // the one-time build is not a draw time
     }
-    if (level <= 0) return;
-    if (level == 1 && wait) return;  // the picture size has just changed: nothing until the faces for it are built
+    // The mod's own panel is drawn whatever the status display's level is; without faces it is never opened.
+    const int sN = StageScreen::Build(view, faces, GetTickCount64(), gSV, kStageMaxV);
+    // Its picture tiles: the texture is made when they are first asked for and given back three seconds after.
+    const StageScreen::Pic* pics = nullptr;
+    int split = 0;
+    const int picN = sN >= 3 ? StageScreen::Pictures(&pics, &split) : 0;
+    // MK9's look: everything but the dimming comes from the texture, as one list of triangles.
+    const StageSkin::Vtx* look = nullptr;
+    const int lookN = sN >= 3 ? StageScreen::Look(&look) : 0;
+    IDirect3DTexture9* sheet = picN > 0 || lookN >= 3 ? SheetTexture(dev) : nullptr;
+    if (picN > 0 || lookN >= 3) gSheetUsedAt = GetTickCount64();
+    else if (gSheetTex && GetTickCount64() - gSheetUsedAt > 3000) ReleaseSheet();
+    const bool status = level > 0 && !(level == 1 && wait);  // wait: the picture size has just changed, nothing until its faces are built
     gN = 0;
     // Level 1: the HUD display. Without a usable face from Windows, the old line below is drawn instead.
-    const bool hud = level == 1 && faces;
+    const bool hud = status && level == 1 && faces;
     if (hud) {
         gN = Hud::Build(s, view, GetTickCount64(), gV, kMaxV);
         if (gN > gHudMaxVerts) InterlockedExchange(&gHudMaxVerts, gN);
         if (const int dropped = Hud::Dropped()) InterlockedExchangeAdd(&gHudDropped, dropped);
         if (gN >= 3) InterlockedIncrement(&gHudDraws);
-    } else {
-        if (level == 1 && s.mode == Overlay::kOff) return;
+    } else if (status && !(level == 1 && s.mode == Overlay::kOff)) {
         static char la[256], lb[256], lw[96];  // render thread only (Format writes la and lb with the same size)
         DWORD color;
         int bars;
@@ -508,7 +638,7 @@ void Draw(IDirect3DDevice9* dev) {
             }
         }
     }
-    if (gN < 3) return;  // nothing on screen this frame: the device is not touched
+    if (gN < 3 && sN < 3) return;  // nothing on screen this frame: the device is not touched
     QueryPerformanceCounter(&tBuilt);
     IDirect3DStateBlock9* sb = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
@@ -539,7 +669,62 @@ void Draw(IDirect3DDevice9* dev) {
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
     dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
-    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, gN / 3, gV, sizeof(Vtx));
+    if (gN >= 3) dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, gN / 3, gV, sizeof(Vtx));
+    // The panel over the status display, in calls of at most 20000 triangles (far below any device's limit per call):
+    // what lies under the pictures, the pictures, what lies over them.
+    const auto panel = [&](int from, int to) {
+        for (int at = from; at < to; at += kStageChunkV)
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, std::min(kStageChunkV, to - at) / 3, gSV + at, sizeof(Vtx));
+    };
+    const int quadV = sheet ? PictureQuads(pics, picN) : 0;
+    const int under = quadV >= 3 ? std::clamp(split, 0, sN) / 3 * 3 : sN;
+    panel(0, under);
+    if (quadV >= 3) {
+        // The colours as they are in the game's file; alpha stays the vertex's (opaque).
+        dev->SetTexture(0, sheet);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, quadV / 3, gPV, sizeof(TVtx));
+        dev->SetTexture(0, nullptr);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        InterlockedIncrement(&gPicDraws);
+    }
+    panel(under, sN);
+    if (sheet && lookN >= 3) {
+        // Texture times the vertex's colour, both already multiplied by alpha: what lies under keeps 1 - alpha, and a
+        // colour with alpha 0 is light added. A letter's pixels map one to one; the pieces are stretched (linear).
+        dev->SetTexture(0, sheet);
+        dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+        for (int at = 0; at < lookN; at += kStageChunkV)
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, std::min(kStageChunkV, lookN - at) / 3, look + at, sizeof(StageSkin::Vtx));
+        dev->SetTexture(0, nullptr);
+        InterlockedIncrement(&gLookDrawn);
+    }
     QueryPerformanceCounter(&tDrawn);
     sb->Apply();
     sb->Release();
@@ -728,6 +913,7 @@ extern "C" void __cdecl MK9R_OverlayDraw(IDirect3DDevice9* dev) {
         if (gEnabled) Draw(dev);
         if (gEnabled && InterlockedExchange(&gShotWanted, 0)) Capture(dev);
     }
+    if (!gEnabled && gSheetTex) ReleaseSheet();  // the display was switched off (the DLL unloads): nothing stays on the device
     InterlockedDecrement(&gInFlight);
 }
 // Reached by the E8 written at 0x00667106 ([esp] = 0x0066710B): draw with every register and the flags kept, then
@@ -804,6 +990,8 @@ void Shutdown() {
 }
 
 long InFlight() { return gInFlight; }
+bool SheetHeld() { return gSheetHeld != 0; }
+int SheetsMade() { return (int)gSheetMade; }
 void RequestDisplayLog() { InterlockedExchange(&gDisplayLogWanted, 1); }
 
 void SetLevel(int level) { InterlockedExchange(&gLevel, level < 0 ? 0 : level > 2 ? 2 : level); }
@@ -835,6 +1023,15 @@ void LogCounters() {
                  "%ld of %ld ms or more",
                  gDraws, gResimDraws, gMaxUs, gLevel, gEnabled ? "" : " (disabled)", gHudDraws, gHudMaxVerts, kMaxV, gHudDropped, wn,
                  wn ? wsum / wn : 0, wmax, gSlowDraws, kn, kmax, gKeyMaxUs, gKeyWaits, kKeyWaitUs / 1000);
+    long stageDraws = 0, stageLargest = 0, stageDropped = 0;
+    StageScreen::Counters(&stageDraws, &stageLargest, &stageDropped);
+    if (stageDraws) {
+        long lookDraws = 0, lookLargest = 0;
+        StageScreen::LookCounters(&lookDraws, &lookLargest);
+        Logger::Info("OVERLAY stage screen: %ld draws (%ld as plain picture tiles, %ld in MK9's look: built %ld times, largest %ld textured vertices), largest "
+                     "frame %ld vertices of %d, %ld rectangles dropped, the texture made %ld times",
+                     stageDraws, gPicDraws, gLookDrawn, lookDraws, lookLargest, stageLargest, kStageMaxV, stageDropped, gSheetMade);
+    }
     const LONG n = InterlockedExchange(&gQueueFrames, 0), sum = InterlockedExchange(&gQueueSum, 0);
     const LONG mx = InterlockedExchange(&gQueueMax, 0), full = InterlockedExchange(&gQueueFull, 0);
     if (n)

@@ -62,6 +62,29 @@ void SetDeferSampling(bool on);
 void SampleDeferredNow();
 void LogSamplingCounts();
 
+// A panel of the mod has the controls (the stage screen, net\StageFlow.cpp). While on:
+//  - every engine tick the six hardware pad records are driven with a neutral mask (HoldPadsNeutral, from
+//    CommandChannel::RunFrame, after the sampler and before the game reads them), so the game's screen underneath sees
+//    no direction and no button, and MK9's online exchange sends neutral input for this player;
+//  - local capture is on, so the sampler still reads the real devices and puts their bytes back: PanelMask is what the
+//    player holds (every hardware pad OR-ed, keyboard pads included), plus a scripted 'hwhold' press of the test
+//    harness, which goes to the panel instead of the game while the panel has the controls.
+// Covers what MK9 reads through the pad records. Whether a screen of the game also takes keys another way (the queued
+// key events at 0x00E28EF0) is not known from the disassembly; docs\feature_parity_plan.md 4.2 says how it was tested.
+void SetPanelHold(bool on);
+bool PanelHold();
+void HoldPadsNeutral();
+void SetPanelScripted(uint32_t mask);
+uint32_t PanelMask();
+// A press the panel makes on the game's screen in the player's place (the choice after a match answers MK9's own rematch
+// box, Refight.h): while the panel has the controls, every hardware pad reads this mask instead of "nothing held", from
+// the next tick's HoldPadsNeutral on. 0 again: nothing held. Forgotten when the panel gives the controls back.
+void SetPanelPass(uint32_t mask);
+// What the panel's reader adds to PanelMask once per tick: every bit a sample showed since its last call (a pass of the
+// main loop may sample without a tick), and what the pads showed between two samples (PressLatch.h). A key pressed and
+// released between two samples is in there too, because its release was held back until one sample had it.
+uint32_t TakePanelPresses();
+
 // Netplay start: both fighters' input history (pad records past the header, their rings, the last-buttons lists)
 // cleared to the same neutral state on both peers. Returns the number of pads reset.
 int CanonicalizePadsForNetplay();

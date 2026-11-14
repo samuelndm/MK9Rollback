@@ -7,11 +7,13 @@
 #include <cstdio>
 #include <cwchar>
 
+#include "debug/ArenaPics.h"
 #include "debug/CommandChannel.h"
 #include "debug/CrashLog.h"
 #include "debug/Logger.h"
 #include "debug/Overlay.h"
 #include "game/MK9Game.h"
+#include "game/PressLatch.h"
 #include "hook/CodePatch.h"
 #include "hook/GameLoopHook.h"
 #include "hook/ObjectHooks.h"
@@ -81,7 +83,18 @@ DWORD WINAPI InitThread(LPVOID) {
 // waits for in-flight hook calls to drain, then unloads this module.
 extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     InterlockedExchange(&gUnloading, 1);
+    // First, so that the waits below pass before the module goes: the message hook an open panel has on the window's
+    // thread comes off (a key release it held back is posted to the game), and the pads' reading thread ends.
+    PressLatch::Shutdown();
     Overlay::Disable();  // the stub passes through until CodePatch::RestoreAll removes it
+    if (Overlay::SheetHeld()) {
+        // The stage screen's picture texture is the one thing the display keeps on the game's device. Only the render
+        // thread may release it, and it does in its next frame, while the stub is still in place: wait for that frame.
+        for (int i = 0; i < 50 && Overlay::SheetHeld(); ++i) Sleep(10);
+        Logger::Info("ARENAPICS: the texture of the pictures %s", Overlay::SheetHeld()
+                                                                      ? "is STILL on the device: the game drew no frame in 500 ms; it stays there until the game closes"
+                                                                      : "was released before the unload");
+    }
     RenderTag::Disable();  // frames queued from here on carry the game's own render command again
     Rumble::Uninstall();   // the game's XInputSetState pointer is its own again (a call in flight leaves during the waits below)
     if (InterlockedExchange(&gHooksInstalled, 0)) {
@@ -108,6 +121,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     }
     Snapshot::StopPageWarmer();
     ParallelMem::Stop();
+    ArenaPics::Shutdown();  // the stage screen's reading thread has ended (it runs for a few milliseconds)
     CrashLog::StopWatchdog();
     Overlay::Shutdown();  // its watcher thread (the F9 key) must be gone before the module is
     CrashLog::Uninstall();

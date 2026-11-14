@@ -14,6 +14,8 @@
 #include "../rollback/ScriptRng.h"
 #include "FlowDecode.h"
 #include "OnlineMode.h"
+#include "StageFlow.h"
+#include "StagePick.h"
 
 // Addresses, all read in the game's code (..\analysis\mkke_text.asm, 2026-11-12):
 //  - online manager [0x00E924F0] (0x0081A4D0 returns it; 0 offline); its session = [manager + 0x1F4] (0x0093C7D0 is
@@ -226,6 +228,37 @@ int Slot(uint32_t id) {
     return -1;
 }
 
+// ---- the scripts' sync wait polls ----
+// Native 1260 (0x008C0520 -> 0x0081B460 -> session 0x00911C20(type)) answers whether the sync wait of a type still runs:
+// 1 when the session has no wait of that type or still waits for another game, 0 when the wait is over or there is no
+// online session (read in the game's script and code 2026-11-13, StageHold.h has the detail; the first reading of that
+// day had the two the other way round). The scripts poll it. Which type is polled, from which game frame to which, how often and with which
+// answers tells where the game waits for the other one; after the last fighter is locked that is the place a stage
+// screen both players use would have to hold. Nothing of the game is called: the operand and the result the native left
+// are read, the polls counted. Native 1261 (0x008C0540 -> 0x0081C730 -> session 0x0091F630, two operands, no result) is
+// not read through: its first calls per timeline are logged with their operands.
+constexpr int kSyncSlots = 10;  // types 0-8, and one slot for every other number
+struct SyncPolls {
+    uint32_t calls, firstGf, lastGf, answer, lines;
+};
+SyncPolls gPolls[kSyncSlots];  // game thread; per timeline
+uint32_t gSync1261 = 0;
+void FlushPolls(const char* when) {
+    char line[900];
+    int n = 0;
+    for (int t = 0; t < kSyncSlots; ++t) {
+        const SyncPolls& p = gPolls[t];
+        if (!p.calls) continue;
+        if (t == kSyncSlots - 1) n = AppendF(line, sizeof line, n, "%sother types", n ? "; " : "");
+        else n = AppendF(line, sizeof line, n, "%stype %d %s", n ? "; " : "", t, FlowDecode::SyncWaitName((uint32_t)t));
+        n = AppendF(line, sizeof line, n, " x%u, gf %u to %u, last answer %u", (unsigned)p.calls, (unsigned)p.firstGf, (unsigned)p.lastGf,
+                    (unsigned)p.answer);
+    }
+    if (n) Logger::Info("ONLINEFLOW sync wait polls (native 1260) until %s: %s", when, line);
+    memset(gPolls, 0, sizeof gPolls);
+    gSync1261 = 0;
+}
+
 bool gSendTapped = false, gRecvTapped = false, gInstallTried = false;
 bool PatchCall(uintptr_t site, uintptr_t oldTarget, void (*stub)(), const char* name) {
     uint8_t expected[5] = {0xE8}, replacement[5] = {0xE8};
@@ -241,6 +274,19 @@ extern "C" void __cdecl MK9R_OnSettingsSend(const uint8_t* bytes) {
     if (Rollback::gIsResimulating) return;  // a replayed call of native 1375: nothing read, nothing noted
     InterlockedExchange(&gSettingsBuilt, 1);
     if (!InMatch()) return;
+    // The stage flow may write the two players' agreed stage into the message here (off unless 'stageoverride 1'; game
+    // thread only). The sender read the index from the session before this call (0x0087F8EC), so the session's copy,
+    // which this game reads back with native 1179, is set too. The line below then shows what is really sent.
+    if (GetCurrentThreadId() == ObjectHooks::gGameThread && StageFlow::OnSettingsSend(const_cast<uint8_t*>(bytes))) {
+        uint32_t mgr = 0, session = 0, old = 0;
+        const uint32_t entry = StagePick::SettingsIndex(bytes);
+        if (Rd(kOnlineManager, &mgr) && mgr && Rd(mgr + kManagerSession, &session) && session && Rd(session + kSessionBackground, &old)) {
+            *reinterpret_cast<uint32_t*>(session + kSessionBackground) = entry;
+            Logger::Info("STAGEPICK the session's selected background index %u -> %u", old, entry);
+        } else {
+            Logger::Info("STAGEPICK the session's selected background index could not be set: only the message carries %u", entry);
+        }
+    }
     uint8_t b[FlowDecode::kGameSettingsBytes];
     const bool read = ReadBytes(reinterpret_cast<uintptr_t>(bytes), b, sizeof b);
     uint32_t index = 0;
@@ -281,6 +327,8 @@ extern "C" void __cdecl MK9R_OnMsgRecv(uint32_t id, uint32_t msg) {
     const uint32_t len = shape ? size - pos : 0;
     const uint32_t have = len < sizeof b ? len : (uint32_t)sizeof b;
     const bool read = shape && ReadBytes(data + pos, b, have);
+    // The stage flow compares the index with the stage it computed itself (any thread: it only notes the number).
+    if (id == 9 && read && have >= StagePick::kSettingsBytes) StageFlow::NoteSettingsReceived(StagePick::SettingsIndex(b));
     uint32_t index = 0;
     const bool sessionRead = id == 9 && SessionIndex(&index);
     uint32_t h = FlowDecode::BytesHash(&len, sizeof len, id);
@@ -311,6 +359,8 @@ extern "C" void __cdecl MK9R_OnMsgRecv(uint32_t id, uint32_t msg) {
 }
 
 namespace FlowTrace {
+
+bool FightStageName(char* out, size_t cap) { return FightStage(out, cap); }
 
 void Install() {
     if (!gSendTapped)
@@ -403,7 +453,40 @@ bool OnNative(uint32_t id, uint32_t fn, uint32_t exec, uint32_t gf, uint32_t cal
     return true;
 }
 
+void OnSyncNative(uint32_t id, uint32_t exec, uint32_t gf) {
+    if (Rollback::gIsResimulating || !InMatch()) return;
+    uint32_t ops = 0, a = 0, b = 0, answer = 0, gfNow = 0, state = 0;
+    const bool read = Rd(exec + 0x3C, &ops) && ops && Rd(ops + 4, &a);
+    if (id == 1261) {
+        if (gSync1261++ >= 6) return;
+        GameNow(&gfNow, &state);
+        if (read && Rd(ops + 8, &b))
+            Logger::Info("ONLINEFLOW id 1261 native 008C0540 call #%u of this timeline at gf %u (game state %u): operands %u, %u (session "
+                         "0x0091F630, not read through)",
+                         (unsigned)gSync1261, (unsigned)gf, (unsigned)state, (unsigned)a, (unsigned)b);
+        else
+            Logger::Info("ONLINEFLOW id 1261 native 008C0540 call #%u of this timeline at gf %u (game state %u): operands not readable",
+                         (unsigned)gSync1261, (unsigned)gf, (unsigned)state);
+        return;
+    }
+    if (!read || !Rd(exec + 0x1C, &answer)) return;
+    SyncPolls& p = gPolls[a < (uint32_t)kSyncSlots - 1 ? a : (uint32_t)kSyncSlots - 1];
+    const bool first = !p.calls++;
+    // The first poll of a type in this timeline and every change of its answer (twelve lines per type and timeline).
+    if ((first || answer != p.answer) && p.lines < 12) {
+        ++p.lines;
+        GameNow(&gfNow, &state);
+        Logger::Info("ONLINEFLOW id 1260 native 008C0520 poll #%u of sync wait %u %s in this timeline at gf %u (game state %u): answer %u "
+                     "(0: over, 1: still waiting or never begun)",
+                     (unsigned)p.calls, (unsigned)a, FlowDecode::SyncWaitName(a), (unsigned)gf, (unsigned)state, (unsigned)answer);
+    }
+    if (first) p.firstGf = gf;
+    p.lastGf = gf;
+    p.answer = answer;
+}
+
 void OnFightStart(uint32_t gf) {
+    if (!Rollback::gIsResimulating) FlushPolls("the fight's start");
     if (Rollback::gIsResimulating || !InMatch()) return;
     char stage[65];
     const bool stageRead = FightStage(stage, sizeof stage);
@@ -421,6 +504,7 @@ void OnFightStart(uint32_t gf) {
 }
 
 void NewTimeline() {
+    FlushPolls("the timeline's end");
     memset(gCalls, 0, sizeof gCalls);
     memset(gShownSends, 0, sizeof gShownSends);
     for (FlowDecode::Repeat& r : gRepeat) r.Reset();

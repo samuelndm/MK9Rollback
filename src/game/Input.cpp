@@ -7,6 +7,7 @@
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
 #include "MK9Game.h"
+#include "PressLatch.h"
 
 namespace {
 // Pad objects are long-lived; validate each distinct pointer once with VirtualQuery.
@@ -192,6 +193,7 @@ volatile bool gDefer = false;
 bool gPending = false;
 uint32_t gDeferredSamples = 0, gUndeferredSamples = 0;
 void SampleCapture();
+void ReassertPanelHold();
 
 // ---- MK9's controller re-detection during a session (two-PC match of 2026-11-11) ----
 // MK9's window procedure (0x005758B0, message 0x219 WM_DEVICECHANGE, any wParam) sets a flag at 0x00DE9934. The sampler
@@ -338,6 +340,7 @@ extern "C" int __cdecl MK9R_IsXInputDevice(const GUID* product) {
 
 extern "C" void __cdecl MK9R_Sampler() {
     using namespace Input;
+    ReassertPanelHold();  // before the sampler can write a player's press into a record the panel holds
     if (!gCapture) {
         gPending = false;
         reinterpret_cast<void(__cdecl*)()>(kSampler)();
@@ -358,6 +361,17 @@ extern "C" void __cdecl MK9R_Sampler() {
 
 namespace Input {
 namespace {
+// While a panel of the mod has the controls (SetPanelHold): every change of the sampled mask and every long gap
+// between two samples go to the log, anew for each opening. Game thread only.
+bool gPanelLog = false;
+int gPanelMaskLines = 0, gPanelGapLines = 0;
+uint32_t gPanelLoggedMask = 0;
+LONGLONG gPanelSampledQpc = 0;
+// Every bit any sample showed since the panel last asked (TakePanelPresses): a pass of the main loop that samples but
+// runs no tick of the panel must not lose a press that lasted one sample.
+uint32_t gPanelSeen = 0;
+uint32_t gPanelGiven = 0;  // what the panel's reader had at its last tick (TakePanelPresses)
+
 void SampleCapture() {
     bool restore[6] = {};
     for (int k = 0; k < 6; ++k) {
@@ -409,6 +423,23 @@ void SampleCapture() {
         sLoggedKey = key;
     }
     if (gLocalHw && sNonZero++ < 5) Logger::Info("INPUT capture: local hardware mask %04X", gLocalHw);
+    // Under a panel. A press that begins and ends between two samples is never seen, by the panel or by MK9's own
+    // menus: on 2026-11-13 one of three key presses posted to the game's window went missing while the title screen
+    // hitched (five samples with one timestamp right after it). These lines say next time whether that was it.
+    if (gPanelLog) {
+        if (gPanelSampledQpc) {
+            LARGE_INTEGER fq;
+            QueryPerformanceFrequency(&fq);
+            const double gap = (double)(sampledAt.QuadPart - gPanelSampledQpc) * 1000.0 / (double)(fq.QuadPart ? fq.QuadPart : 1);
+            if (gap >= 60.0 && gPanelGapLines++ < 12)
+                Logger::Info("INPUT panel: %.0f ms between two samples of the controls (a press that begins and ends inside such a gap is not seen)", gap);
+        }
+        gPanelSampledQpc = sampledAt.QuadPart;
+        if (gLocalHw != gPanelLoggedMask && gPanelMaskLines++ < 48) Logger::Info("INPUT panel: sampled mask %04X", gLocalHw);
+        gPanelLoggedMask = gLocalHw;
+        gPanelSeen |= gLocalHw;
+        PressLatch::OnSample(gLocalHw);  // key releases held back for this sample go to the game now; the pads' reading is compared
+    }
 }
 }  // namespace
 
@@ -455,7 +486,85 @@ bool InstallSamplerHook() {
     }
     return gSamplerHooked;
 }
+namespace {
+bool gPanelHold = false, gPanelOwnsCapture = false, gPanelCall = false;
+uint32_t gPanelScripted = 0, gPanelReasserted = 0;
+uint32_t gPanelPass = 0;  // what the game's pads read under the panel instead of "nothing held" (SetPanelPass)
+// MK9 writes its pad records' flags anew when it sets its controllers up again. Seen 2026-11-12 in an offline game: the
+// menu went back to the title screen by itself after a minute without input, "externally driven" was gone from all six
+// records, and from then on the sampler wrote the player's presses into them under the open panel. Called before every
+// hardware sample (the sampler is the only writer of real input) and at every tick of the hold.
+void ReassertPanelHold() {
+    if (!gPanelHold) return;
+    for (int p = 0; p < 6; ++p) {
+        const uintptr_t pad = kHwPads + p * kPadBytes;
+        uint32_t* flags = reinterpret_cast<uint32_t*>(pad + 0x08);
+        if (!gHwActive[p] || (*flags & kFlagExternal)) continue;
+        gHwSavedFlags[p] = *flags;  // the game's new flags are what the release gives back
+        *flags |= kFlagExternal;
+        *reinterpret_cast<uint32_t*>(pad + 0x0C) = 0;
+        if (gPanelReasserted++ < 12)
+            Logger::Info("INPUT: the game wrote hardware pad %d's flags anew (0x%08X) under the panel; the hold is put back", p,
+                         gHwSavedFlags[p]);
+    }
+}
+}
+void SetPanelHold(bool on) {
+    if (on == gPanelHold) return;
+    gPanelHold = on;
+    gPanelScripted = 0;
+    gPanelPass = 0;
+    gPanelCall = true;
+    gPanelLog = on;
+    gPanelMaskLines = gPanelGapLines = 0;
+    gPanelLoggedMask = 0;
+    gPanelSampledQpc = 0;
+    if (on) {
+        // The sampler's wrapper is what reads the player's own pad or keyboard for the panel. A netplay session installs
+        // it ('netcode rollback'); a game that has had none yet (seen 2026-11-12 in an offline game: "capture NOT on",
+        // the panel could only be driven by scripted presses) gets it here.
+        if (!gSamplerHooked) InstallSamplerHook();
+        if (!gCapture) {
+            SetLocalCapture(true);
+            gPanelOwnsCapture = gCapture;
+        }
+        Logger::Info("INPUT: a panel of the mod has the controls (the game's screen gets neutral input; capture %s)",
+                     gCapture ? "on" : "NOT on: the panel cannot be operated");
+        gPanelSeen = gPanelGiven = 0;
+        PressLatch::Begin();  // presses that fall between two samples (PressLatch.h); nothing of it runs without a panel
+    } else {
+        PressLatch::End();  // a key release still held back goes to the game before it has the controls again
+        for (int p = 0; p < 6; ++p) ReleaseHwPad(p);
+        if (gPanelOwnsCapture) SetLocalCapture(false);
+        gPanelOwnsCapture = false;
+        Logger::Info("INPUT: the game has the controls again");
+    }
+    gPanelCall = false;
+}
+bool PanelHold() { return gPanelHold; }
+void HoldPadsNeutral() {
+    if (!gPanelHold) return;
+    ReassertPanelHold();
+    for (int p = 0; p < 6; ++p) OverrideHwPad(p, gPanelPass);
+}
+void SetPanelPass(uint32_t mask) { gPanelPass = gPanelHold ? (mask & 0xFFFFu) : 0; }
+void SetPanelScripted(uint32_t mask) { gPanelScripted = mask & 0xFFFFu; }
+uint32_t PanelMask() { return gPanelHold ? ((gCapture ? gLocalHw : 0) | gPanelScripted) : 0; }
+uint32_t TakePanelPresses() {
+    if (!gPanelHold) return 0;
+    const uint32_t seen = gCapture ? gPanelSeen : 0;
+    gPanelSeen = 0;
+    const uint32_t pad = PressLatch::TakePad();
+    // A press the pads' reading adds: in no sample, and not the tail of a press the panel already had last tick.
+    const uint32_t added = pad & ~seen & ~gLocalHw & ~gPanelGiven;
+    gPanelGiven = seen | pad | gLocalHw;
+    if (added) PressLatch::NotePadAdded(added);
+    return seen | pad;
+}
+
 void SetLocalCapture(bool on) {
+    // A session that asks for capture while a panel holds it takes it over: the panel's end must not switch it off.
+    if (!gPanelCall && on) gPanelOwnsCapture = false;
     const bool was = gCapture;
     // Without the sampler patch nothing is captured: the log said "on" all the same, over a session with neutral input.
     if (on && !gSamplerHooked)

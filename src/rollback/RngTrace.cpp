@@ -18,6 +18,8 @@
 #include "../hook/GameLoopHook.h"
 #include "../debug/Ue3Names.h"
 #include "../net/FlowDecode.h"
+#include "../net/Refight.h"
+#include "../net/StageFlow.h"
 #include "../net/FlowTrace.h"
 #include "../net/OnlineMode.h"
 #include "RollbackManager.h"
@@ -146,7 +148,7 @@ const OnlineNative kOnlineNatives[] = {
     {0x008BFFD0, 1219}, {0x008BFFF0, 1221}, {0x008C0010, 1222}, {0x008C0030, 1223}, {0x008C0040, 1224},
     {0x008C0070, 1225}, {0x008C00A0, 1226}, {0x008C00D0, 1227}, {0x008C0100, 1228}, {0x008C0180, 1235},
     {0x008C0500, 1259}, {0x008C0520, 1260}, {0x008C0540, 1261}, {0x008C0960, 1297}, {0x008C0AB0, 1310},
-    {0x008C0E10, 1342}, {0x008C0E20, 1343}, {0x008C0E50, 1346}, {0x008C0E90, 1350}, {0x008C0ED0, 1352},
+    {0x008C0E10, 1342}, {0x008C0E20, 1343}, {0x008C0E50, 1346}, {0x008C0E90, 1350}, {0x008C0EB0, 1351}, {0x008C0ED0, 1352},
     {0x008C0F00, 1353}, {0x008C0F20, 1354}, {0x008C0F50, 1355}, {0x008C0F60, 1356}, {0x008C0F80, 1357},
     {0x008C0FA0, 1358}, {0x008C0FC0, 1359}, {0x008C0FE0, 1360}, {0x008C1090, 1367}, {0x008C10B0, 1368},
     {0x008C10F0, 1370}, {0x008C1110, 1371}, {0x008C1120, 1372}, {0x008C1140, 1373}, {0x008C1170, 1375},
@@ -171,7 +173,7 @@ bool gOnlineSeen[kOnlineNativeCount];
 // never left) was a second match, and its log has none of them. These are logged per timeline: calls 1-3, then the 10th,
 // 100th, ... (one polled every tick shows as such).
 constexpr uint16_t kFlowNatives[] = {1144, 1173, 1174, 1175, 1176, 1177, 1178, 1179, 1182, 1190, 1192, 1193, 1204,
-                                     1206, 1209, 1211, 1217, 1350, 1352, 1375, 1378, 1386, 1392, 3268};
+                                     1206, 1209, 1211, 1217, 1350, 1351, 1352, 1375, 1378, 1386, 1392, 3268};
 uint32_t gFlowCalls[kOnlineNativeCount];
 bool FlowNative(uint16_t id) { return std::binary_search(std::begin(kFlowNatives), std::end(kFlowNatives), id); }
 void NoteOnlineNative(uint32_t fn, uint32_t exec) {
@@ -193,6 +195,30 @@ void NoteOnlineNative(uint32_t fn, uint32_t exec) {
     // as new ones, and said "live" for all of them.)
     const bool replay = Rollback::gIsResimulating;
     if (kOnlineNatives[lo].id == 1182 && !replay) Online::OnLoadedNative();
+    // The choice after a match (Refight.h): its panel opens when MK9's rematch screen begins (1350 with operand 1) and
+    // ends when that screen's two decisions are in (1351); at 1375 the mod's own presses on the character select end,
+    // before the stage screen's tap. The native has just returned; its first operand is at [[0x00E39DF4]+0x3C]+4, where
+    // 0x008C0E90 and 0x008C0EB0 took it from (read in the disassembly).
+    if (!replay) {
+        const uint32_t ex = *reinterpret_cast<const uint32_t*>(0x00E39DF4);
+        const uint32_t ops = ex ? *reinterpret_cast<const uint32_t*>(ex + 0x3C) : 0;
+        const uint16_t id = kOnlineNatives[lo].id;
+        Refight::OnNative(id, ops && (id == 1350 || id == 1351) ? *reinterpret_cast<const uint32_t*>(ops + 4) : 0);
+    }
+    // The stage screen: opens on native 'stagetrigger N' (1375 by default), ends its own panel at 1182.
+    if (!replay) StageFlow::OnNative(kOnlineNatives[lo].id);
+    // The scripts' sync wait polls, in an online one-on-one match (FlowTrace: where the game waits for the other one).
+    if (!replay && (kOnlineNatives[lo].id == 1260 || kOnlineNatives[lo].id == 1261)) FlowTrace::OnSyncNative(kOnlineNatives[lo].id, exec, (uint32_t)gCurGf);
+    // The stage screen's hold (StageHold.h): while the players pick, the script's question "does sync wait 2 still run?"
+    // reads "yes" (1; the game answers 0 once the other game is there). The native 0x008C0520 has just returned: it took
+    // the wait's type from [[0x00E39DF4]+0x3C]+4 and left its answer at [0x00E39DF4]+0x1C (both read in the
+    // disassembly), where the script takes it from. The trace line above has the game's own answer.
+    if (!replay && kOnlineNatives[lo].id == 1260) {
+        const uint32_t ex = *reinterpret_cast<const uint32_t*>(0x00E39DF4);
+        const uint32_t ops = ex ? *reinterpret_cast<const uint32_t*>(ex + 0x3C) : 0;
+        if (ops && StageFlow::OnSyncPoll(*reinterpret_cast<const uint32_t*>(ops + 4), *reinterpret_cast<const uint32_t*>(ex + 0x1C)))
+            *reinterpret_cast<uint32_t*>(ex + 0x1C) = 1;  // StageHold::kAnswerWaiting
+    }
     if (!replay && FlowNative(kOnlineNatives[lo].id)) {
         const uint32_t n = ++gFlowCalls[lo];
         gOnlineSeen[lo] = true;

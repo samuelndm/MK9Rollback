@@ -69,6 +69,9 @@ const char* StatusText();                // in an online fight on MK9's netcode:
 // Returns an Overlay::Pre. kPreReady: both mods answered each other with the same build in a one-on-one Player/Private
 // match, *rttMs = the hellos' median round trip (-1: none measured yet). kPreBlocked: *why = the status text.
 int PreFight(int* rttMs, const char** why);
+// After a match (the results and rematch screens, where the hellos pause and PreFight says nothing): the two mods of
+// this match answered each other as the same build, in a one-on-one Player/Private match. Game thread.
+bool SameBuildPeer();
 // Connection facts for the status line; game thread, plain reads of values kept up to date elsewhere (the Wi-Fi look
 // runs on its own thread once per match, the opponent's side comes with its hellos, the relay state is read from Steam
 // with every hello sent, twice a second). All false while unknown.
@@ -82,5 +85,8 @@ uintptr_t ConnectionAddress(uint32_t* size);
 // GameContext check of the engagement: type 0, 2 or 3 and match type 0). False offline, in ranked and in King of the
 // Hill. Reads only, any thread; for the trace lines of FlowTrace.
 bool OneOnOne();
+// A datagram of the mod's own to the current opponent, on the hellos' channel (the stage screen's picks; a release
+// that does not know it drops it as "not a hello"). False: no opponent is known right now, nothing sent. Game thread.
+bool SendToPeer(const void* data, uint32_t size);
 
 }  // namespace Online

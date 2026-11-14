@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 // The "G2" trace lines (docs\feature_parity_plan.md 4.2 step 1 and section 5, row G2): how MK9 passes the stage and the
@@ -28,7 +29,13 @@ void Install();
 // native in this timeline, or 0 to have the call counted here. True: handled here (a line with the call's values, or
 // none because they are those of its last line); false: not in an online one-on-one match, nothing read or written.
 bool OnNative(uint32_t id, uint32_t fn, uint32_t exec, uint32_t gf, uint32_t callNo);
+// Script native 1260 (a script asks whether a sync wait is over) or 1261 returned, live, on the game thread: in an
+// online one-on-one match the first poll of each wait type per timeline, every change of its answer, and a summary at
+// the timeline's end or the fight's start ("ONLINEFLOW sync wait polls"); 1261's first six calls with their operands.
+void OnSyncNative(uint32_t id, uint32_t exec, uint32_t gf);
 void OnFightStart(uint32_t gf);  // combat begins (game thread, live)
+// The name of the stage the current fight runs on, as the game holds it (a stage table name). False: not readable.
+bool FightStageName(char* out, size_t cap);
 void NewTimeline();              // GameFrame started over: the counts per timeline do too
 
 }  // namespace FlowTrace

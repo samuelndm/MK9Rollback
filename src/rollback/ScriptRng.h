@@ -32,6 +32,13 @@ void OnFightStart();  // restarts the attract pick index (combat start)
 // Two-instance tests on every stage: the attract script's random stage pick (0x00810530, table [0x00E9234C]) returns
 // entry 'index' of the stage table instead ('forcestage -1': random again). Needs 'scriptseed' (the pick's hook).
 void ForceStage(int index);
+// The stage screen (StageFlow), game thread. SetMatchStage: every stage a script or a picker sets from now on becomes
+// this stage table entry, until SetMatchStage(-1); it goes before 'forcestage'. False: no such entry (nothing changed).
+// WriteStage: the game's own SetSelectedBackground with that entry's name, now. False: nothing was called.
+void InstallStageSites();
+bool SetMatchStage(int index);
+int MatchStage();
+bool WriteStage(uint32_t index);
 void SetPickVariety(uint32_t v);  // 'pickvariety N': other attract fighters for the same scriptseed
 void LogStages();  // 'stages': the table's entries (index, name, selectable flag, attract exclusion)
 // Read-only looks at the stage table for trace lines (FlowTrace): its number of entries; the name of entry 'index'
@@ -39,6 +46,7 @@ void LogStages();  // 'stages': the table's entries (index, name, selectable fla
 // case ignored (-1: none).
 uint32_t StageCount();
 const char* StageAt(uint32_t index);
+bool StageSelectable(uint32_t index);  // the entry carries the table's "selectable" mark (the 'stages' line shows the others as "(off)")
 int StageIndex(const char* name);
 
 }  // namespace ScriptRng

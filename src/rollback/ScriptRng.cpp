@@ -162,7 +162,13 @@ extern "C" {
 volatile int MK9R_ForceStageOn = 0;
 }
 namespace {
-volatile int gForceStage = -1;
+volatile int gForceStage = -1;  // 'forcestage' (tests)
+// The stage screen's agreed arena for the online match that is about to load (-1: none). It goes before the command's.
+volatile int gMatchStage = -1;
+int Forced() {
+    const int m = gMatchStage;
+    return m >= 0 ? m : gForceStage;
+}
 const char* StageName(uint32_t i, uint32_t* flag) {
     const uint32_t tab = *reinterpret_cast<const uint32_t*>(0x00E9234C), n = *reinterpret_cast<const uint32_t*>(0x00E92350);
     const uint32_t names = *reinterpret_cast<const uint32_t*>(0x00E7C058);
@@ -177,12 +183,13 @@ const char* StageName(uint32_t i, uint32_t* flag) {
 }  // namespace
 extern "C" void __cdecl MK9R_ForceStageAfter(char* out, uint32_t picker) {
     if (!MK9R_ForceStageOn || !out) return;
-    const char* name = StageName((uint32_t)gForceStage, nullptr);
+    const int forced = Forced();
+    const char* name = StageName((uint32_t)forced, nullptr);
     if (!name) return;
     char was[64];
     snprintf(was, sizeof was, "%s", out);
     strcpy(out, name);  // as the pickers copy it
-    Logger::Info("FORCESTAGE: attract pick -> stage %d %s (picker %08X had %s)", gForceStage, name, picker, was);
+    Logger::Info("FORCESTAGE: attract pick -> stage %d %s (picker %08X had %s)", forced, name, picker, was);
 }
 // Pick, then overwrite: called instead of a picker (thiscall, two stack arguments, ret 8; ecx untouched until the call).
 #define MK9R_STAGE_AFTER(NAME, TARGET, PRE)                                                                                   \
@@ -200,10 +207,11 @@ extern "C" void MK9R_HkPickStage3();
 extern "C" const char* __cdecl MK9R_ForcedStageName(const char* orig) {
     // Only a fight stage ("BGND_..." or "random"): the attract flow also sets "empty_map" between demos.
     if (!orig || IsBadStringPtrA(orig, 64) || (_strnicmp(orig, "BGND_", 5) && _stricmp(orig, "random"))) return nullptr;
-    const char* name = MK9R_ForceStageOn ? StageName((uint32_t)gForceStage, nullptr) : nullptr;
+    const int forced = Forced();
+    const char* name = MK9R_ForceStageOn ? StageName((uint32_t)forced, nullptr) : nullptr;
     if (name)
-        Logger::Info("FORCESTAGE: SetSelectedBackground(%s) -> stage %d %s", orig && !IsBadStringPtrA(orig, 64) ? orig : "?", gForceStage,
-                     name);
+        Logger::Info("FORCESTAGE: SetSelectedBackground(%s) -> stage %d %s%s", orig && !IsBadStringPtrA(orig, 64) ? orig : "?", forced, name,
+                     gMatchStage >= 0 ? " (the stage screen's agreed arena)" : "");
     return name;
 }
 asm(R"(
@@ -249,33 +257,56 @@ void SetPickVariety(uint32_t v) {
     Logger::Info("PICKVARIETY %u: attract fighter picks offset (scriptseed %08X)", v, gAttractSeed);
 }
 
+// The stage natives' picker calls (0x008D6A1E is 'scriptseed''s; they never ran in attract) and every call of
+// SetSelectedBackground 0x00811DD0, which sets the demos' stages and the stage a script names (natives 671 and 672).
+// While nothing is forced the stubs go straight on to the game's functions.
+void InstallStageSites() {
+    static bool sites = false;
+    if (sites) return;
+    sites = true;
+    const struct { uintptr_t site, target; void (*stub)(); } s[5] = {{0x008D6A5E, 0x00812670, &MK9R_HkPickStage2},
+                                                                     {0x008D6A9E, 0x00812540, &MK9R_HkPickStage3},
+                                                                     {0x008BB53C, 0x00811DD0, &MK9R_HkSetBgnd},
+                                                                     {0x0081563C, 0x00811DD0, &MK9R_HkSetBgnd},
+                                                                     {0x008143D7, 0x00811DD0, &MK9R_HkSetBgnd}};
+    for (const auto& p : s) {
+        uint8_t orig[5] = {0xE8}, call[5] = {0xE8};
+        const int32_t ro = (int32_t)(p.target - (p.site + 5));
+        const int32_t rn = (int32_t)(reinterpret_cast<uintptr_t>(p.stub) - (p.site + 5));
+        memcpy(orig + 1, &ro, 4);
+        memcpy(call + 1, &rn, 4);
+        CodePatch::Write(p.site, orig, call, 5, "attract stage picker (forcestage)");
+    }
+}
+
+bool SetMatchStage(int index) {
+    if (index >= 0 && !StageName((uint32_t)index, nullptr)) return false;
+    if (index >= 0) InstallStageSites();
+    gMatchStage = index >= 0 ? index : -1;
+    MK9R_ForceStageOn = Forced() >= 0;
+    return true;
+}
+int MatchStage() { return gMatchStage; }
+
+// SetSelectedBackground 0x00811DD0 as a script's stage native calls it (cdecl, the name). Read in the disassembly: it
+// prints a debug line, copies the name into the fight's stage buffer [0x00E89B8C]+0x3C (64 bytes), stores the name's
+// FName at +0x7C / +0x80 and sets +0x8D8 to 1; it starts no load. It reads [0x00E89B8C] without a check.
+bool WriteStage(uint32_t index) {
+    const char* name = StageName(index, nullptr);
+    if (!name || !*reinterpret_cast<const uint32_t*>(0x00E89B8C)) return false;
+    reinterpret_cast<void(__cdecl*)(const char*)>(0x00811DD0)(name);
+    return true;
+}
+
 void ForceStage(int index) {
     const char* name = index >= 0 ? StageName((uint32_t)index, nullptr) : nullptr;
     if (index >= 0 && !name) {
         Logger::Info("FORCESTAGE %d: no such stage (table of %u)", index, *reinterpret_cast<const uint32_t*>(0x00E92350));
         return;
     }
-    // The stage natives' picker calls (0x008D6A1E is 'scriptseed''s; they never ran in attract) and every call of
-    // SetSelectedBackground 0x00811DD0, which sets the demos' stages.
-    static bool sites = false;
-    if (index >= 0 && !sites) {
-        sites = true;
-        const struct { uintptr_t site, target; void (*stub)(); } s[5] = {{0x008D6A5E, 0x00812670, &MK9R_HkPickStage2},
-                                                                         {0x008D6A9E, 0x00812540, &MK9R_HkPickStage3},
-                                                                         {0x008BB53C, 0x00811DD0, &MK9R_HkSetBgnd},
-                                                                         {0x0081563C, 0x00811DD0, &MK9R_HkSetBgnd},
-                                                                         {0x008143D7, 0x00811DD0, &MK9R_HkSetBgnd}};
-        for (const auto& p : s) {
-            uint8_t orig[5] = {0xE8}, call[5] = {0xE8};
-            const int32_t ro = (int32_t)(p.target - (p.site + 5));
-            const int32_t rn = (int32_t)(reinterpret_cast<uintptr_t>(p.stub) - (p.site + 5));
-            memcpy(orig + 1, &ro, 4);
-            memcpy(call + 1, &rn, 4);
-            CodePatch::Write(p.site, orig, call, 5, "attract stage picker (forcestage)");
-        }
-    }
+    if (index >= 0) InstallStageSites();
     gForceStage = index;
-    MK9R_ForceStageOn = index >= 0;
+    MK9R_ForceStageOn = Forced() >= 0;
     Logger::Info("FORCESTAGE %d%s%s%s", index, name ? " (" : " (random picks)", name ? name : "", name ? ")" : "");
 }
 
@@ -298,6 +329,10 @@ void LogStages() {
 
 uint32_t StageCount() { return *reinterpret_cast<const uint32_t*>(0x00E92350); }
 const char* StageAt(uint32_t index) { return StageName(index, nullptr); }
+bool StageSelectable(uint32_t index) {
+    uint32_t flag = 0;
+    return StageName(index, &flag) && flag != 0;
+}
 int StageIndex(const char* name) {
     const uint32_t n = StageCount();
     for (uint32_t i = 0; name && i < n && i < 256; ++i) {

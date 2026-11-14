@@ -12,6 +12,8 @@
 namespace {
 using Hud::Vtx;
 using Overlay::Stats;
+using Hud::Canvas;
+using Hud::Frame;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Faces: every glyph as two lists of rectangles, the glyph itself ("fill") and its dark edge.
@@ -259,10 +261,6 @@ uint64_t gBuiltAtMs = 0;
 // ---------------------------------------------------------------------------------------------------------------
 // Rectangles.
 
-struct Canvas {
-    Vtx* v;
-    int n, cap, dropped;
-};
 
 void Quad(Canvas& c, int x0, int y0, int x1, int y1, uint32_t argb) {
     if (x1 <= x0 || y1 <= y0 || !(argb >> 24)) return;
@@ -530,24 +528,6 @@ void Compose(const Stats& s, uint64_t now, Wanted& w) {
 // Where. Positions are in 1/1080 of the height of a 16:9 frame centred in the picture (MK9 letterboxes to 16:9),
 // calibrated on screenshots of the fight HUD.
 
-struct Frame {
-    int x, y, w, h;
-    float u;
-};
-Frame FrameOf(const Hud::View& v) {
-    Frame f;
-    if ((long long)v.w * 9 >= (long long)v.h * 16) {
-        f.h = v.h;
-        f.w = (int)((long long)v.h * 16 / 9);
-    } else {
-        f.w = v.w;
-        f.h = (int)((long long)v.w * 9 / 16);
-    }
-    f.x = v.x + (v.w - f.w) / 2;
-    f.y = v.y + (v.h - f.h) / 2;
-    f.u = (float)f.h / 1080.0f;
-    return f;
-}
 
 // Measured 2026-11-12 on frames of a Ladder fight and of its character select at 1920x1200 (a 1920x1080 frame, 'hudshot'):
 //   the round timer's medallion spans 30..130 below the frame's top, and its middle spike points down to 157;
@@ -803,6 +783,39 @@ bool Demo(int n, Stats* s) {
         return false;
     }
 }
+
+// ---- the same faces and rectangles for the mod's panels (Hud.h) ----
+Frame FrameOf(const View& v) {
+    Frame f;
+    if ((long long)v.w * 9 >= (long long)v.h * 16) {
+        f.h = v.h;
+        f.w = (int)((long long)v.h * 16 / 9);
+    } else {
+        f.w = v.w;
+        f.h = (int)((long long)v.w * 9 / 16);
+    }
+    f.x = v.x + (v.w - f.w) / 2;
+    f.y = v.y + (v.h - f.h) / 2;
+    f.u = (float)f.h / 1080.0f;
+    return f;
+}
+bool FacesFor(const View& v) { return gFacesOk && v.w == gBuiltW && v.h == gBuiltH; }
+void Rect(Canvas& c, int x0, int y0, int x1, int y1, uint32_t argb) { Quad(c, x0, y0, x1, y1, argb); }
+int Width(FaceId f, const char* s) { return TextW(f == kSmallFace ? gSmall : gMain, s); }
+int Write(Canvas& c, FaceId f, const char* s, int x, int y, uint32_t rgb, int alpha, bool edge) {
+    const Face& face = f == kSmallFace ? gSmall : gMain;
+    if (edge) return Text(c, face, s, x, y, rgb, alpha);
+    int pen = x;
+    for (const char* p = s; *p; ++p)
+        if (const Glyph* g = GlyphOf(face, *p)) {
+            Runs(c, face, g->fill, g->fillN, pen, y, rgb, alpha);
+            pen += g->adv * face.zoom;
+        }
+    return pen - x;
+}
+int EmOf(FaceId f) { return (f == kSmallFace ? gSmall : gMain).Em(); }
+int CapOf(FaceId f) { return (f == kSmallFace ? gSmall : gMain).Cap(); }
+int ReachOf(FaceId f) { return (f == kSmallFace ? gSmall : gMain).Reach(); }
 
 void Reset() {
     gShown = Shown{};

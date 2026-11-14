@@ -19,6 +19,9 @@
 #include "EnvFingerprint.h"
 #include "FinisherRule.h"
 #include "HelloProto.h"
+#include "Refight.h"
+#include "StageFlow.h"
+#include "StagePick.h"
 #include "SteamBridge.h"
 
 namespace {
@@ -703,6 +706,13 @@ void ReadHellos() {
         const int got = SteamBridge::ReadRaw(kHelloChannel, buf, sizeof buf, &from);
         if (got < 0) break;
         if (from != gPeer) continue;
+        // The mods' second datagram on this channel (the stage screen's picks, StagePick.h): not a hello.
+        // Each takes the packets of its own kind: the stage picks, the choice after a match (Refight.h).
+        if (StagePick::IsPacket(buf, (size_t)got)) {
+            StageFlow::OnPacket(buf, got);
+            Refight::OnPacket(buf, got);
+            continue;
+        }
         // Everything below is the opponent's to choose: Parse checks the lengths and brings every value into the range
         // this mod sends (a delay of 255 went through AgreedDelay into GGPO, whose input queue asserts: the game closed).
         const HelloProto::Parsed h = HelloProto::Parse(buf, (size_t)got);
@@ -934,6 +944,11 @@ void MatchReset(const char* why) {
 
 namespace Online {
 
+bool SendToPeer(const void* data, uint32_t size) {
+    if (!gPeer || gPeer == kAutoPeer) return false;
+    return SteamBridge::SendRaw(gPeer, data, size, kHelloChannel);
+}
+
 bool OneOnOne() {
     uint32_t type = 0, matchType = 0;
     return OneOnOneMatch(&type, &matchType);
@@ -1068,6 +1083,11 @@ int PreFight(int* rttMs, const char** why) {  // game thread (overlay publish)
         *rttMs = (int)(median < 9999 ? median : 9999);
     }
     return Overlay::kPreReady;
+}
+
+bool SameBuildPeer() {
+    uint32_t type = 0, matchType = 0;
+    return gPeer && gPeer != kAutoPeer && HeardPeer() && gVerdict == HelloProto::Match::kSame && !gMatchRefused && OneOnOneMatch(&type, &matchType);
 }
 
 void TestScan() {  // 'onlinescan': the fallback pass on demand (its log line gives size and time); results unused
@@ -1327,7 +1347,9 @@ void Tick() {
         // re-engagement after the next round's start would miss that round). Not while MK9 loads the online fight or
         // waits for the other player's load (up to 40 s now): the match is still on, and the fight's phase needs the
         // opponent it knows (in auto mode a reset here cost a new search, ~2 s, at the fight's start).
-        const bool loading = gLoadWait || (GameState() == kLoadState && *reinterpret_cast<const volatile uint32_t*>(kOnlineManager));
+        // Nor while a player still chooses on the panel over MK9's rematch screen (Refight.h): its packets go to this
+        // opponent, and the rematch is the same match.
+        const bool loading = gLoadWait || (GameState() == kLoadState && *reinterpret_cast<const volatile uint32_t*>(kOnlineManager)) || Refight::Active();
         if (gInactiveSince && now - gInactiveSince > 20000 && !loading) {
             if (gPeer) {  // still connected to them through Steam, and still hearing their mod?
                 char p2p[200], age[32];

@@ -44,6 +44,8 @@
 #include "Ue3Names.h"
 #include "Logger.h"
 #include "../net/OnlineMode.h"
+#include "../net/Refight.h"
+#include "../net/StageFlow.h"
 #include "../net/SteamBridge.h"
 
 namespace {
@@ -272,6 +274,9 @@ void Execute(const std::string& line) {
     sscanf(line.c_str(), "%15s", verb);
     int player = 0, frames = 0, value = 0;
     unsigned mask = 0;
+    // The stage screen's commands (stagescreen, stageoverride, stagetrigger, stagedemo, stagestatus): StageFlow.cpp in src/net.
+    if (Refight::Command(line.c_str())) return;
+    if (StageFlow::Command(line.c_str())) return;
     if (!strcmp(verb, "hwhold") && sscanf(line.c_str(), "hwhold %d %x %d", &player, &mask, &frames) == 3 && player >= 0 &&
         player < 6 && frames > 0) {
         gHwQueue[player].push_back({mask, (uint32_t)frames});
@@ -1684,6 +1689,20 @@ void RunFrame() {
         }
         if (!paused && --q.front().frames == 0) q.pop_front();
     }
+    // A panel of the mod has the controls (Input::SetPanelHold): the game's pads stay neutral and a scripted press goes
+    // to the panel, as the player's own press does.
+    if (Input::PanelHold()) {
+        uint32_t scripted = 0;
+        for (int p = 0; p < 6; ++p) {
+            auto& q = gHwQueue[p];
+            if (q.empty()) continue;
+            scripted |= q.front().mask;
+            if (--q.front().frames == 0) q.pop_front();
+        }
+        Input::SetPanelScripted(scripted);
+        Input::HoldPadsNeutral();
+        return;
+    }
     for (int p = 0; p < 6; ++p) {  // hardware pads count engine ticks (menus run while unpaused)
         auto& q = gHwQueue[p];
         if (q.empty()) {
@@ -1751,6 +1770,9 @@ void Shutdown() {
     gStepRemaining = 0;
     gStepping = false;
     for (auto& q : gQueue) q.clear();
+    for (auto& q : gHwQueue) q.clear();
+    Refight::Shutdown();    // a panel of the mod gives the controls back
+    StageFlow::Shutdown();
     Input::ReleaseAll();
 }
 
