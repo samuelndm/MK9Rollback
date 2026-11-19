@@ -1,5 +1,5 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,stagepick,stagehold,refightvote,presslatch,codewrite,strappend,guardpage,hud,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,stagepick,stagehold,refightvote,koth,presslatch,padpreset,score,replay,codewrite,strappend,guardpage,hud,scoreview,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
 #                        [-Seconds 25] [-GameDir <the folder that holds DiscContentPC>]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
@@ -26,6 +26,11 @@
 #           from its script: an accept, a leave, a leave after an accept, a box that reads late), and 6000 exchanges of
 #           the two picks between two simulated games over links that lose, delay and reorder datagrams: a game acts on a
 #           re-fight only when both chose it.
+#   koth   src\net\KothRoom.h: King of the Hill rooms. When a game is in one (MK9's states, a match description that says so),
+#           who is in it (the session's four connection arrays through fake memory: this player's own, one in two
+#           arrays, holes, nameless ones, arrays that cannot be read), the hold of the two-player verdict, and what MK9 is
+#           shown of its connection timers there: the evening of 2026-11-14 replayed (a connection silent from 65 s into a
+#           rollback fight), a player who comes later, silences from before a fight, 4000 random rooms.
 #   presslatch  src\game\PressLatch.h: a press that falls between two samples of the controls, for a panel of the mod. A
 #           key's release held back until MK9 has sampled the key (every order of down, up, sample and posted release;
 #           3000 taps through a simulated main loop with pauses of up to 400 ms: all lost ones arrive, none twice, no
@@ -35,6 +40,22 @@
 #           and running after it, a write under a running thread refused), and 56 writes (what arming makes in one game
 #           frame) inside half a second. The program is not called "codepatch": Windows takes a 32-bit program with
 #           "patch", "setup", "install" or "update" in its name for an installer and asks for administrator rights.
+#   padpreset  src\game\PadPreset.h: the controller preset a player chose (AJUSTE DOS COMANDOS) comes back at the next
+#           game start: the file's text read and written (bad lines skipped), the restore only into a record MK9 left at
+#           its start value, a choice kept and REMOTO never, players apart, and 3000 game starts in a row with random
+#           choices between looks.
+#   score  src\net\Score.h: who won an online match, read from the fighters' lives (rounds by knock-out and by time, a
+#           hit a rollback takes back, a wait for the other game, the Health Recovery kode, a match left in the middle),
+#           the history file's lines written and read back, the panel's score line, 3000 random matches; the board (names,
+#           today's and every day's score, the wins in a row, the last matches, today's fighters).
+#   scoreview  src\debug\ScoreView.cpp: the score in a fight (each player's wins under the health bar, the run): inside the
+#           frame and clear of the HUD at every picture size, fades. Pictures in build\hosttests\scoreview\*.bmp.
+#   replay  src\net\ReplayFile.h: replays of online matches. The recorder's memory under rollbacks (40 sessions with
+#           random rollbacks: every frame ends with the inputs and checksum the session settled on), its limits, the
+#           file written and read back, every cut-off copy and every flipped bit refused, 20000 damaged copies read
+#           without leaving their bytes, the playback's frame-by-frame comparison (checksums, exact and rounded state
+#           samples); and tools\replay_from_log.ps1 run on two made-up logs (tests\host\replay_sample_*.log): the
+#           PowerShell writer's file read by the C++ reader with every value as expected.
 #   strappend  src\common\StrAppend.h: AppendF never writes past its buffer and always leaves it terminated.
 #   guardpage  src\common\GuardPage.h: a guarded read of another thread's stack guard page puts the guard back, so
 #           that thread can still grow its stack (a child process shows the crash without it).
@@ -84,11 +105,11 @@
 #           thread of its own. Every program on the PC waits with it, so it refuses to start while MKKE runs.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'presslatch', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
+      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
       [int]$Seconds = 25, [string]$GameDir = '')
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'presslatch', 'codewrite', 'strappend', 'guardpage', 'hud', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
+$known = 'hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -208,9 +229,36 @@ if ($Only -contains 'refightvote') {
     if (-not $ok) { $failed += 'refightvote' }
 }
 
+if ($Only -contains 'koth') {
+    $ok = RunSmall 'koth_test' 'King of the Hill rooms: when in one, who is in it, MK9''s connection timers there' @((Join-Path $PSScriptRoot 'koth_test.cpp')) @('-I', (Join-Path $root 'src\net')) 60
+    if (-not $ok) { $failed += 'koth' }
+}
+
 if ($Only -contains 'presslatch') {
     $ok = RunSmall 'presslatch_test' 'press latch: a press between two samples of the controls' @((Join-Path $PSScriptRoot 'presslatch_test.cpp')) @('-I', (Join-Path $root 'src\game')) 120
     if (-not $ok) { $failed += 'presslatch' }
+}
+
+if ($Only -contains 'padpreset') {
+    $ok = RunSmall 'padpreset_test' 'controller presets kept across game starts' @((Join-Path $PSScriptRoot 'padpreset_test.cpp')) @('-I', (Join-Path $root 'src\game')) 60
+    if (-not $ok) { $failed += 'padpreset' }
+}
+
+if ($Only -contains 'score') {
+    $ok = RunSmall 'score_test' 'score of online matches: rounds read from the lives, the history file''s lines' @((Join-Path $PSScriptRoot 'score_test.cpp')) @('-I', (Join-Path $root 'src\net')) 60
+    if (-not $ok) { $failed += 'score' }
+}
+
+if ($Only -contains 'replay') {
+    # The rebuild tool's file from the made-up logs first: the test reads it with the DLL's reader.
+    $sample = Join-Path $out 'replay_sample.mk9r'
+    Remove-Item $sample -ErrorAction SilentlyContinue
+    $made = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tools\replay_from_log.ps1') `
+        -FramesLog (Join-Path $PSScriptRoot 'replay_sample_frames.log') -MainLog (Join-Path $PSScriptRoot 'replay_sample_main.log') -Out $sample 2>&1
+    Write-Host "  tools\replay_from_log.ps1: $made"
+    $ok = RunSmall 'replay_test' 'replays: the recorder under rollbacks, the file, the playback''s comparison' @((Join-Path $PSScriptRoot 'replay_test.cpp')) `
+        @('-I', (Join-Path $root 'src\net')) 120 @() @($sample)
+    if (-not $ok) { $failed += 'replay' }
 }
 
 if ($Only -contains 'codewrite') {
@@ -234,6 +282,13 @@ if ($Only -contains 'hud') {
     $ok = RunSmall 'hud_test' 'HUD display: rectangles, fades, sizes' @((Join-Path $PSScriptRoot 'hud_test.cpp'),
                    (Join-Path $root 'src\debug\Hud.cpp')) @() 120 @('-lgdi32') @((Join-Path $out 'hud'))
     if (-not $ok) { $failed += 'hud' }
+}
+
+if ($Only -contains 'scoreview') {
+    # The pictures (each picture size, each canned badge) stay in build\hosttests\scoreview for a look.
+    $ok = RunSmall 'scoreview_test' 'score in a fight: wins under the health bars, runs, fades' @((Join-Path $PSScriptRoot 'scoreview_test.cpp'),
+                   (Join-Path $root 'src\debug\ScoreView.cpp'), (Join-Path $root 'src\debug\Hud.cpp')) @() 120 @('-lgdi32') @((Join-Path $out 'scoreview'))
+    if (-not $ok) { $failed += 'scoreview' }
 }
 
 if ($Only -contains 'keyedge') {

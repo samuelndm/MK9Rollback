@@ -26,7 +26,7 @@ The choices the window had until 2026-11-12 are gone from it: a fixed input dela
 ## Inside MK9's own online mode (what the window arms)
 
 The window arms `online auto ping` (`online auto <frames>` fixes the input delay instead; not offered in the window) instead of a Versus session. Then:
-- **Meeting:** the two players meet through MK9's own Online menu, in a **1 vs 1** Player Match (invite or private room). King of the Hill rooms and Ranked matches always use MK9's own netcode: in King of the Hill, spectators receive the fighters' inputs through the exchange the mod replaces.
+- **Meeting:** the two players meet through MK9's own Online menu, in a **1 vs 1** Player Match (invite or private room). A King of the Hill room takes rollback too while it holds just the two players (since 2026-11-17); with anyone else in it its matches use MK9's own netcode, because watchers receive the fighters' inputs through the exchange the mod replaces. Ranked matches always use MK9's own netcode.
 - **Handshake:** when an online fight is active and the game's own Steam P2P connection is with the opponent, each DLL sends a hello on Steam channel 79.
 - **Takeover:** once both hellos arrive, rollback starts at the first fight frame of the current fight, or of the next one if the current fight has already started.
   - The DLL takes the local side from the game's local pad list, at every fight.
@@ -173,5 +173,5 @@ If the game stutters, freezes or will not connect:
 - On a laptop: plug it in and set the Windows power mode to "Best performance".
 - Close browsers and other heavy apps (downloads, streaming, launchers).
 - Use a wired (Ethernet) connection instead of Wi-Fi.
-- Both players need the same version ("Check for updates" in the window).
+- Both players need the same version: this window installs a new one by itself when it opens.
 - In a fight, F9 switches between the HUD display and the detailed network line.

@@ -478,13 +478,22 @@ int main(int argc, char** argv) {
                 Check(n > 0 && n % 6 == 0 && n <= kCap && Dropped() == 0, "choice: a frame of whole rectangles, none dropped", text);
                 Check(Pictures(&picList, &split) == 0, "choice: no picture tiles", text);
                 Check((lookN > 0) == (form == 1) && lookN % 6 == 0, "choice: MK9's look where its art is, the plain panel where it is not", text);
+                // A card that covers the character select stands in the middle: everything of it 448 units higher
+                // than the card at the foot (StageScreen.cpp, kCoverLift), on one opaque rectangle over the whole picture.
+                const float lift = s.cover ? (float)std::lround(448.0f * fr.u) : 0.0f, slack = s.cover ? 1.0f : 0.0f;  // (rounded once here, once there)
                 bool inside = true, low = true;
                 for (int i = 0; i < n; ++i) {
                     inside = inside && gV[i].x >= -0.5f && gV[i].y >= -0.5f && gV[i].x <= (float)size[0] && gV[i].y <= (float)size[1];
-                    low = low && gV[i].y >= foot;
+                    low = low && (gV[i].y >= foot - lift - slack || (s.cover && i < 6));
                 }
                 Check(inside, "choice: every rectangle inside the picture", text);
-                if (s.phase == kCard) Check(low, "the re-fight's card stays in the lowest seventh of the frame", text);
+                if (s.phase == kCard && s.cover) {
+                    bool opaque = true;
+                    for (int i = 0; i < 6; ++i) opaque = opaque && (gV[i].color >> 24) == 0xFF;
+                    Check(opaque && gV[0].x <= 0.0f && gV[0].y <= 0.0f && gV[4].x >= (float)size[0] - 0.5f && gV[4].y >= (float)size[1] - 0.5f,
+                          "the covering card hides the whole picture behind one opaque rectangle", text);
+                    Check(low, "the covering card's lines stand in the middle of the frame, not above it", text);
+                } else if (s.phase == kCard) Check(low, "the re-fight's card stays in the lowest seventh of the frame", text);
                 else Check(gV[0].x <= 0.0f && gV[4].x >= (float)size[0] - 0.5f && gV[4].y >= (float)size[1] - 0.5f, "choice: the picture behind the panel is dimmed", text);
                 if (form) {
                     // The plain rectangles: the dimming alone (the card: the middle of its band). Every textured
@@ -492,12 +501,29 @@ int main(int argc, char** argv) {
                     // the arena pictures' quarter; a letter is drawn pixel for pixel.
                     bool placed = true, inAtlas = true, sharp = true, noPicture = true;
                     int letters = 0;
+                    // The score around the choice (State::board): the scoreboard over the panel (440 units to each side,
+                    // 20 to 240 down), the last matches at its right and today's fighters at its left (24 units from
+                    // the panel and from the frame's sides, the panel's height). Nothing of it on the panel's area.
+                    const float u = fr.u;
+                    const float sx0 = (float)(cx - std::lround(440.0f * u)), sx1 = (float)(cx + std::lround(440.0f * u));
+                    const float sy0 = (float)(fr.y + std::lround(20.0f * u)), sy1 = (float)(fr.y + std::lround(240.0f * u));
+                    const float rx0 = px1 + (float)std::lround(24.0f * u), rx1 = (float)(fr.x + fr.w - std::lround(24.0f * u));
+                    const float lx0 = (float)(fr.x + std::lround(24.0f * u)), lx1 = px0 - (float)std::lround(24.0f * u);
+                    const auto within = [](const StageSkin::Vtx& a, const StageSkin::Vtx& e, float x0, float y0, float x1, float y1, float sl) {
+                        return a.x >= x0 - sl && e.x <= x1 + sl && a.y >= y0 - sl && e.y <= y1 + sl;
+                    };
+                    const bool board = s.board.on != 0;
+                    if (board && demo == kDemos + 2) Check(sy1 <= py0 && rx0 >= px1 && lx1 <= px0, "choice look: the score's boxes stand apart from the panel", text);
+                    int onBoard = 0;
                     for (int i = 0; i + 6 <= lookN; i += 6) {
                         const StageSkin::Vtx& a = lookV[i];
                         const StageSkin::Vtx& e = lookV[i + 4];
+                        const bool onPanel = a.x >= px0 - 0.5f && e.x <= px1 && a.y >= py0 - 0.5f && e.y <= py1;
+                        const bool aside = board && (within(a, e, sx0, sy0, sx1, sy1, 1.0f) || within(a, e, rx0, py0, rx1, py1, 1.0f) || within(a, e, lx0, py0, lx1, py1, 1.0f));
+                        onBoard += !onPanel && aside;
                         placed = placed && a.x < e.x && a.y < e.y &&
-                                 (s.phase == kCard ? a.y >= foot - 0.5f && e.y <= (float)(fr.y + fr.h) && a.x >= (float)fr.x - 0.5f && e.x <= (float)(fr.x + fr.w)
-                                                   : a.x >= px0 - 0.5f && e.x <= px1 && a.y >= py0 - 0.5f && e.y <= py1);
+                                 (s.phase == kCard ? a.y >= foot - lift - 0.5f - slack && e.y <= (float)(fr.y + fr.h) - lift + slack && a.x >= (float)fr.x - 0.5f && e.x <= (float)(fr.x + fr.w)
+                                                   : onPanel || aside);
                         for (int k = 0; k < 6; ++k) inAtlas = inAtlas && lookV[i + k].u >= 0.0f && lookV[i + k].u <= 1.0f && lookV[i + k].v >= 0.0f && lookV[i + k].v <= 1.0f;
                         if (a.v >= 0.5f) {  // the lower half: lettering
                             ++letters;
@@ -508,8 +534,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     snprintf(text + strlen(text), sizeof text - strlen(text), ", %d letters", letters);
-                    Check(n == 6, "choice look: one plain rectangle (the dimming; the card: its band's middle)", text);
-                    Check(placed, s.phase == kCard ? "choice look: the card stays at the frame's foot" : "choice look: every rectangle stays on the panel", text);
+                    Check(n == 6, "choice look: one plain rectangle (the dimming; the card: its band's middle, or the cover)", text);
+                    Check(placed, s.phase == kCard ? (s.cover ? "choice look: the covering card's band stands in the frame's middle" : "choice look: the card stays at the frame's foot")
+                                                   : "choice look: every rectangle stays on the panel or in the score's boxes beside it", text);
+                    if (s.phase == kVote) Check(board == (onBoard > 0), "choice look: the score is drawn where a board is given, and only there", text);
                     Check(inAtlas && noPicture, "choice look: every rectangle is filled from the atlas, none from an arena's picture", text);
                     Check(sharp && letters > (s.phase == kCard ? 30 : 100), "choice look: every letter is drawn pixel for pixel", text);
                     if (lookN > worstLook) worstLook = lookN;
@@ -764,6 +792,38 @@ int main(int argc, char** argv) {
         long draws = 0, largest = 0, dropped = 0;
         Counters(&draws, &largest, &dropped);
         Check(draws == 2 && largest >= pub && dropped == 0, "the draws are counted");
+
+        // The cover of a re-fight (MK9's character select and versus screen are not seen): drawn in place of whatever
+        // is published for as long as it is asked for, and it ends by itself when nobody asks again.
+        State card;
+        card.phase = kCard;
+        card.cover = 1;
+        snprintf(card.name[0], sizeof card.name[0], "REMATCH");
+        snprintf(card.note, sizeof card.note, "THE SAME FIGHTERS, THE SAME ARENA");
+        Publish(card);
+        const int asCard = Build(view, true, 10, gV, kCap);
+        Publish(off);
+        Check(!CoverShown() && Build(view, true, 10, gV, kCap) == 0, "no cover asked for: none drawn");
+        Cover("REMATCH", "THE SAME FIGHTERS, THE SAME ARENA", 60000);
+        const int cov = Build(view, true, 10, gV, kCap);
+        snprintf(text, sizeof text, "cover %d vertices, the same card published %d", cov, asCard);
+        Check(CoverShown() && cov > 0 && cov == asCard, "a cover is drawn with nothing published, as the card that hides the whole picture", text);
+        bool opaque = cov >= 6;
+        for (int i = 0; i < 6 && opaque; ++i) opaque = (gV[i].color >> 24) == 0xFF;
+        Check(opaque, "its ground is opaque");
+        Publish(s);
+        Check(Build(view, true, 10, gV, kCap) == cov, "and in place of a published state");
+        Cover("REMATCH", "THE SAME FIGHTERS, THE SAME ARENA", 60000);
+        Check(Build(view, true, 10, gV, kCap) == cov, "asked for again with the same lines: the same picture");
+        CoverOff();
+        Check(!CoverShown() && Build(view, true, 10, gV, kCap) == pub, "taken back: the published state is drawn again");
+        Cover("REMATCH", "THE SAME FIGHTERS, THE SAME ARENA", 40);
+        const bool shownAtOnce = CoverShown();
+        Sleep(150);
+        Check(shownAtOnce && !CoverShown() && Build(view, true, 10, gV, kCap) == pub, "a cover nobody asks for again ends by itself");
+        CoverOff();
+        Publish(off);
+        Check(Build(view, true, 10, gV, kCap) == 0, "and nothing is left of it");
     }
 
     // The roulette: fast, then slower, and it ends on the winner on both screens (the same seed, mirrored winners).

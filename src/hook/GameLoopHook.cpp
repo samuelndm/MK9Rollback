@@ -12,8 +12,11 @@
 #include "../game/Fighter.h"
 #include "../game/Input.h"
 #include "../game/MK9Game.h"
+#include "../game/PadPreset.h"
 #include "../net/FlowTrace.h"
 #include "../net/Refight.h"
+#include "../net/ScoreKeeper.h"
+#include "../net/ReplayKeeper.h"
 #include "../net/StageFlow.h"
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
@@ -205,8 +208,14 @@ void __fastcall HkEngineTick(void* engine, void* /*edx*/, float dt) {
     InFlightGuard g;
     ++gEngineTicks;
     gLastDt = dt;
+    // The score of online matches: the fighters' lives as the last tick left them (a rollback's replay is done by now:
+    // it runs at the world tick's entry, before this), and whether that tick ran a fight update (gFightedThisTick is
+    // still the last tick's here). Before Refight::Tick, so a panel opened at the results screen shows this match too.
+    ScoreKeeper::Tick();
+    ReplayKeeper::Tick();               // a recorded session is written to replays\ once no session runs
     Refight::Tick();                    // the choice after an online match: its panel over MK9's rematch box (idle elsewhere)
     StageFlow::Tick();                  // the stage screen's panel: its controls, packets and countdown (idle unless switched on)
+    PadPreset::Tick();                  // the players' controller presets: kept when chosen, set again at the game's start
     CommandChannel::RunFrame();         // scripted input / test commands, after the sampler, before the fight update
     Rollback::RecordInputs();
     gFightedThisTick = false;

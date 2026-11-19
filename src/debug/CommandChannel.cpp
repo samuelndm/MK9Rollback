@@ -45,6 +45,8 @@
 #include "Logger.h"
 #include "../net/OnlineMode.h"
 #include "../net/Refight.h"
+#include "../net/ScoreKeeper.h"
+#include "../net/ReplayKeeper.h"
 #include "../net/StageFlow.h"
 #include "../net/SteamBridge.h"
 
@@ -233,7 +235,7 @@ const uint8_t kSetPauseOrig[6] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C};  // push 
 uint8_t* gSetPauseTramp = nullptr;
 void CallSetPause(int on) { reinterpret_cast<SetPauseFn>(gSetPauseTramp ? reinterpret_cast<uintptr_t>(gSetPauseTramp) : kSetPause)(on); }
 void __cdecl SetPauseGuard(int on) {
-    if (on && Rollback::NetplayRunning()) {
+    if (on && (Rollback::NetplayRunning() || Rollback::PlaybackRunning())) {
         static int refused = 0;
         if (refused++ < 20)
             Logger::Info("PAUSE: the game asked to pause during the netplay session (call from %08X); refused, the session goes on",
@@ -277,6 +279,8 @@ void Execute(const std::string& line) {
     // The stage screen's commands (stagescreen, stageoverride, stagetrigger, stagedemo, stagestatus): StageFlow.cpp in src/net.
     if (Refight::Command(line.c_str())) return;
     if (StageFlow::Command(line.c_str())) return;
+    if (ScoreKeeper::Command(line.c_str())) return;  // score [status] | score 0|1 | score test 0|1 (src\net\ScoreKeeper.h)
+    if (ReplayKeeper::Command(line.c_str())) return;  // replay last|<file>|stop|status|list|record 0|1|like 0|1 (src\net\ReplayKeeper.h)
     if (!strcmp(verb, "hwhold") && sscanf(line.c_str(), "hwhold %d %x %d", &player, &mask, &frames) == 3 && player >= 0 &&
         player < 6 && frames > 0) {
         gHwQueue[player].push_back({mask, (uint32_t)frames});
@@ -524,6 +528,7 @@ void Execute(const std::string& line) {
             Rollback::GgpoSteamCommand(peer, player, delay, false);
         else if (unsigned long long peer = 0; sscanf(line.c_str(), "ggpo steamnetplay %llu %d %d", &peer, &player, &delay) >= 2)
             Rollback::GgpoSteamCommand(peer, player, delay, true);
+        else if (line == "ggpo disarm") Rollback::NetplayDisarm();  // a test's 'ggpo netplay' stays armed after its session (the online mode disarms its own)
         else Rollback::GgpoCommand(0);
     } else if (!strcmp(verb, "steamid")) {
         Logger::Info("STEAM: interfaces %s, this account's SteamID64 = %llu", SteamBridge::Available() ? "available" : "unavailable",
@@ -1358,6 +1363,10 @@ void Execute(const std::string& line) {
         SoundDedupe::SetNearFrames(value);
     } else if (!strcmp(verb, "replayskip") && sscanf(line.c_str(), "replayskip %d", &value) == 1) {
         RenderTag::SetReplaySkip(value != 0);
+    } else if (!strcmp(verb, "lateskip") && sscanf(line.c_str(), "lateskip %d", &value) == 1) {
+        RenderTag::SetLateSkip(value != 0);
+    } else if (!strcmp(verb, "drawstat") && sscanf(line.c_str(), "drawstat %d", &value) == 1) {
+        FramePace::SetDrawStat(value != 0);
     } else if (!strcmp(verb, "fastreadable") && sscanf(line.c_str(), "fastreadable %d", &value) == 1) {
         Rollback::SetFastReadable(value != 0);
     } else if (!strcmp(verb, "renderlate") && sscanf(line.c_str(), "renderlate %d", &value) == 1) {
@@ -1652,7 +1661,7 @@ void RunFrame() {
     // While paused no fight frame runs, so scripted steps must not be consumed
     // (the current mask is still applied to keep the pad stable).
     const bool paused = *reinterpret_cast<const uint32_t*>(kPauseFlag) != 0;
-    const bool ggpo = Rollback::GgpoActive();
+    const bool ggpo = Rollback::GgpoActive() || Rollback::PlaybackRunning();  // a replay's playback drives the fighter pads as a session does
     // 'hold' masks may name directions relative to the opponent (combo scripts, tools\combo_inputs.ps1): 0x10000 forward,
     // 0x20000 back, resolved here on the live frame from the fighters' horizontal coordinate (pos[1]; 4 = left = towards
     // smaller values, 8 = right, xray_probe 2026-11-02). Only the resolved mask reaches the game, GGPO and the replays.

@@ -16,6 +16,7 @@
 #include "Hud.h"
 #include "KeyEdge.h"
 #include "Logger.h"
+#include "ScoreView.h"
 #include "StageScreen.h"
 #include "SysWatch.h"
 
@@ -106,6 +107,10 @@ int gN = 0;
 // frame in tests/host/stagescreen_test.cpp (48 cells of the longest name, 1440 lines) is two thirds of it.
 constexpr int kStageMaxV = 360000, kStageChunkV = 60000;
 Vtx gSV[kStageMaxV];
+// The score in a fight (ScoreView.h): the two players' wins under the health bars. The widest badge of
+// tests\host\scoreview_test.cpp (four digits on each side and a run, 1440 lines) is about 40% of it.
+constexpr int kBadgeMaxV = 96000;
+Vtx gBV[kBadgeMaxV];
 
 // ---- the stage screen's arena pictures and MK9 look (ArenaPics.h, StageSkin.h) ----
 // The one thing this display keeps on the device: a texture of 2048 x 1024 (ArenaPics' atlas: the arena pictures, the
@@ -638,7 +643,9 @@ void Draw(IDirect3DDevice9* dev) {
             }
         }
     }
-    if (gN < 3 && sN < 3) return;  // nothing on screen this frame: the device is not touched
+    // The score in a fight, whatever the status display's level is (like the panel), and never under a panel.
+    const int bN = sN < 3 ? ScoreView::Build(view, faces, GetTickCount64(), gBV, kBadgeMaxV) : 0;
+    if (gN < 3 && sN < 3 && bN < 3) return;  // nothing on screen this frame: the device is not touched
     QueryPerformanceCounter(&tBuilt);
     IDirect3DStateBlock9* sb = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) || !sb) return;
@@ -670,6 +677,7 @@ void Draw(IDirect3DDevice9* dev) {
     dev->SetPixelShader(nullptr);
     dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
     if (gN >= 3) dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, gN / 3, gV, sizeof(Vtx));
+    if (bN >= 3) dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, bN / 3, gBV, sizeof(Vtx));
     // The panel over the status display, in calls of at most 20000 triangles (far below any device's limit per call):
     // what lies under the pictures, the pictures, what lies over them.
     const auto panel = [&](int from, int to) {

@@ -253,9 +253,9 @@ bool BuildFace(Face& f, HDC dc, int px, int zoom) {
     return AddWifi(f);
 }
 
-Face gMain, gSmall;
+Face gMain, gSmall, gBig;  // gBig: the score's numbers (ScoreView.h, StageScreen.h); the main face stands in where it was not built
 int gBuiltW = 0, gBuiltH = 0, gBuilds = 0;
-bool gBuilt = false, gFacesOk = false;
+bool gBuilt = false, gFacesOk = false, gBigOk = false;
 uint64_t gBuiltAtMs = 0;
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -534,6 +534,7 @@ void Compose(const Stats& s, uint64_t now, Wanted& w) {
 //   a round-win mark (a skull) sits at 67..90 beside the middle, 105..134 down; the health bars end at 95;
 //   a portrait reaches 190 in from the frame's side, the fighter's name starts at 219.
 constexpr float kMainEm = 30.0f, kSmallEm = 21.0f;   // the two faces' em heights
+constexpr float kBigEm = 58.0f;                      // the score's numbers (kBigFace)
 constexpr float kGroupBase = 162.0f;                 // baseline of the group under the round timer: under the round-win marks
 constexpr float kSpikeGap = 10.0f;                   // the group's two halves keep this far from the middle: the spike's room
 constexpr float kWifiX = 214.0f, kWifiBase = 130.0f; // the Wi-Fi mark at a player's side: under the bar, beside the portrait
@@ -678,16 +679,19 @@ bool Prepare(const View& v, bool* wait) {
     gBuilt = true;
     gBuiltW = v.w;
     gBuiltH = v.h;
-    gFacesOk = false;
+    gFacesOk = gBigOk = false;
     if (v.w < 320 || v.h < 200) return false;
     const Frame fr = FrameOf(v);
     const int zoom = fr.h > 2880 ? 3 : fr.h > 1440 ? 2 : 1;
     // Not below 16 and 12 pixels: a 540-line window (the test harness) keeps readable labels.
     const int mainPx = std::max(16, (int)std::lround(kMainEm * fr.u / zoom));
     const int smallPx = std::max(12, (int)std::lround(kSmallEm * fr.u / zoom));
+    const int bigPx = std::max(28, (int)std::lround(kBigEm * fr.u / zoom));
     HDC dc = CreateCompatibleDC(nullptr);
     if (!dc) return false;
     gFacesOk = BuildFace(gMain, dc, mainPx, zoom) && BuildFace(gSmall, dc, smallPx, zoom);
+    // The big face is a nicety: without it the score's numbers are written in the main face.
+    gBigOk = gFacesOk && BuildFace(gBig, dc, bigPx, zoom);
     DeleteDC(dc);
     return gFacesOk;
 }
@@ -729,8 +733,9 @@ int Builds() { return gBuilds; }
 void Describe(char* out, int n) {
     char face[LF_FACESIZE * 3] = "";
     WideCharToMultiByte(CP_UTF8, 0, gFaceName, -1, face, sizeof face, nullptr, nullptr);
-    snprintf(out, n, "%s for %dx%d: face \"%s\", %d and %d px (x%d), %d and %d rectangles", gFacesOk ? "built" : "NOT built", gBuiltW,
-             gBuiltH, face, gMain.px, gSmall.px, gMain.zoom, gMain.n, gSmall.n);
+    snprintf(out, n, "%s for %dx%d: face \"%s\", %d and %d px (x%d), %d and %d rectangles; score numbers %s %d px, %d rectangles",
+             gFacesOk ? "built" : "NOT built", gBuiltW, gBuiltH, face, gMain.px, gSmall.px, gMain.zoom, gMain.n, gSmall.n,
+             gBigOk ? "built," : "NOT built (main face),", gBig.px, gBig.n);
 }
 
 bool Demo(int n, Stats* s) {
@@ -800,10 +805,12 @@ Frame FrameOf(const View& v) {
     return f;
 }
 bool FacesFor(const View& v) { return gFacesOk && v.w == gBuiltW && v.h == gBuiltH; }
+bool BigFace() { return gBigOk; }
 void Rect(Canvas& c, int x0, int y0, int x1, int y1, uint32_t argb) { Quad(c, x0, y0, x1, y1, argb); }
-int Width(FaceId f, const char* s) { return TextW(f == kSmallFace ? gSmall : gMain, s); }
+static const Face& FaceOf(FaceId f) { return f == kSmallFace ? gSmall : f == kBigFace && gBigOk ? gBig : gMain; }
+int Width(FaceId f, const char* s) { return TextW(FaceOf(f), s); }
 int Write(Canvas& c, FaceId f, const char* s, int x, int y, uint32_t rgb, int alpha, bool edge) {
-    const Face& face = f == kSmallFace ? gSmall : gMain;
+    const Face& face = FaceOf(f);
     if (edge) return Text(c, face, s, x, y, rgb, alpha);
     int pen = x;
     for (const char* p = s; *p; ++p)
@@ -813,16 +820,16 @@ int Write(Canvas& c, FaceId f, const char* s, int x, int y, uint32_t rgb, int al
         }
     return pen - x;
 }
-int EmOf(FaceId f) { return (f == kSmallFace ? gSmall : gMain).Em(); }
-int CapOf(FaceId f) { return (f == kSmallFace ? gSmall : gMain).Cap(); }
-int ReachOf(FaceId f) { return (f == kSmallFace ? gSmall : gMain).Reach(); }
+int EmOf(FaceId f) { return FaceOf(f).Em(); }
+int CapOf(FaceId f) { return FaceOf(f).Cap(); }
+int ReachOf(FaceId f) { return FaceOf(f).Reach(); }
 
 void Reset() {
     gShown = Shown{};
     gInfoText[0] = 0;
     gInfoSince = gStoppedAt = 0;
     gStoppedSeen = false;
-    gBuilt = gFacesOk = false;
+    gBuilt = gFacesOk = gBigOk = false;
     gBuiltW = gBuiltH = 0;
     gBuiltAtMs = 0;
 }

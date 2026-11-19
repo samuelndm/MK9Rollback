@@ -298,6 +298,294 @@ bool WriteStage(uint32_t index) {
     return true;
 }
 
+// ---- the fighters of a re-fight ----
+// SetSelectedPlayers 0x008142E0 (cdecl, two names; read in the game's code on 2026-11-14): it prints
+// "SetSelectedPlayers(pchr1:%s, pchr2:%s)", clears both players' second fighter and copies each name into its player's
+// record through 0x008141A0 (player, slot, name). The record of player p is 0x00E89D7C + p * 0xC8C, and the name of its
+// fighter in slot s lies at +0x964 + s * 0xEC (64 bytes). It is called from three places: 0x008143E4 (in 0x008143D0,
+// script native 672: the arena and both fighters, run by the select screen's script when both players are done),
+// 0x008BB520 (script native 670) and 0x0081564B (the attract demos: left alone). The game's settings message carries
+// no fighter: each game sets its own from what its select screen holds, so two games that are given the same pair here
+// load the same fight.
+// The fighter's colours are not in its name. The character select's START on a fighter picks its other colours (a
+// costume's second palette: Johnny Cage's black suit against the blue one), and the select screen's script writes that
+// choice into each player's record itself: PlayerSelect.mko, PSelectSetSettings (read 2026-11-16), for player p the
+// value at the script's selection + 120 is stored at the record (script native 17544:25 (p)) + 2404 + 128, that is
+// +0x964 + 0x80 = +0x9E4 (+0xEC further for a tag partner), after FixupAltPaletteSelections and before natives 670 /
+// 672 set the names. A re-fight's hidden select is confirmed without START, so it wrote 0 there: in the two-PC log of
+// 2026-11-16 21:37 and 21:42 "P1+9E4 00000001>00000000" and the same for P2 at each re-fight's start, the fighters'
+// names the same. The game reads the flag after the select (nothing of the mod's earlier work kept it), so a re-fight
+// gives the game the last fight's two flags back together with its names; where the pair does not stand, the select
+// screen's own flags go back with its names.
+namespace {
+constexpr uintptr_t kSetPlayers = 0x008142E0, kSetPlayersBy672 = 0x008143E4, kSetPlayersBy670 = 0x008BB520;
+constexpr uintptr_t kFighterName = 0x964;  // in a player's record: its first fighter's name
+constexpr uintptr_t kFighterColours = 0x964 + 0x80;  // ... and its colours: 0 its first palette, 1 the other (START)
+constexpr size_t kFighterLen = 64;
+bool gPlayersArmed = false, gPlayersWritten = false, gPlayersKept = false;
+char gWantA[kFighterLen] = "", gWantB[kFighterLen] = "", gHadA[kFighterLen] = "", gHadB[kFighterLen] = "";
+uint32_t gWantColours[2] = {}, gHadColours[2] = {};
+bool gWantColoursOk = false, gHadColoursOk = false;
+uint32_t gPlayerCalls = 0;
+
+bool ReadableName(const char* s) { return s && !IsBadStringPtrA(s, kFighterLen) && s[0] && strnlen(s, kFighterLen) < kFighterLen; }
+uint32_t RealSetPlayers(const char* p1, const char* p2) {
+    return reinterpret_cast<uint32_t(__cdecl*)(const char*, const char*)>(kSetPlayers)(p1, p2);
+}
+volatile uint32_t* ColoursAt(int player) {
+    const uintptr_t at = kPlayerInfo + (uintptr_t)player * kPlayerInfoStride + kFighterColours;
+    return IsBadWritePtr(reinterpret_cast<void*>(at), 4) ? nullptr : reinterpret_cast<volatile uint32_t*>(at);
+}
+bool WriteColours(const uint32_t v[2]) {
+    volatile uint32_t *a = ColoursAt(0), *b = ColoursAt(1);
+    if (!a || !b) return false;
+    *a = v[0];
+    *b = v[1];
+    return true;
+}
+}  // namespace
+bool FightColours(uint32_t out[2]) {
+    volatile uint32_t *a = ColoursAt(0), *b = ColoursAt(1);
+    if (!out || !a || !b) return false;
+    out[0] = *a;
+    out[1] = *b;
+    return true;
+}
+// Called in place of SetSelectedPlayers by the two script natives. Not armed: straight on to the game's function.
+// Armed: the game's function runs first with the script's own names, exactly as in a game that is not armed (0x008141A0
+// draws a fighter itself for the name at 0x00D5DFEC, so that draw is made at the same moment on both PCs whichever of
+// them is armed), the two names it left in the records are kept, and then it runs again with the armed pair: every
+// field the first call wrote is written again by the second.
+extern "C" uint32_t __cdecl MK9R_HkSetPlayers(const char* p1, const char* p2) {
+    ++gPlayerCalls;
+    const uint32_t r = RealSetPlayers(p1, p2);
+    char a[kFighterLen] = "", b[kFighterLen] = "";
+    if (!gPlayersArmed || !ScriptRng::FightPlayers(a, b, sizeof a)) return r;  // (a script that names no fighter is left alone)
+    memcpy(gHadA, a, sizeof gHadA);
+    memcpy(gHadB, b, sizeof gHadB);
+    gHadColoursOk = FightColours(gHadColours);  // (the script wrote them just before it set the names)
+    gPlayersWritten = true;  // (a pair that was kept stays kept: a later call of the script gets the same pair)
+    RealSetPlayers(gWantA, gWantB);
+    const bool coloured = gWantColoursOk && WriteColours(gWantColours);
+    char had[24] = "not read", given[40] = "not known: left as the script set them";
+    if (gHadColoursOk) snprintf(had, sizeof had, "%u and %u", gHadColours[0], gHadColours[1]);
+    if (coloured) snprintf(given, sizeof given, "%u and %u", gWantColours[0], gWantColours[1]);
+    Logger::Info("REFIGHT fighters: the script set %.60s and %.60s (call %u, named %.40s and %.40s; colours %s); the game is given the "
+                 "re-fight's %.60s and %.60s (colours %s)",
+                 gHadA, gHadB, gPlayerCalls, ReadableName(p1) ? p1 : "?", ReadableName(p2) ? p2 : "?", had, gWantA, gWantB, given);
+    return r;
+}
+
+// ---- the pictures of a re-fight's versus / loading screen ----
+// Read in the game's scripts and code on 2026-11-16. MK9's versus / loading screen has no fighter pictures of its own.
+// When a character select ends, the last thing its script does before it asks for the fight (PlayerSelect.mko,
+// SaveLoadingScreenRenders; the Ladder does the same on its tower screen, fg_utils.mko p_setup_versus_screen_images) is
+// to ask the select screen's two body pictures for a copy each, named "BodyRenderBackLeft" and "BodyRenderBackRight":
+// script native 4039 (0x008E00C0) calls 0x004D5EC0 (thiscall on the picture's image object, the name), which copies the
+// image's texture into the engine's transient package through 0x006A07A0 (thiscall on the texture, the name). The script
+// keeps each copy in its player's record (+0x964 + 0xA0, held against the engine's clean-up), and the loading screen's
+// script (fg_utils.mko, LoadVersusImages) shows the two copies by those names. So that screen shows what the select
+// screen showed, whatever fighters the game was given afterwards: Scorpion and Quan Chi before a fight of Sektor against
+// Johnny Cage in the one game it was looked at (2026-11-16), and Scorpion and Sub-Zero in a re-fight, whose hidden
+// select screen is confirmed where its cursors start.
+// For a re-fight whose pair stands (the stage screen's exchange has settled it by then: the script sets the fighters,
+// sends its settings and waits before it comes to the copies), each copy is made of the body picture of the re-fight's
+// fighter instead. The picture's name is the game's own: 0x00814530 (cdecl: side, the fighter's name, out, size), the
+// routine behind script native 1414 with which the Ladder names its opponents' pictures ("ui_ps_vs_jpegs.BD_<fighter>
+// .jpeg", "_f" before the ending for a fighter with a picture of its own on the right, a fighter's own package for an
+// added one; it cuts a costume's ending off the name it is given, in place). The picture is looked up among the loaded
+// ones as the game's image code looks it up (0x0060D080, cdecl: the class at [0x00E590C0], 0, the name without its
+// ending, 0, 0, 1; it loads nothing and answers null for a picture that is not in memory). Not found, or no copy: the
+// select screen's own picture is copied, as without the mod, and MatchPictures says so (the mod's cover then stays over
+// the versus / loading screen).
+namespace {
+constexpr uintptr_t kSaveRenderBy4039 = 0x008E00EA, kSaveRender = 0x004D5EC0, kCopyPicture = 0x006A07A0;
+constexpr uintptr_t kPictureName = 0x00814530, kFindLoaded = 0x0060D080, kPictureClass = 0x00E590C0;
+// 'refightpics 0|1'; 1 at the start since one offline game showed it (2026-11-16, the Ladder: two re-fights with the
+// right pictures, added fighters among them, and a fight with no re-fight left as it is). No online match yet.
+bool gPicsOn = true;
+uint32_t gPicsGiven = 0, gPicCalls = 0;  // gPicsGiven: bit 0 the left picture, bit 1 the right, since the pair was armed
+
+// The loaded body picture of `fighter` as the select screen shows it on `side` (0 left, 1 right); null: not in memory.
+// `shown` gets the picture's name, for the log.
+void* LoadedBodyPicture(int side, const char* fighter, char* shown, size_t cap) {
+    char name[kFighterLen], pic[128] = "";
+    snprintf(name, sizeof name, "%s", fighter);
+    if (strlen(name) <= 5) return nullptr;  // ("CHAR_" and a name: the routine reads it from the sixth letter on)
+    reinterpret_cast<void(__cdecl*)(uint32_t, char*, char*, uint32_t)>(kPictureName)((uint32_t)side, name, pic, 64);
+    pic[sizeof pic - 1] = 0;
+    snprintf(shown, cap, "%s", pic);
+    char* dot = strrchr(pic, '.');
+    void* cls = *reinterpret_cast<void**>(kPictureClass);
+    if (!dot || dot == pic || !cls) return nullptr;
+    *dot = 0;                               // (0x00600130 in the game's image code: a picture is looked up without its ending)
+    if (!strchr(pic, '.')) return nullptr;  // (a package and a name, as every name of the routine is)
+    return reinterpret_cast<void*(__cdecl*)(void*, void*, const char*, const char*, uint32_t, uint32_t)>(kFindLoaded)(cls, nullptr, pic, nullptr, 0, 1);
+}
+}  // namespace
+// Called in place of 0x004D5EC0 by script native 4039: the copy of a picture that a script keeps under a name.
+extern "C" void* __fastcall MK9R_HkSaveRender(void* image, void* /*edx*/, const char* name) {
+    using CopyFn = void*(__thiscall*)(void*, const char*);
+    ++gPicCalls;
+    int side = -1;
+    if (gPicsOn && gPlayersArmed && gPlayersKept && ReadableName(name))
+        side = !_stricmp(name, "BodyRenderBackLeft") ? 0 : !_stricmp(name, "BodyRenderBackRight") ? 1 : -1;
+    if (side >= 0) {
+        const char* fighter = side ? gWantB : gWantA;
+        char pic[96] = "";
+        void* picture = LoadedBodyPicture(side, fighter, pic, sizeof pic);
+        void* copy = picture ? reinterpret_cast<CopyFn>(kCopyPicture)(picture, name) : nullptr;
+        if (copy) {
+            gPicsGiven |= 1u << side;
+            Logger::Info("REFIGHT pictures: MK9's script keeps the select screen's %s body picture for its versus / loading screen (%s); the copy "
+                         "is made of %.90s instead, the picture of the re-fight's %.60s",
+                         side ? "right" : "left", name, pic, fighter);
+            return copy;
+        }
+        Logger::Info("REFIGHT pictures: the picture of the re-fight's %.60s (%.90s) is %s; the select screen's own %s picture is kept for the "
+                     "versus / loading screen (%s), as without the mod",
+                     fighter, pic[0] ? pic : "no name", picture ? "loaded, but no copy of it was made" : "not among the loaded ones",
+                     side ? "right" : "left", name);
+    }
+    return reinterpret_cast<CopyFn>(kSaveRender)(image, name);
+}
+namespace {
+// The call of script native 672 is the one a re-fight needs; 670's is taken along where it is found, and so is the
+// picture copy's (without it a re-fight's versus / loading screen keeps the select screen's pictures).
+bool InstallPlayerSites() {
+    static int state = 0;  // 1 in, -1 refused
+    if (state) return state > 0;
+    const auto patch = [](uintptr_t site, uintptr_t was, uintptr_t now, const char* name) {
+        uint8_t orig[5] = {0xE8}, call[5] = {0xE8};
+        const int32_t ro = (int32_t)(was - (site + 5));
+        const int32_t rn = (int32_t)(now - (site + 5));
+        memcpy(orig + 1, &ro, 4);
+        memcpy(call + 1, &rn, 4);
+        return CodePatch::Write(site, orig, call, 5, name);
+    };
+    const uintptr_t players = reinterpret_cast<uintptr_t>(&MK9R_HkSetPlayers);
+    state = patch(kSetPlayersBy672, kSetPlayers, players, "SetSelectedPlayers call of script native 672 (re-fight)") ? 1 : -1;
+    if (state > 0) {
+        patch(kSetPlayersBy670, kSetPlayers, players, "SetSelectedPlayers call of script native 670 (re-fight)");
+        patch(kSaveRenderBy4039, kSaveRender, reinterpret_cast<uintptr_t>(&MK9R_HkSaveRender),
+              "picture copy of script native 4039 (re-fight's versus / loading screen)");
+    }
+    return state > 0;
+}
+}  // namespace
+
+bool FightPlayers(char* p1, char* p2, size_t cap) {
+    const char* a = reinterpret_cast<const char*>(kPlayerInfo + kFighterName);
+    const char* b = reinterpret_cast<const char*>(kPlayerInfo + kPlayerInfoStride + kFighterName);
+    if (!p1 || !p2 || cap < kFighterLen || IsBadReadPtr(a, kFighterLen) || IsBadReadPtr(b, kFighterLen)) return false;
+    memcpy(p1, a, kFighterLen - 1);
+    memcpy(p2, b, kFighterLen - 1);
+    p1[kFighterLen - 1] = p2[kFighterLen - 1] = 0;
+    return p1[0] && p2[0];
+}
+
+bool SetMatchPlayers(const char* p1, const char* p2, const uint32_t* colours) {
+    if (!p1 || !p2) {
+        gPlayersArmed = false;
+        gPicsGiven = 0;
+        return true;
+    }
+    if (!p1[0] || !p2[0] || strlen(p1) >= kFighterLen || strlen(p2) >= kFighterLen || !InstallPlayerSites()) return false;
+    snprintf(gWantA, sizeof gWantA, "%s", p1);
+    snprintf(gWantB, sizeof gWantB, "%s", p2);
+    gWantColoursOk = colours != nullptr;
+    gWantColours[0] = colours ? colours[0] : 0;
+    gWantColours[1] = colours ? colours[1] : 0;
+    gHadColoursOk = false;
+    gPlayersArmed = true;
+    gPlayersWritten = gPlayersKept = false;
+    gPicsGiven = 0;
+    return true;
+}
+uint32_t MatchPictures() { return gPlayersArmed && gPlayersKept ? gPicsGiven : 0; }
+void SetMatchPictures(bool on) { gPicsOn = on; }
+bool MatchPicturesOn() { return gPicsOn; }
+uint32_t PictureCalls() { return gPicCalls; }
+bool MatchPlayersWritten() { return gPlayersArmed && gPlayersWritten; }
+void KeepMatchPlayers() {
+    if (gPlayersArmed && gPlayersWritten) gPlayersKept = true;
+}
+void KeepMatchPlayersForTest() {
+    if (gPlayersArmed) gPlayersKept = true;
+}
+bool UndoMatchPlayers(const char* why) {
+    if (gPlayersKept) return false;
+    const bool armed = gPlayersArmed, written = gPlayersWritten;
+    gPlayersArmed = gPlayersWritten = false;
+    if (!written) {
+        if (armed) Logger::Info("REFIGHT fighters: the re-fight's pair is not used (%s); the game had not been given it", why ? why : "?");
+        return false;
+    }
+    RealSetPlayers(gHadA, gHadB);
+    const bool coloured = gHadColoursOk && WriteColours(gHadColours);
+    Logger::Info("REFIGHT fighters: the re-fight's pair does not stand (%s): the game is given back %.60s and %.60s, the names its select "
+                 "screen had set%s",
+                 why ? why : "?", gHadA, gHadB, coloured ? ", and its colours" : "");
+    return true;
+}
+uint32_t PlayerCalls() { return gPlayerCalls; }
+
+// ---- a re-fight without the character select (a test, 2026-11-15) ----
+// MK9's scripts change screens through script native 171 (0x008B7C00), which calls 0x00495A10 (cdecl: module, function)
+// at 0x008B7C10. That routine only notes the request (two names at 0x00E3B8A8 / 0x00E3B8B0, a flag at 0x00E3B85C); the
+// engine ends the running scripts and starts the named function in its own tick (0x0080F673). Read in the game's
+// scripts: the online rematch screen (MKOnlineEngine_RematchScreen) ends with ("PlayerSelect.mko", "PlayerSelect"); the
+// character select starts a fight with ("versus.mko", "versus_mode"); and MK9's own offline rematch (versus.mko,
+// p_versus_loop) asks for ("versus.mko", "versus_mode") at once, with the fighters and the arena the game holds and no
+// character select. Armed, a script's next request for the character select is turned into the armed one.
+namespace {
+constexpr uintptr_t kModeJumpBy171 = 0x008B7C10;
+bool gJumpArmed = false, gJumpTaken = false;
+char gJumpModule[48] = "", gJumpFunction[64] = "";
+uint32_t gJumpCalls = 0;
+}  // namespace
+extern "C" void __cdecl MK9R_HkModeJump(const char* module, const char* function) {
+    ++gJumpCalls;
+    const bool readable = ReadableName(module) && ReadableName(function);
+    if (gJumpArmed && readable && !_stricmp(module, "PlayerSelect.mko") && !_stricmp(function, "PlayerSelect")) {
+        gJumpArmed = false;
+        gJumpTaken = true;
+        Logger::Info("REFIGHT jump: a script asks for the character select (%s / %s, request %u); the game is asked for %s / %s instead", module,
+                     function, gJumpCalls, gJumpModule, gJumpFunction);
+        module = gJumpModule;
+        function = gJumpFunction;
+    } else {
+        Logger::Info("REFIGHT jump: a script asks for %.47s / %.63s (request %u%s)", readable ? module : "?", readable ? function : "?", gJumpCalls,
+                     gJumpArmed ? "; the armed one waits for a request for the character select" : "");
+    }
+    reinterpret_cast<void(__cdecl*)(const char*, const char*)>(kRunScript)(module, function);
+}
+bool SetModeJump(const char* module, const char* function) {
+    if (!module || !function) {
+        gJumpArmed = false;
+        return true;
+    }
+    static int state = 0;  // 1 in, -1 refused
+    if (!state) {
+        uint8_t orig[5] = {0xE8}, call[5] = {0xE8};
+        const int32_t ro = (int32_t)(kRunScript - (kModeJumpBy171 + 5));
+        const int32_t rn = (int32_t)(reinterpret_cast<uintptr_t>(&MK9R_HkModeJump) - (kModeJumpBy171 + 5));
+        memcpy(orig + 1, &ro, 4);
+        memcpy(call + 1, &rn, 4);
+        state = CodePatch::Write(kModeJumpBy171, orig, call, 5, "script native 171's request for a script mode (re-fight)") ? 1 : -1;
+    }
+    if (state < 0 || !module[0] || !function[0] || strlen(module) >= sizeof gJumpModule || strlen(function) >= sizeof gJumpFunction) return false;
+    snprintf(gJumpModule, sizeof gJumpModule, "%s", module);
+    snprintf(gJumpFunction, sizeof gJumpFunction, "%s", function);
+    gJumpArmed = true;
+    gJumpTaken = false;
+    return true;
+}
+bool ModeJumpTaken() { return gJumpTaken; }
+uint32_t PlayerRecordValue(int player) {
+    return player == 0 || player == 1 ? *reinterpret_cast<const uint32_t*>(kPlayerInfo + (uintptr_t)player * kPlayerInfoStride + 0xB40) : 0;
+}
+
 void ForceStage(int index) {
     const char* name = index >= 0 ? StageName((uint32_t)index, nullptr) : nullptr;
     if (index >= 0 && !name) {

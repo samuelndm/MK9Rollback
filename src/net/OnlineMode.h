@@ -41,6 +41,11 @@
 // the larger of both games' current proposals.
 // A session ends at MK9's results screen (game state 9): the results and rematch screens run on MK9's own netcode, and
 // the rematch's fight engages again.
+//
+// King of the Hill rooms (KothRoom.h): rollback while the room holds just the two players, MK9's netcode for a match
+// with anyone else in it. Between the room's matches the hellos keep going and the match is not reset (the room has no
+// rematch screen), and MK9's connection timers are kept per connection: one the rollback fights starved stays hidden
+// while the opponent's game is heard from; every other one is MK9's own.
 namespace Online {
 
 constexpr uint64_t kAutoPeer = 1;  // not a valid SteamID64
@@ -52,6 +57,7 @@ void Command(uint64_t peer, int delay, bool pingDelay);
 void Tick();                             // every engine tick (handshake, arming, diagnostics)
 bool SkipNative();                       // the native exchange is replaced right now
 int LocalPlayer();                       // 1 or 2: which fighter this game controls in the online fight (0 = unknown)
+uint64_t Opponent();                     // the current opponent's SteamID64 (named, or found in this match's connection); 0 unknown
 bool Engaged();                          // armed through the online mode for the current fight
 void OnSessionStop(const char* why);     // a P2P session ended: idle-timer grace period; a timeline restart re-arms
 // A session frame is about to start, live or replayed, with the game's state as that frame finds it (RollbackManager's
@@ -82,9 +88,13 @@ bool LinkRelayed();                      // Steam's P2P connection with the oppo
 // no online fight data was seen.
 uintptr_t ConnectionAddress(uint32_t* size);
 // The game is online in a match this mode would engage in: a one-on-one Player / Private / invited room (the
-// GameContext check of the engagement: type 0, 2 or 3 and match type 0). False offline, in ranked and in King of the
-// Hill. Reads only, any thread; for the trace lines of FlowTrace.
+// GameContext check of the engagement: type 0, 2 or 3 and match type 0), or a King of the Hill room while it holds just
+// the two players (KothRoom.h; read every 100 ms by Tick). False offline, in ranked, and in a King of the Hill room
+// with anyone else in it (its watchers receive the fight through MK9's exchange). The stage screen, the choice after a
+// match, the score and the trace lines ask it. Reads only, any thread.
 bool OneOnOne();
+// In a King of the Hill room (MK9's King of the Hill state seen since its menus). Any thread.
+bool KingOfTheHill();
 // A datagram of the mod's own to the current opponent, on the hellos' channel (the stage screen's picks; a release
 // that does not know it drops it as "not a hello"). False: no opponent is known right now, nothing sent. Game thread.
 bool SendToPeer(const void* data, uint32_t size);

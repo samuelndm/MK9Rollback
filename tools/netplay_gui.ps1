@@ -10,10 +10,16 @@
 # The log-line table, the injector's exit codes, the log reader, the log privacy filter, the mark and the other pure
 # helpers are in tools\launcher_lib.ps1 (checked by tools\launcher_selftest.ps1). The update check, the download and
 # saving the logs run in background runspaces, polled by a timer, so the window never freezes on the network.
-#   -NoUpdateCheck         no update check when the window opens
+# Updates are not a choice either (2026-11-16, the player: "make the mod launcher auto update and don't let the user
+# launch the game if there is an update"): a newer release is installed without a question and the window restarts
+# on it; Play waits for the check and is refused until the update is in (see "updates" below).
+# The texts are in the player's language (tools\launcher_text.ps1: English and Portuguese (Brazil); Windows' display
+# language, or the "Language" link at the bottom). They are written here in English, as the argument of Tr.
+#   -NoUpdateCheck         no update check at all (tests): Play is never held for one
 #   -SnapshotPng <file>    saves a picture of the window, then closes it (layout check). The window is then shown
 #                          off the screen and without taking the keyboard, and does not count as the open window.
-#   -SnapshotState <name>  with -SnapshotPng: what the picture shows (idle, starting, running, update, failed)
+#   -SnapshotState <name>  with -SnapshotPng: what the picture shows (idle, checking, starting, running, update,
+#                          updatewait, updatefailed, failed)
 #   -StartCheck            exits at once with code 0 (the "Play Online.bat" of the versions before 2026-11 runs this
 #                          first, in its console, to learn whether this PC runs the script at all)
 param([switch]$NoUpdateCheck, [string]$SnapshotPng = '', [switch]$StartCheck, [string]$SnapshotState = 'idle')
@@ -29,21 +35,29 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     Start-Process notepad.exe -ArgumentList "`"$errFile`""
     exit 1
 }
-# Any error that stops this script: written to %TEMP%\MK9Rollback-launcher-error.txt and shown.
+# Any error that stops this script: written to %TEMP%\MK9Rollback-launcher-error.txt (in English, for the bug report)
+# and shown in the player's language.
 trap {
     $errFile = Join-Path $env:TEMP 'MK9Rollback-launcher-error.txt'
-    $msg = "The MK9 Rollback window stopped because of an error:`r`n`r`n$($_.Exception.Message)`r`n$($_.InvocationInfo.PositionMessage)"
-    try { Set-Content -LiteralPath $errFile -Value $msg -Encoding ascii } catch { }
+    $detail = "$($_.Exception.Message)`r`n$($_.InvocationInfo.PositionMessage)"
+    try { Set-Content -LiteralPath $errFile -Value "The MK9 Rollback window stopped because of an error:`r`n`r`n$detail" -Encoding ascii } catch { }
+    $head = 'The MK9 Rollback window stopped because of an error:'; $saved = "(Saved in $errFile; please send it with your bug report.)"
+    try { $head = Tr 'The MK9 Rollback window stopped because of an error:'; $saved = Tr '(Saved in {0}; please send it with your bug report.)' $errFile } catch { }
     $shown = $false
     try {
         Add-Type -AssemblyName System.Windows.Forms
-        [void][System.Windows.Forms.MessageBox]::Show("$msg`r`n`r`n(Saved in $errFile; please send it with your bug report.)", 'MK9 Rollback', 'OK', 'Error')
+        [void][System.Windows.Forms.MessageBox]::Show("$head`r`n`r`n$detail`r`n`r`n$saved", 'MK9 Rollback', 'OK', 'Error')
         $shown = $true
     } catch { }
     if (-not $shown) { try { Start-Process notepad.exe -ArgumentList "`"$errFile`"" } catch { } }
     exit 1
 }
 $ErrorActionPreference = 'Continue'
+# The texts in the player's language (Tr, the tables and the choice of language). Missing, the window would say
+# nothing at all: English then, until the check below names the missing file.
+$textPath = Join-Path $PSScriptRoot 'launcher_text.ps1'
+if (Test-Path -LiteralPath $textPath) { . $textPath; Set-UiLanguage (Get-UiLanguageChoice) }
+else { function Tr { $t = "$($args[0])"; if ($args.Count -gt 1) { $t -f @($args[1..($args.Count - 1)]) } else { $t } } }
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 # Windows calls and a form that can be shown without taking the keyboard (the layout picture). Every use below is
@@ -141,7 +155,7 @@ if (-not $SnapshotPng) {
                 }
             } catch { }
             if (-not $shown) {
-                [void][System.Windows.Forms.MessageBox]::Show("MK9 Rollback is already open.`r`n`r`nIf you cannot see its window: open Task Manager (Ctrl+Shift+Esc), end `"Windows PowerShell`" there, then open MK9 Rollback again.", 'MK9 Rollback', 'OK', 'Information')
+                [void][System.Windows.Forms.MessageBox]::Show("$(Tr 'MK9 Rollback is already open.')`r`n`r`n$(Tr 'If you cannot see its window: open Task Manager (Ctrl+Shift+Esc), end "Windows PowerShell" there, then open MK9 Rollback again.')", 'MK9 Rollback', 'OK', 'Information')
             }
         }
         exit 0
@@ -155,9 +169,9 @@ $log = Join-Path $dir 'MK9Rollback.log'
 $kSteamBase = [uint64]76561197960265728
 $libPath = Join-Path $PSScriptRoot 'launcher_lib.ps1'
 $updaterPath = Join-Path $PSScriptRoot 'updater.ps1'
-foreach ($p in @($libPath, $updaterPath)) { if (-not (Test-Path -LiteralPath $p)) { throw "$p is missing. Extract the zip again into an empty folder." } }
-# Update check and install from the GitHub releases (Get-InstalledVersion, Get-LatestRelease, Install-Update,
-# Restore-PreviousVersion), and the window's pure helpers.
+foreach ($p in @($libPath, $updaterPath, $textPath)) { if (-not (Test-Path -LiteralPath $p)) { throw (Tr '{0} is missing. Extract the zip again into an empty folder.' $p) } }
+# Update check and install from the GitHub releases (Get-InstalledVersion, Get-LatestRelease, Install-Update), and the
+# window's pure helpers.
 . $updaterPath
 . $libPath
 $installed = Get-InstalledVersion $root
@@ -208,11 +222,11 @@ function UiFont([single]$size, [switch]$Bold, [switch]$Semi) {
 
 # ---- window ----
 # Laid out at 96 DPI (100 %); ResumeLayout below scales every position and size to the display's DPI.
-$kVersionText = if ($installed.version) { "Version $($installed.version)" } else { 'Development copy' }
+$kVersionText = if ($installed.version) { Tr 'Version {0}' $installed.version } else { Tr 'Development copy' }
 $form = if ('MK9R.QuietForm' -as [type]) { New-Object MK9R.QuietForm } else { New-Object System.Windows.Forms.Form }
 $form.SuspendLayout()
 $form.Text = 'MK9 Rollback'
-$form.ClientSize = New-Object System.Drawing.Size(460, 598)
+$form.ClientSize = New-Object System.Drawing.Size(460, 620)
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -308,7 +322,7 @@ $logo.BackColor = $c.Panel
 try { $logo.Image = New-LogoBitmap (Scaled 48) } catch { }
 [void](Place $logo $header 20 18 48 48)
 [void](Label $header 'MK9 Rollback' 80 13 240 32 (UiFont 16 -Semi) $c.Text)
-[void](Label $header 'Rollback netcode for Mortal Kombat Komplete Edition' 82 47 366 20 (UiFont 9) $c.Muted)
+[void](Label $header (Tr 'Rollback netcode for Mortal Kombat Komplete Edition') 82 47 366 20 (UiFont 9) $c.Muted)
 $verLabel = Label $header $kVersionText 300 20 148 18 (UiFont 8.25) $c.Muted
 $verLabel.TextAlign = 'TopRight'
 [void](Rule 84)
@@ -324,7 +338,8 @@ StyleButton $play 7
 [void](Place $play $form 20 172 420 54)
 $form.AcceptButton = $play
 
-# Shown only when a newer version is out (ShowUpdateBanner); the status box below then starts lower.
+# Shown only while a newer version is due (ShowBanner): waiting for the game to close, installing, or failed (then with
+# a button that tries again); the status box below then starts lower.
 $banner = New-Object System.Windows.Forms.Panel
 $banner.BackColor = $c.Banner
 $banner.Visible = $false
@@ -335,7 +350,7 @@ $bannerEdge.BackColor = $c.Warn
 $bannerLabel = Label $banner '' 16 0 270 44 (UiFont 9.75 -Semi) $c.BannerText
 $bannerLabel.TextAlign = 'MiddleLeft'
 $updBtn = New-Object System.Windows.Forms.Button
-$updBtn.Text = '&Update now'
+$updBtn.Text = Tr 'Try a&gain'
 $updBtn.Font = UiFont 9.75 -Semi
 $updBtn.Cursor = [System.Windows.Forms.Cursors]::Hand
 StyleButton $updBtn 5
@@ -361,14 +376,18 @@ if (-not $kHighContrast) {
 }
 
 # Facts of the last match from the log (launcher_lib Update-MatchFacts) and the Wi-Fi hint (Get-ConnectionHint).
-$matchLabel = Label $form 'Last match: none yet.' 21 486 420 20 (UiFont 9) $c.Muted
-$hintLabel = Label $form '' 21 506 420 20 (UiFont 9) $c.Warn
-[void](Rule 534)
-$trouble = Link $form '&Having trouble?' 19 546 110
-$saveLogs = Link $form '&Save logs to the Desktop' 136 546 166
-$updLink = Link $form '&Check for updates' 300 546 142 'MiddleRight'
-$backLink = Link $form 'Go &back to the previous version' 19 570 240
-$backLink.Visible = Test-Path -LiteralPath (Join-Path $root 'previous_version')
+$matchLabel = Label $form (Tr 'Last match: none yet.') 21 486 420 20 (UiFont 9) $c.Muted
+# The score of the online matches (the DLL's match_history.txt; launcher_lib Format-MatchRecord), and the list of them.
+$recordLabel = Label $form (Tr 'Score: no online match counted yet.') 21 506 420 20 (UiFont 9) $c.Text
+$hintLabel = Label $form '' 21 528 420 20 (UiFont 9) $c.Warn
+[void](Rule 556)
+$trouble = Link $form (Tr '&Having trouble?') 19 568 110
+$saveLogs = Link $form (Tr '&Save logs to the Desktop') 136 568 166
+$updLink = Link $form (Tr '&Check for updates') 300 568 142 'MiddleRight'
+# Where "Go back to the previous version" was until 2026-11-16: with updates installed by themselves, an older version
+# would only be updated again at the next start.
+$langLink = Link $form (Tr '&Language: {0}' (Get-UiLanguageName $script:UiLang)) 19 592 240
+$historyLink = Link $form (Tr '&Match history') 300 592 142 'MiddleRight'
 
 # The window's icon: the mark at the title bar's and the taskbar's sizes. The title bar and the window's edge take the
 # header's colours where Windows can (dark title bar: Windows 10 1809 and later; the colours: Windows 11). Registered
@@ -413,19 +432,24 @@ function SetStatus([string]$text, [string]$tone = 'idle', $sub = $null) {
     $dot.ForeColor = switch ($tone) { 'busy' { $c.Warn } 'good' { $c.Good } 'warn' { $c.Warn } 'bad' { $c.Bad } default { $c.Idle } }
     if ($null -ne $sub) { $subline.Text = "$sub" }
 }
-$kSubIdle = 'Press Play: the game starts through Steam with the mod loaded.'
-$kSubInGame = 'In the game: Online > Player Match, a 1 vs 1 room. Rollback takes over when your opponent runs MK9 Rollback too.'
-$kSubFailed = 'The lines below say why. Then press Play again.'
+$kSubIdle = Tr 'Press Play: the game starts through Steam with the mod loaded.'
+$kSubInGame = Tr 'In the game: Online > Player Match, a 1 vs 1 room. Rollback takes over when your opponent runs MK9 Rollback too.'
+$kSubFailed = Tr 'The lines below say why. Then press Play again.'
 # The Play button is never greyed out by Windows (its grey text is unreadable on the dark look): a press is ignored
-# while $script:playMode is 'busy', 'running' or 'blocked'.
-#   play     ready to start                     busy     a start is under way
-#   running  the game runs with the mod         retry    the game runs, the mod did not answer: a press sends again
-#   blocked  this folder cannot be written
+# while $script:playMode is 'busy', 'running', 'checking', 'updating', 'updatewait' or 'blocked'.
+#   play      ready to start                     busy        a start is under way
+#   running   the game runs with the mod         retry       the game runs, the mod did not answer: a press sends again
+#   blocked   this folder cannot be written      checking    the update check before a start
+#   updating  an update is being installed       updatewait  an update is due and waits for the game to close
+#   update    an update is due and its install failed: a press tries again
 $script:playMode = 'play'
 function SetPlay([string]$mode) {
     $script:playMode = $mode
-    $hot = $mode -eq 'play' -or $mode -eq 'retry'
-    $play.Text = switch ($mode) { 'busy' { 'STARTING...' } 'running' { 'GAME RUNNING' } 'retry' { '&TRY AGAIN' } default { '&PLAY' } }
+    $hot = $mode -eq 'play' -or $mode -eq 'retry' -or $mode -eq 'update'
+    $play.Text = switch ($mode) {
+        'busy' { Tr 'STARTING...' } 'running' { Tr 'GAME RUNNING' } 'retry' { Tr '&TRY AGAIN' } 'checking' { Tr 'CHECKING FOR UPDATES...' }
+        'updating' { Tr 'UPDATING...' } 'updatewait' { Tr 'CLOSE THE GAME TO UPDATE' } 'update' { Tr '&INSTALL THE UPDATE' } default { Tr '&PLAY' }
+    }
     $back = if ($hot) { $c.Accent } elseif ($mode -eq 'running') { $c.Running } else { $c.Quiet }
     $play.Tag.Back = $back
     $play.Tag.Hot = if ($hot) { $c.AccentHot } else { $back }
@@ -447,11 +471,17 @@ function LayoutLog {
     $logBack.Height = $logEdge.Height - $script:logBackPad
     $status.Height = $logBack.Height - $script:statusPad
 }
-function ShowUpdateBanner([string]$version) {
-    $bannerLabel.Text = "Version $version is available"
+# The banner with $text; -Button: with "Try again" on its right (the label then leaves room for it).
+function ShowBanner([string]$text, [switch]$Button) {
+    $bannerLabel.Text = $text
+    $updBtn.Visible = [bool]$Button
+    $right = if ($Button) { $updBtn.Left - (Scaled 8) } else { $banner.ClientSize.Width - (Scaled 12) }
+    $bannerLabel.Width = [Math]::Max((Scaled 40), $right - $bannerLabel.Left)
     $script:bannerOn = $true
     $banner.Visible = $true
     LayoutLog
+    $title = "MK9 Rollback - $(Tr 'update available')"
+    if ($form.Text -ne $title) { $form.Text = $title }
 }
 # Brings this window to the front: asked by a second start ($kShowEvent), and at the start when Windows was told to
 # start this process hidden. Windows then hides the first window the process shows, which is this one: the versions
@@ -480,11 +510,11 @@ function HandlerError($ex) {
             $at = ''
             if ($ex -is [System.Management.Automation.IContainsErrorRecord] -and $ex.ErrorRecord.InvocationInfo) { $at = $ex.ErrorRecord.InvocationInfo.PositionMessage }
             try { Set-Content -LiteralPath $errFile -Value "An error inside the MK9 Rollback window:`r`n`r`n$($ex.Message)`r`n$at" -Encoding ascii } catch { }
-            Say "Something went wrong in this window: $text (Saved in $errFile; please send it with your bug report if it keeps happening.)"
+            Say (Tr 'Something went wrong in this window: {0} (Saved in {1}; please send it with your bug report if it keeps happening.)' $text $errFile)
         }
         # A start step that fails at every tick of the timer would leave the Play button busy for good.
         if ($script:errorWatch.Count -eq 3 -and $script:state -ne 'idle' -and $script:state -ne 'watch') {
-            Say 'This start is given up. Press Play to try again.'
+            Say (Tr 'This start is given up. Press Play to try again.')
             GoIdle -Failed
         }
     } catch { }
@@ -492,27 +522,150 @@ function HandlerError($ex) {
 
 # Same text in README.md and the README of tools\package.ps1.
 $troubleLines = @(
-    'Allow MKKE.exe through the Windows firewall (Windows Security > Firewall > Allow an app).',
-    'Add the MK9 Rollback folder to your antivirus exclusions.',
-    'Run the game from an SSD, and turn off disk sleep.',
-    'On a laptop: plug it in and set the Windows power mode to "Best performance".',
-    'Close browsers and other heavy apps (downloads, streaming, launchers).',
-    'Use a wired (Ethernet) connection instead of Wi-Fi.',
-    'Both players need the same version ("Check for updates" at the bottom).',
-    'In a fight, F9 switches between the HUD display and the detailed network line.'
+    (Tr 'Allow MKKE.exe through the Windows firewall (Windows Security > Firewall > Allow an app).'),
+    (Tr 'Add the MK9 Rollback folder to your antivirus exclusions.'),
+    (Tr 'Run the game from an SSD, and turn off disk sleep.'),
+    (Tr 'On a laptop: plug it in and set the Windows power mode to "Best performance".'),
+    (Tr 'Close browsers and other heavy apps (downloads, streaming, launchers).'),
+    (Tr 'Use a wired (Ethernet) connection instead of Wi-Fi.'),
+    (Tr 'Both players need the same version: this window installs a new one by itself when it opens.'),
+    (Tr 'In a fight, F9 switches between the HUD display and the detailed network line.')
 )
 function ShowTrouble {
-    [void][System.Windows.Forms.MessageBox]::Show("If the game stutters, freezes or will not connect:`n`n- $($troubleLines -join "`n- ")", 'Having trouble?', 'OK', 'Information')
+    [void][System.Windows.Forms.MessageBox]::Show("$(Tr 'If the game stutters, freezes or will not connect:')`n`n- $($troubleLines -join "`n- ")", (Tr 'Having trouble?'), 'OK', 'Information')
 }
 $trouble.Add_LinkClicked({ ShowTrouble })
 
+# ---- score and match history ----
+# The DLL writes a line to match_history.txt for every online one-on-one match that reaches MK9's results screen
+# (src\net\ScoreKeeper.h); the window reads the file when it opens, when the DLL says a line was written, and for the list.
+$historyPath = Join-Path $dir 'match_history.txt'
+function UpdateRecord {
+    try { $recordLabel.Text = Format-MatchRecord @(Read-MatchHistory $historyPath) } catch { }
+}
+function ShowHistory {
+    $entries = @(Read-MatchHistory $historyPath)
+    $friends = Get-SteamFriendNames
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.SuspendLayout()
+    $dlg.Text = Tr 'Match history'
+    $dlg.ClientSize = New-Object System.Drawing.Size(860, 480)
+    $dlg.MinimumSize = New-Object System.Drawing.Size(520, 300)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.ShowInTaskbar = $false
+    $dlg.MinimizeBox = $false
+    $dlg.Font = UiFont 9.75
+    $dlg.BackColor = $c.Bg
+    $dlg.ForeColor = $c.Text
+    if ($script:icons.Count) { $dlg.Icon = $script:icons[0] }
+    if (-not $kHighContrast) {
+        $dlg.Add_HandleCreated({ param($s, $e) try { $on = 1; [void][MK9R.Native]::DwmSetWindowAttribute($s.Handle, 20, [ref]$on, 4) } catch { } })
+    }
+    # The list: newest first, the result in its colour.
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.HeaderStyle = 'Nonclickable'; $lv.MultiSelect = $false
+    $lv.BorderStyle = 'None'; $lv.BackColor = $c.Field; $lv.ForeColor = $c.FieldText
+    $lv.Dock = 'Fill'
+    foreach ($col in @(@((Tr 'When'), 128), @((Tr 'Result'), 72), @((Tr 'Rounds'), 60), @((Tr 'You played'), 150), @((Tr 'Opponent played'), 150), @((Tr 'Arena'), 160), @((Tr 'Opponent'), 120))) {
+        [void]$lv.Columns.Add($col[0], $col[1])
+    }
+    $whenFormat = Tr 'yyyy-MM-dd HH:mm'
+    $lv.BeginUpdate()
+    for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+        $e = $entries[$i]
+        $it = New-Object System.Windows.Forms.ListViewItem($e.Time.ToString($whenFormat, [Globalization.CultureInfo]::InvariantCulture))
+        $it.UseItemStyleForSubItems = $false
+        $it.ForeColor = $c.FieldText; $it.BackColor = $c.Field
+        $res = switch ($e.Result) { 'WIN' { Tr 'Won' } 'LOSS' { Tr 'Lost' } default { Tr 'Draw' } }
+        foreach ($v in @($res, $(if ($e.Rounds -eq '?') { '' } else { $e.Rounds }), (Get-FighterName $e.Mine), (Get-FighterName $e.Theirs), (Get-ArenaName $e.Arena), (Get-OpponentLabel $e.Opponent $friends))) {
+            $sub = $it.SubItems.Add([string]$v)
+            $sub.ForeColor = $c.FieldText; $sub.BackColor = $c.Field
+        }
+        $it.SubItems[1].ForeColor = switch ($e.Result) { 'WIN' { $c.Good } 'LOSS' { $c.Bad } default { $c.Muted } }
+        [void]$lv.Items.Add($it)
+    }
+    $lv.EndUpdate()
+    if (-not $kHighContrast) { $lv.Add_HandleCreated({ param($s, $e) try { [void][MK9R.Native]::SetWindowTheme($s.Handle, 'DarkMode_Explorer', [IntPtr]::Zero) } catch { } }) }
+    # Above it: today's and every day's score, and each opponent's (the three most played).
+    $top = New-Object System.Windows.Forms.Panel
+    $top.Dock = 'Top'
+    $top.BackColor = $c.Panel
+    $lines = @()
+    if (-not $entries.Count) {
+        $lines += Tr 'No online match counted yet.'
+        $lines += Tr 'A match counts when both players are in a 1 vs 1 Player Match room and it reaches MK9''s results screen.'
+    } else {
+        $lines += (Format-MatchRecord $entries)
+        $byOpp = @($entries | Group-Object { $_.Opponent } | Sort-Object Count -Descending | Select-Object -First 3)
+        foreach ($g in $byOpp) {
+            $t = Get-MatchTally $g.Group
+            $lines += Tr 'Against {0}: {1}.' (Get-OpponentLabel ([uint64]$g.Name) $friends) (Format-Tally $t)
+        }
+    }
+    $sum = New-Object System.Windows.Forms.Label
+    $sum.UseMnemonic = $false
+    $sum.Text = $lines -join "`r`n"
+    $sum.ForeColor = $c.Text
+    $sum.Location = New-Object System.Drawing.Point(16, 10)
+    $sum.AutoSize = $true
+    $top.Controls.Add($sum)
+    $top.Height = 20 + 20 * $lines.Count
+    # Below it: where the file is.
+    $foot = New-Object System.Windows.Forms.Panel
+    $foot.Dock = 'Bottom'
+    $foot.Height = 34
+    $foot.BackColor = $c.Bg
+    $fileLink = New-Object System.Windows.Forms.LinkLabel
+    $fileLink.Text = Tr 'Show the file (match_history.txt)'
+    $fileLink.LinkBehavior = 'HoverUnderline'
+    $fileLink.LinkColor = $c.Link; $fileLink.VisitedLinkColor = $c.Link; $fileLink.ActiveLinkColor = $c.AccentHot
+    $fileLink.Location = New-Object System.Drawing.Point(14, 8)
+    $fileLink.AutoSize = $true
+    $fileLink.Enabled = Test-Path -LiteralPath $historyPath
+    $fileLink.Add_LinkClicked({ if (Test-Path -LiteralPath $historyPath) { Start-Process explorer.exe -ArgumentList "/select,`"$historyPath`"" } })
+    $foot.Controls.Add($fileLink)
+    $dlg.Controls.Add($lv)
+    $dlg.Controls.Add($foot)
+    $dlg.Controls.Add($top)
+    $dlg.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+    $dlg.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $dlg.ResumeLayout($true)
+    try { [void]$dlg.ShowDialog($form) } finally { $dlg.Dispose() }
+    UpdateRecord
+}
+$historyLink.Add_LinkClicked({ try { ShowHistory } catch { Say (Tr 'The match history could not be shown: {0}' $_.Exception.Message) } })
+
+# ---- language ----
+# The "Language" link opens a list of the languages (launcher_text.ps1 $script:UiLanguages). A choice is kept for
+# this Windows account (Save-UiLanguageChoice) and the window restarts in it; while a start, the game or an update is
+# under way it is only kept, for the next time the window opens.
+$langMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$langMenu.ShowImageMargin = $true
+foreach ($code in @($script:UiLanguages.Keys)) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem($script:UiLanguages[$code])
+    $item.Tag = $code
+    $item.Checked = ($code -eq $script:UiLang)
+    $item.Add_Click({ param($s, $e) ChangeLanguage "$($s.Tag)" })
+    [void]$langMenu.Items.Add($item)
+}
+function ChangeLanguage([string]$code) {
+    if ($code -eq $script:UiLang) { return }
+    if (-not (Save-UiLanguageChoice $code)) { Say (Tr 'The language could not be saved.'); return }
+    if ($script:state -eq 'idle' -and -not $script:updateBusy -and -not $script:installing) { RestartWindow; return }
+    Say (Tr 'This window shows {0} the next time it opens.' (Get-UiLanguageName $code))
+}
+$langLink.Add_LinkClicked({ $langMenu.Show($langLink, (New-Object System.Drawing.Point(0, 0)), [System.Windows.Forms.ToolStripDropDownDirection]::AboveRight) })
+
 # ---- background work (update check, download and install, saving the logs, the Wi-Fi check) ----
-# Each job is a runspace of its own; $bgTimer polls them and passes status lines from $bgQueue to the window.
+# Each job is a runspace of its own; $bgTimer polls them and passes status lines from $bgQueue to the window. Every job
+# first loads the texts in this window's language (Start-BgJob adds $text and $lang to its parameters).
 $script:jobs = New-Object System.Collections.ArrayList
 $script:bgQueue = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 function Start-BgJob([scriptblock]$code, [hashtable]$params, [scriptblock]$done) {
     $ps = [powershell]::Create()
     [void]$ps.AddScript($code.ToString())
+    $params['text'] = $textPath
+    $params['lang'] = $script:UiLang
     foreach ($k in $params.Keys) { [void]$ps.AddParameter($k, $params[$k]) }
     [void]$script:jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $done })
 }
@@ -537,46 +690,123 @@ $bgTimer.Add_Tick({
         & $j.Done $out $err
     }
 })
-$kCheckJob = { param($updater, $timeout) . $updater; $r = Get-LatestRelease -TimeoutSec $timeout; [pscustomobject]@{ Release = $r; Info = (Get-UpdateError) } }
-$kInstallJob = { param($updater, $release, $root, $queue) . $updater; Install-Update $release $root { param($s) [void]$queue.Add($s) } }
-$kFinishJob = { param($updater, $release, $root, $queue) . $updater; Complete-Install $release $root { param($s) [void]$queue.Add($s) } }
-$kLogsJob = { param($lib, $dir, $dest, $self) . $lib; Save-LogsZip $dir $dest $self }
-$kHintJob = { param($lib) . $lib; Get-ConnectionHint }
+$kCheckJob = { param($text, $lang, $updater, $timeout) . $text; Set-UiLanguage $lang; . $updater; $r = Get-LatestRelease -TimeoutSec $timeout; [pscustomobject]@{ Release = $r; Info = (Get-UpdateError) } }
+$kInstallJob = { param($text, $lang, $updater, $release, $root, $queue) . $text; Set-UiLanguage $lang; . $updater; Install-Update $release $root { param($s) [void]$queue.Add($s) } }
+$kFinishJob = { param($text, $lang, $updater, $release, $root, $queue) . $text; Set-UiLanguage $lang; . $updater; Complete-Install $release $root { param($s) [void]$queue.Add($s) } }
+$kLogsJob = { param($text, $lang, $lib, $dir, $dest, $self) . $text; Set-UiLanguage $lang; . $lib; Save-LogsZip $dir $dest $self }
+$kHintJob = { param($text, $lang, $lib) . $text; Set-UiLanguage $lang; . $lib; Get-ConnectionHint }
 
-# Updates: checked once when the window opens (quietly: only a newer version is mentioned) and on the link.
+# ---- updates ----
+# Only the newest version plays (2026-11-16, the player: "make the mod launcher auto update and don't let the user
+# launch the game if there is an update"). The window asks GitHub when it opens, and again before a start when it last
+# asked more than $kRecheckMinutes ago; Play waits for the answer (CHECKING FOR UPDATES...). A newer release is then
+# installed at once, without a question, and the window restarts on it. While the game runs, the install waits for the
+# game to close (the timer's idle step starts it). Play is refused for as long as an update is due, also after an
+# install that failed: the button, the banner's "Try again" and "Check for updates" then try again (never by
+# themselves, so a broken download does not loop), and a status line names the release page for a download by hand.
+# A check that gets no answer (no internet, GitHub's limit of 60 checks an hour) lets Play go ahead: an update that
+# cannot be seen cannot be installed either, and the next start asks again. A development copy (no version.txt) is
+# never updated by itself. Going back to the previous version is no longer offered in the window (it would be updated
+# again at the next start); tools\updater.ps1 -Restore still does it.
 $script:release = $null
-$script:updateBusy = $false
+$script:updateBusy = $false      # a check, an install or the program's fetch is under way
 $script:checkQuiet = $false
+$script:updateDue = $null        # the release to install before the next start; $null: none
+$script:updateFailed = $false    # its install failed: tried again on a press only
+$script:waitTold = $false        # the player was told to close the game for it
+$script:lastCheck = [datetime]::MinValue
+$script:playAfterCheck = $false  # a press of Play waits for the check under way
+$kRecheckMinutes = 10
+$kDevCopy = -not $installed.version
 function CheckUpdate([switch]$Quiet) {
     if ($script:updateBusy) { return }
     $script:updateBusy = $true
     $script:checkQuiet = [bool]$Quiet
+    $script:lastCheck = Get-Date
     $updLink.Enabled = $false
-    if (-not $Quiet) { Say 'Checking for updates...' }
-    Start-BgJob $kCheckJob @{ updater = $updaterPath; timeout = $(if ($Quiet) { 4 } else { 10 }) } $onChecked
+    if (-not $Quiet) { Say (Tr 'Checking for updates...') }
+    if ($script:state -eq 'idle' -and -not $script:updateDue -and -not $script:readOnly) { SetPlay 'checking' }
+    Start-BgJob $kCheckJob @{ updater = $updaterPath; timeout = $(if ($Quiet) { 6 } else { 10 }) } $onChecked
+}
+# Play again, once nothing holds it (no start under way, no update due).
+function ReleasePlay {
+    if ($script:state -ne 'idle' -or $script:updateDue) { return }
+    SetPlay $(if ($script:readOnly) { 'blocked' } else { 'play' })
 }
 $onChecked = {
     param($out, $err)
     $script:updateBusy = $false
     $updLink.Enabled = $true
-    $Quiet = $script:checkQuiet
+    $quiet = $script:checkQuiet
+    $thenPlay = $script:playAfterCheck
+    $script:playAfterCheck = $false
     if ($out -and $out.Release) { $script:release = $out.Release }
     if (-not ($out -and $out.Release)) {
-        if (-not $Quiet) {
-            if ($out -and $out.Info.RateLimited) { Say $out.Info.Error }
-            elseif ($out) { Say "Update check failed: $($out.Info.Error)" }
-            else { Say "Update check failed: $err" }
-        }
+        $why = if ($out -and $out.Info.Error) { $out.Info.Error } elseif ($err) { $err } else { Tr 'no answer' }
+        Say (Tr 'The update check failed ({0}). You can play; the window asks again before the next start.' "$why".TrimEnd('.'))
+        ReleasePlay
+        if ($thenPlay) { StartPlay }
         return
     }
     if (Test-UpdateNewer $script:release $installed.version) {
-        Say "UPDATE AVAILABLE: version $($script:release.Version). Close the game, then press 'Update now'. Your opponent needs the same version."
-        ShowUpdateBanner $script:release.Version
-        if ($form.Text -notlike '*update available') { $form.Text = "$($form.Text) - update available" }
-    } else {
-        if (-not $Quiet) { Say "You have the latest version ($($installed.version))." }
-        FinishInstall
+        if ($kDevCopy) {
+            Say (Tr 'Version {0} is out. A development copy is not updated by itself.' $script:release.Version)
+            ReleasePlay
+            if ($thenPlay) { StartPlay }
+            return
+        }
+        if (-not ($script:updateDue -and $script:updateDue.Version -eq $script:release.Version)) {
+            $script:updateDue = $script:release
+            $script:updateFailed = $false
+            $script:waitTold = $false
+            Say (Tr 'UPDATE: version {0} is out. It is installed now, by itself; your opponent needs it too.' $script:release.Version)
+        } elseif (-not $quiet) {
+            $script:updateFailed = $false  # "Check for updates" after a failed install: try again
+        }
+        InstallDueUpdate
+        return
     }
+    if (-not $quiet) { Say (Tr 'You have the latest version ({0}).' $installed.version) }
+    ReleasePlay
+    FinishInstall
+    if ($thenPlay) { StartPlay }
+}
+# The release that is due: installed now when nothing is in the way, else as soon as it is gone (the timer's idle step
+# calls this every second while an update is due and has not failed). -Retry: after a failed install, on a press.
+function InstallDueUpdate([switch]$Retry) {
+    $rel = $script:updateDue
+    if (-not $rel -or $script:installing) { return }
+    if ($Retry) { $script:updateFailed = $false }
+    if ($script:updateFailed) {
+        if ($script:state -eq 'idle' -and $script:playMode -ne 'update') { SetPlay 'update' }
+        return
+    }
+    if ($script:readOnly) {
+        if (-not $script:waitTold) {
+            $script:waitTold = $true
+            ShowBanner (Tr 'Version {0} is available' $rel.Version)
+            Say (Tr 'Version {0} cannot be installed into a read-only folder. Move the MK9 Rollback folder to e.g. C:\Games, then open it again.' $rel.Version)
+        }
+        return
+    }
+    if ($script:updateBusy) { return }   # a check or the program's fetch: the next tick comes back
+    if (GameBlocksUpdate) {
+        if ($script:state -eq 'idle' -and $script:playMode -ne 'updatewait') { SetPlay 'updatewait' }
+        if (-not $script:waitTold) {
+            $script:waitTold = $true
+            ShowBanner (Tr 'Version {0} is available: it installs once the game is closed' $rel.Version)
+            Say (Tr 'Close the game: version {0} then installs by itself. Your opponent needs it too.' $rel.Version)
+            if ($script:state -eq 'idle') { SetStatus (Tr 'Close the game to update') 'warn' (Tr 'The new version installs by itself once the game is closed. Then press Play.') }
+        }
+        return
+    }
+    $script:updateBusy = $true
+    $script:installing = $true
+    $updLink.Enabled = $false
+    SetPlay 'updating'
+    ShowBanner (Tr 'Installing version {0}...' $rel.Version)
+    SetStatus (Tr 'Installing version {0}...' $rel.Version) 'busy' (Tr 'This window restarts by itself when the update is in. Then press Play.')
+    Start-BgJob $kInstallJob @{ updater = $updaterPath; release = $rel; root = $root; queue = $script:bgQueue } $onInstalled
 }
 # An update installed by a version before 2026-11 could not bring "MK9 Rollback.exe" (that version's updater refuses
 # a zip with a file it does not know, so it is given a zip without it; updater.ps1). The program is fetched here, once,
@@ -588,20 +818,19 @@ function FinishInstall {
     $script:finishTried = $true
     $script:updateBusy = $true
     $updLink.Enabled = $false
-    Say 'Finishing the update: fetching "MK9 Rollback.exe", the program that opens this window from now on...'
+    Say (Tr 'Finishing the update: fetching "MK9 Rollback.exe", the program that opens this window from now on...')
     Start-BgJob $kFinishJob @{ updater = $updaterPath; release = $script:release; root = $root; queue = $script:bgQueue } {
         param($out, $err)
         $script:updateBusy = $false
         $updLink.Enabled = $true
-        if ($out -eq $true) { Say 'Done. From now on, open MK9 Rollback with "MK9 Rollback.exe" in its folder ("Play Online.bat" is gone).' }
-        else { Say "It could not be added now$(if ($err) { " ($err)" }); it is tried again the next time this window opens. Until then `"Play Online.bat`" still opens it." }
-        $backLink.Visible = Test-Path -LiteralPath (Join-Path $root 'previous_version')
+        if ($out -eq $true) { Say (Tr 'Done. From now on, open MK9 Rollback with "MK9 Rollback.exe" in its folder ("Play Online.bat" is gone).') }
+        else { Say (Tr 'It could not be added now{0}; it is tried again the next time this window opens. Until then "Play Online.bat" still opens it.' $(if ($err) { " ($err)" } else { '' })) }
     }
 }
-# Restarts this window on the files now on disk (after an update or going back): through "MK9 Rollback.exe" when it
-# is there, else PowerShell directly, with no console and no request to start hidden (see ShowSelf).
-function RestartWindow {
-    Say 'Restarting this window...'
+# Restarts this window on the files now on disk (after an update or a change of language): through "MK9 Rollback.exe"
+# when it is there, else PowerShell directly, with no console and no request to start hidden (see ShowSelf).
+function RestartWindow([switch]$AfterUpdate) {
+    Say (Tr 'Restarting this window...')
     try { $script:mutex.ReleaseMutex(); $script:mutexOwned = $false } catch { }
     $started = $false
     foreach ($exe in @((Join-Path $root 'MK9 Rollback.exe'), "$env:MK9R_LAUNCHER")) {
@@ -619,7 +848,12 @@ function RestartWindow {
     }
     if (-not $started) {
         try { $script:mutexOwned = $script:mutex.WaitOne(0) } catch { }
-        Say 'This window could not restart itself. Close it and open MK9 Rollback again.'
+        Say (Tr 'This window could not restart itself. Close it and open MK9 Rollback again.')
+        if ($AfterUpdate) {
+            # The new files are in; this window still runs the old ones.
+            SetPlay 'blocked'
+            SetStatus (Tr 'Open MK9 Rollback again') 'warn' (Tr 'The update is in. Close this window and open MK9 Rollback again to play.')
+        }
         return
     }
     $form.Close()
@@ -627,29 +861,30 @@ function RestartWindow {
 function GameBlocksUpdate { $script:state -ne 'idle' -or [bool](Get-Process MKKE -ErrorAction SilentlyContinue) }
 $updLink.Add_LinkClicked({ if (-not $script:updateBusy) { CheckUpdate } })
 $updBtn.Add_Click({
-    if ($script:updateBusy) { return }
-    if (-not ($script:release -and (Test-UpdateNewer $script:release $installed.version))) { CheckUpdate; return }
-    if (GameBlocksUpdate) { Say 'Close the game first, then press Update now.'; return }
-    $answer = [System.Windows.Forms.MessageBox]::Show("Install version $($script:release.Version)?`n`nYour opponent needs the same version to play with you.", 'MK9 Rollback update', 'YesNo', 'Question')
-    if ($answer -ne 'Yes') { return }
-    $script:updateBusy = $true
-    $script:installing = $true
-    $updLink.Enabled = $false; $backLink.Enabled = $false
-    SetPlay 'busy'
-    $play.Text = 'UPDATING...'
-    SetStatus "Installing version $($script:release.Version)..." 'busy' 'This window restarts by itself when the update is in.'
-    Start-BgJob $kInstallJob @{ updater = $updaterPath; release = $script:release; root = $root; queue = $script:bgQueue } $onInstalled
+    if ($script:updateBusy -or -not $script:updateDue) { return }
+    if (GameBlocksUpdate) { Say (Tr 'Close the game first: version {0} then installs by itself.' $script:updateDue.Version); return }
+    InstallDueUpdate -Retry
 })
 $onInstalled = {
     param($out, $err)
     $script:updateBusy = $false
     $script:installing = $false
     if ($script:closeWanted) { $form.Close(); return }  # closed during the install: no restart
-    if ($out -eq $true) { RestartWindow; return }
-    if ($err) { Say "The update failed: $err" }
-    $updLink.Enabled = $true; $backLink.Enabled = $true
-    SetStatus 'The update was not installed' 'bad' 'The lines below say why. Your files are as they were.'
+    if ($out -eq $true) {
+        # The files on disk are the new version's: nothing of this window may start another install meanwhile.
+        $script:updateDue = $null
+        $timer.Stop()
+        RestartWindow -AfterUpdate
+        return
+    }
+    if ($err) { Say (Tr 'The update failed: {0}' $err) }
+    $script:updateFailed = $true
+    $rel = $script:updateDue
+    $updLink.Enabled = $true
+    Say (Tr 'Press Try again. Or download version {0} yourself from {1} and extract it over this folder.' $rel.Version $rel.Page)
+    ShowBanner (Tr 'Version {0} was not installed' $rel.Version) -Button
     GoIdle
+    SetStatus (Tr 'The update was not installed') 'bad' (Tr 'The lines below say why. Play stays off until the new version is in: press the button to try again.')
 }
 # Closing the window stops the background jobs where they are (the end of this file). An install stopped while it
 # copies would leave some files new and some old, with nothing to put the old ones back (updater.ps1 Invoke-FileSwap
@@ -660,17 +895,8 @@ $form.Add_FormClosing({
     param($source, $e)
     if (-not $script:installing) { return }
     $e.Cancel = $true
-    if (-not $script:closeWanted) { Say 'The update is still being installed: this window closes by itself when it is done. Please wait.' }
+    if (-not $script:closeWanted) { Say (Tr 'The update is still being installed: this window closes by itself when it is done. Please wait.') }
     $script:closeWanted = $true
-})
-# Undoes the last update (updater.ps1 Restore-PreviousVersion); refused while the game runs, like updating.
-$backLink.Add_LinkClicked({
-    if ($script:updateBusy) { return }
-    if (GameBlocksUpdate) { Say 'Close the game first, then press the link again.'; return }
-    $prevVer = (Get-InstalledVersion (Join-Path $root 'previous_version')).version
-    $answer = [System.Windows.Forms.MessageBox]::Show("Go back to the previous version$(if ($prevVer) { " ($prevVer)" })?`n`nYour opponent needs the same version to play with you.", 'MK9 Rollback', 'YesNo', 'Question')
-    if ($answer -ne 'Yes') { return }
-    if (Restore-PreviousVersion $root { param($s) Say $s }) { RestartWindow }
 })
 $form.Add_Shown({
     if ($SnapshotPng) { return }
@@ -684,15 +910,15 @@ $form.Add_Shown({
 $saveLogs.Add_LinkClicked({
     if (-not $saveLogs.Enabled) { return }
     $saveLogs.Enabled = $false
-    Say 'Saving the logs...'
+    Say (Tr 'Saving the logs...')
     $selfIds = @()
     $acct = MyAccountId
     if ($acct) { $selfIds += "$($kSteamBase + $acct)" }
     Start-BgJob $kLogsJob @{ lib = $libPath; dir = $dir; dest = [Environment]::GetFolderPath('Desktop'); self = [string[]]$selfIds } {
         param($out, $err)
         $saveLogs.Enabled = $true
-        if (-not $out -or -not $out.Zip) { Say $(if ($out) { $out.Error } else { "The logs zip could not be made ($err)." }); return }
-        Say "Logs saved: $($out.Zip). Steam IDs, IP addresses and your user and PC names in them were replaced (PRIVACY.txt in the zip lists what). Send it together with your opponent's zip."
+        if (-not $out -or -not $out.Zip) { Say $(if ($out) { $out.Error } else { Tr 'The logs zip could not be made ({0}).' $err }); return }
+        Say (Tr 'Logs saved: {0}. Steam IDs, IP addresses and your user and PC names in them were replaced (PRIVACY.txt in the zip lists what). Send it together with your opponent''s zip.' $out.Zip)
         Start-Process explorer.exe -ArgumentList "/select,`"$($out.Zip)`""
     }
 })
@@ -723,16 +949,18 @@ function Arm([switch]$Again) {
     $script:state = 'watch'
     SetPlay 'running'
     if ($Again) { return }
-    SetStatus 'Ready in the game' 'good' $kSubInGame
-    Say 'Ready. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.'
-    Say "If your opponent also runs MK9 Rollback, rollback takes over at the start of the fight. Against anyone else, MK9's own netcode is used. Ranked is never touched."
+    SetStatus (Tr 'Ready in the game') 'good' $kSubInGame
+    Say (Tr 'Ready. In the game: Online > Player Match, a 1 vs 1 room or a King of the Hill room with just the two of you. Play anyone there.')
+    Say (Tr 'If your opponent also runs MK9 Rollback, rollback takes over at the start of the fight. Against anyone else, MK9''s own netcode is used. Ranked is never touched.')
 }
 
+# Back to no start under way. An update that came due meanwhile is installed now, or waits for the game to close.
 function GoIdle([switch]$Failed) {
     $script:state = 'idle'
     $script:ackDue = $null
     SetPlay $(if ($script:readOnly) { 'blocked' } else { 'play' })
-    if ($Failed) { SetStatus 'The game did not start with the mod' 'bad' $kSubFailed }
+    if ($Failed) { SetStatus (Tr 'The game did not start with the mod') 'bad' $kSubFailed }
+    if ($script:updateDue) { $script:waitTold = $false; InstallDueUpdate }
 }
 $script:shownDesync = 0
 # The game's own window has taken no message for 5 s (what Windows shows as "Not responding"). Asked of that window
@@ -756,24 +984,28 @@ function GameHung($game) {
 
 $timer.Add_Tick({
     switch ($script:state) {
+        'idle' {
+            # An update that is due waits for the game to close (InstallDueUpdate says so once, then starts it).
+            if ($script:updateDue -and -not $script:installing -and -not $script:updateFailed) { InstallDueUpdate }
+        }
         'launch' {
             if (Get-Process MKKE -ErrorAction SilentlyContinue) {
-                Say 'The game is running. Waiting for its menu...'
-                SetStatus 'Waiting for the game''s menu...' 'busy' 'The mod is loaded once the game has reached its menu.'
+                Say (Tr 'The game is running. Waiting for its menu...')
+                SetStatus (Tr 'Waiting for the game''s menu...') 'busy' (Tr 'The mod is loaded once the game has reached its menu.')
                 $script:state = 'settle'; $script:wait = 0
                 return
             }
-            if (++$script:wait -gt 150) { Say 'The game did not start. Start it from Steam, then press Play again.'; GoIdle -Failed }
+            if (++$script:wait -gt 150) { Say (Tr 'The game did not start. Start it from Steam, then press Play again.'); GoIdle -Failed }
         }
         'settle' {
-            if (++$script:wait -ge 15) { $script:state = 'inject'; $script:wait = 0; SetStatus 'Loading the mod...' 'busy' }
+            if (++$script:wait -ge 15) { $script:state = 'inject'; $script:wait = 0; SetStatus (Tr 'Loading the mod...') 'busy' }
         }
         'injectretry' {
             if (++$script:wait -ge 2) { $script:state = 'inject'; $script:wait = 0 }
         }
         'inject' {
             $games = @(Get-Process MKKE -ErrorAction SilentlyContinue)
-            if ($games.Count -gt 1) { Say 'Two copies of the game are running. Close one.'; GoIdle -Failed; return }
+            if ($games.Count -gt 1) { Say (Tr 'Two copies of the game are running. Close one.'); GoIdle -Failed; return }
             # Closed while this window waited for its menu or between two tries: the injector would end with code 1 and
             # the antivirus text below would be shown for it.
             if ($games.Count -eq 0) { Say (Get-InjectFailureText $null $false); GoIdle -Failed; return }
@@ -787,7 +1019,7 @@ $timer.Add_Tick({
             if (-not $run.Started) { Say $run.Error; GoIdle -Failed; return }
             $r = Get-InjectorResult $run.Code
             if ($r.AlreadyLoaded) {
-                Say 'The mod was already loaded in this game.'
+                Say (Tr 'The mod was already loaded in this game.')
                 $script:tail = New-LogTail $log
                 [void](Read-LogTail $script:tail -Discard)
                 Arm
@@ -804,7 +1036,7 @@ $timer.Add_Tick({
         }
         'injectwait' {
             # A fresh log: read from its first line (a Steam or hook failure at start-up is shown too).
-            if (Test-Path -LiteralPath $log) { Say 'Mod loaded.'; $script:tail = New-LogTail $log; Arm; return }
+            if (Test-Path -LiteralPath $log) { Say (Tr 'Mod loaded.'); $script:tail = New-LogTail $log; Arm; return }
             if (++$script:wait -ge 10) {
                 $running = [bool](Get-Process MKKE -ErrorAction SilentlyContinue)
                 if ($running -and ++$script:tries -lt 6) { $script:state = 'inject'; return }
@@ -815,27 +1047,32 @@ $timer.Add_Tick({
         'watch' {
             $game = Get-Process MKKE -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $game) {
-                Say 'The game has closed.'
+                Say (Tr 'The game has closed.')
                 $script:hang = New-HangWatch
-                GoIdle
-                SetStatus 'Ready to play' 'idle' $kSubIdle
+                UpdateRecord
+                SetStatus (Tr 'Ready to play') 'idle' $kSubIdle
+                GoIdle   # last: an update that came due during the game starts here and sets its own status
                 return
             }
             # A game that stays frozen (launcher_lib Update-HangWatch; the DLL's "HANG?" lines alone are not shown).
             $hang = Update-HangWatch $script:hang (GameHung $game)
             if ($hang -eq 'hung') {
-                Say 'The game is not responding (frozen for more than 15 seconds). If it stays frozen, close it, then save the logs.'
-                SetStatus 'The game is not responding' 'bad'
+                Say (Tr 'The game is not responding (frozen for more than 15 seconds). If it stays frozen, close it, then save the logs.')
+                SetStatus (Tr 'The game is not responding') 'bad'
             } elseif ($hang -eq 'back') {
-                Say 'The game is responding again.'
-                SetStatus 'Ready in the game' 'good'
+                Say (Tr 'The game is responding again.')
+                SetStatus (Tr 'Ready in the game') 'good'
             }
             foreach ($line in (Read-LogTail $script:tail)) {
                 if ($script:ackDue -and (Test-CommandAck $line)) {
                     $script:ackDue = $null
-                    if ($script:playMode -eq 'retry') { SetPlay 'running'; SetStatus 'Ready in the game' 'good' $kSubInGame }
+                    if ($script:playMode -eq 'retry') { SetPlay 'running'; SetStatus (Tr 'Ready in the game') 'good' $kSubInGame }
                 }
                 if (Update-MatchFacts $script:facts $line) { $matchLabel.Text = Format-MatchFacts $script:facts }
+                # A counted match: what it gave, and the score line again once the DLL has written it to its file.
+                $scoreSay = Get-ScoreSay $line
+                if ($scoreSay) { Say $scoreSay }
+                if ($line -like '*SCORE: written to*') { UpdateRecord }
                 $r = Get-LauncherMessage $line 'Rollback'
                 if (-not $r) { continue }
                 if ($r.Kind -eq 'desync' -and $script:shownDesync++) { continue }
@@ -849,8 +1086,8 @@ $timer.Add_Tick({
                 if ($script:armTries -lt $kArmSends) { Arm -Again }
                 else {
                     $script:ackDue = $null
-                    Say 'The mod did not answer. Press TRY AGAIN; if it repeats, close the game, press Play, and save the logs.'
-                    SetStatus 'The mod is not answering' 'bad' 'Press TRY AGAIN. If it repeats, close the game and press Play.'
+                    Say (Tr 'The mod did not answer. Press TRY AGAIN; if it repeats, close the game, press Play, and save the logs.')
+                    SetStatus (Tr 'The mod is not answering') 'bad' (Tr 'Press TRY AGAIN. If it repeats, close the game and press Play.')
                     SetPlay 'retry'
                 }
             }
@@ -858,26 +1095,17 @@ $timer.Add_Tick({
     }
 })
 
-$kReadOnlyText = 'This folder is read-only (or protected by Windows ransomware protection). Move the MK9 Rollback folder to e.g. C:\Games.'
-$play.Add_Click({
-    if ($script:playMode -eq 'busy' -or $script:playMode -eq 'running') { return }
-    if ($script:readOnly) { Say $kReadOnlyText; return }
-    if (-not (MyAccountId)) {
-        Say 'Start Steam and sign in first.'
-        SetStatus 'Steam is not running' 'warn' 'Start Steam and sign in, then press Play.'
-        return
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $dir 'MK9RollbackInjector.exe'))) { Say "The mod files are missing next to this launcher ($dir)."; return }
-    if ($script:state -eq 'watch') { Arm; return }
-    if ($script:state -ne 'idle') { return }
-    $files = Test-InstalledFiles $root
-    if (-not $files.Ok) { Say $files.Message; SetStatus 'The mod''s files are damaged' 'bad' $kSubFailed; return }
+$kReadOnlyText = Tr 'This folder is read-only (or protected by Windows ransomware protection). Move the MK9 Rollback folder to e.g. C:\Games.'
+# Starts the game (or loads the mod into a running one), once the press of Play has passed its checks and, when the
+# last one was too old, the update check (onChecked calls this then).
+function StartPlay {
+    if ($script:state -ne 'idle' -or $script:updateDue) { return }
     SetPlay 'busy'
     $script:tries = 0
     $game = Get-Process MKKE -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $game) {
-        Say 'Starting Mortal Kombat through Steam...'
-        SetStatus 'Starting the game...' 'busy' 'Steam is starting Mortal Kombat. This can take a minute.'
+        Say (Tr 'Starting Mortal Kombat through Steam...')
+        SetStatus (Tr 'Starting the game...') 'busy' (Tr 'Steam is starting Mortal Kombat. This can take a minute.')
         Start-Process $kPowerShell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSScriptRoot\launch_game.ps1`""
         $script:state = 'launch'; $script:wait = 0
     } elseif ((Test-Path -LiteralPath $log) -and ((Get-Item -LiteralPath $log).LastWriteTime -gt $game.StartTime)) {
@@ -886,40 +1114,86 @@ $play.Add_Click({
         [void](Read-LogTail $script:tail -Discard)
         Arm
     } else {
-        Say 'The game is already running. Loading the mod...'
-        SetStatus 'Loading the mod...' 'busy' 'The game is already running.'
+        Say (Tr 'The game is already running. Loading the mod...')
+        SetStatus (Tr 'Loading the mod...') 'busy' (Tr 'The game is already running.')
         $script:state = 'inject'
     }
+}
+$play.Add_Click({
+    if (@('busy', 'running', 'checking', 'updating', 'updatewait') -contains $script:playMode) { return }
+    # An update is due and its install failed (the button says INSTALL THE UPDATE): a press tries it again.
+    if ($script:updateDue -and $script:state -eq 'idle') {
+        if (GameBlocksUpdate) { Say (Tr 'Close the game first: version {0} then installs by itself.' $script:updateDue.Version); return }
+        InstallDueUpdate -Retry
+        return
+    }
+    if ($script:readOnly) { Say $kReadOnlyText; return }
+    if (-not (MyAccountId)) {
+        Say (Tr 'Start Steam and sign in first.')
+        SetStatus (Tr 'Steam is not running') 'warn' (Tr 'Start Steam and sign in, then press Play.')
+        return
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $dir 'MK9RollbackInjector.exe'))) { Say (Tr 'The mod files are missing next to this launcher ({0}).' $dir); return }
+    if ($script:state -eq 'watch') { Arm; return }
+    if ($script:state -ne 'idle') { return }
+    $files = Test-InstalledFiles $root
+    if (-not $files.Ok) { Say $files.Message; SetStatus (Tr 'The mod''s files are damaged') 'bad' $kSubFailed; return }
+    # The last answer from GitHub is older than $kRecheckMinutes: ask again first; the answer starts the game.
+    if (-not $NoUpdateCheck -and -not $kDevCopy -and ((Get-Date) - $script:lastCheck).TotalMinutes -ge $kRecheckMinutes) {
+        if ($script:updateBusy) { return }
+        $script:playAfterCheck = $true
+        CheckUpdate -Quiet
+        return
+    }
+    StartPlay
 })
 
-SetPlay 'play'
-SetStatus 'Ready to play' 'idle' $kSubIdle
-Say 'Press Play. The game starts with the mod.'
+# Until the first update check has answered (Shown starts it), Play waits.
+SetPlay $(if ($NoUpdateCheck -or $SnapshotPng) { 'play' } else { 'checking' })
+SetStatus (Tr 'Ready to play') 'idle' $kSubIdle
+Say (Tr 'Press Play. The game starts with the mod.')
+if (-not $SnapshotPng) { UpdateRecord }
 if ($script:readOnly) {
     Say $kReadOnlyText
     SetPlay 'blocked'
-    SetStatus 'This folder cannot be written' 'bad' 'Move the MK9 Rollback folder to e.g. C:\Games, then open it again.'
+    SetStatus (Tr 'This folder cannot be written') 'bad' (Tr 'Move the MK9 Rollback folder to e.g. C:\Games, then open it again.')
 }
 
 if ($SnapshotPng) {
     # What the picture shows: made-up lines, nothing is started.
+    $kSnapVersion = '20261231-1200'
     switch ($SnapshotState) {
-        'starting' { SetPlay 'busy'; SetStatus 'Starting the game...' 'busy' 'Steam is starting Mortal Kombat. This can take a minute.'; Say 'Starting Mortal Kombat through Steam...' }
+        'checking' { SetPlay 'checking' }
+        'starting' { SetPlay 'busy'; SetStatus (Tr 'Starting the game...') 'busy' (Tr 'Steam is starting Mortal Kombat. This can take a minute.'); Say (Tr 'Starting Mortal Kombat through Steam...') }
         'running' {
-            SetPlay 'running'; SetStatus 'Rollback is on' 'good' $kSubInGame
-            Say 'Starting Mortal Kombat through Steam...'; Say 'The game is running. Waiting for its menu...'; Say 'Mod loaded.'
-            Say 'Ready. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.'
-            Say 'Online fight found. Checking whether your opponent runs the mod...'; Say 'Both games run the mod.'
-            Say 'Input delay this match: 1 frame(s).'; Say 'Rollback on. You are player 1.'
-            $matchLabel.Text = 'Last match: input delay 1, ping 34 ms, 3 rollbacks a minute, always in sync.'
-            $hintLabel.Text = 'You are on Wi-Fi: a cable gives steadier fights.'
+            SetPlay 'running'; SetStatus (Tr 'Rollback is on') 'good' $kSubInGame
+            Say (Tr 'Starting Mortal Kombat through Steam...'); Say (Tr 'The game is running. Waiting for its menu...'); Say (Tr 'Mod loaded.')
+            Say (Tr 'Ready. In the game: Online > Player Match, a 1 vs 1 room or a King of the Hill room with just the two of you. Play anyone there.')
+            foreach ($l in @('ONLINE auto: the game''s online opponent is x', 'ONLINE: both games run MK9Rollback', 'ONLINE: input delay 1 agreed', 'ONLINE: this game controls player 1')) { Say (Get-LauncherMessage $l).Text }
+            $sf = New-MatchFacts; $sf.Delay = 1; $sf.Rtt = 34; $sf.Frames = 3600; $sf.Loads = 3; $sf.Fights = 1; $sf.Seen = $true
+            $matchLabel.Text = Format-MatchFacts $sf
+            $recordLabel.Text = Tr 'Score today: {0}. All time: {1}.' (Format-Tally ([pscustomobject]@{ Wins = 3; Losses = 2; Draws = 0 })) '41-38'
+            $hintLabel.Text = Tr 'You are on Wi-Fi: a cable gives steadier fights.'
         }
         'update' {
-            Say "UPDATE AVAILABLE: version 20261231-1200. Close the game, then press 'Update now'. Your opponent needs the same version."
-            ShowUpdateBanner '20261231-1200'
-            $backLink.Visible = $true
+            Say (Tr 'UPDATE: version {0} is out. It is installed now, by itself; your opponent needs it too.' $kSnapVersion); Say (Tr 'Downloading version {0}...' $kSnapVersion)
+            SetPlay 'updating'; ShowBanner (Tr 'Installing version {0}...' $kSnapVersion)
+            SetStatus (Tr 'Installing version {0}...' $kSnapVersion) 'busy' (Tr 'This window restarts by itself when the update is in. Then press Play.')
         }
-        'failed' { GoIdle -Failed; Say 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe. Press ''Having trouble?'' for what to try, then save the logs if it keeps failing.' }
+        'updatewait' {
+            Say (Tr 'UPDATE: version {0} is out. It is installed now, by itself; your opponent needs it too.' $kSnapVersion)
+            Say (Tr 'Close the game: version {0} then installs by itself. Your opponent needs it too.' $kSnapVersion)
+            SetPlay 'updatewait'; ShowBanner (Tr 'Version {0} is available: it installs once the game is closed' $kSnapVersion)
+            SetStatus (Tr 'Close the game to update') 'warn' (Tr 'The new version installs by itself once the game is closed. Then press Play.')
+        }
+        'updatefailed' {
+            Say (Tr 'UPDATE: version {0} is out. It is installed now, by itself; your opponent needs it too.' $kSnapVersion); Say (Tr 'Downloading version {0}...' $kSnapVersion)
+            Say (Tr 'The download failed: {0}. Nothing was changed.' 'The operation has timed out.')
+            Say (Tr 'Press Try again. Or download version {0} yourself from {1} and extract it over this folder.' $kSnapVersion "https://github.com/samuelndm/MK9Rollback/releases/tag/v$kSnapVersion")
+            SetPlay 'update'; ShowBanner (Tr 'Version {0} was not installed' $kSnapVersion) -Button
+            SetStatus (Tr 'The update was not installed') 'bad' (Tr 'The lines below say why. Play stays off until the new version is in: press the button to try again.')
+        }
+        'failed' { GoIdle -Failed; Say (Get-InjectFailureText $null $true) }
     }
     try { $form.NoActivate = $true } catch { }
     $form.ShowInTaskbar = $false

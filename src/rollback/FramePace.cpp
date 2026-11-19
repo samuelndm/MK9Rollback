@@ -93,6 +93,42 @@ bool ProcessCounters(DWORD* faults, SIZE_T* workingSet) {
 DWORD gFaultsAt = 0;  // the process's page fault count at the last boundary
 bool gFaultsValid = false;
 
+// ---- DRAWS lines (2026-11-16) ----
+// What became of every main-loop pass's picture. The delay-0 trial of 2026-11-15 simulated 60 frames a second and
+// presented 41 to 50, with no long frame in the PACE line, and every game start's first fight loses ~110 presents in
+// its first 10 s in every release since 2026-11-11: the PACE line counts the presents but not why one is missing.
+// Per pass (game thread, right after MK9's limiter): the limiter's verdict (late flag 0x00E844A5) and how long it
+// waited, from its entry time (double 0x00E0AB18) and the deadline it has just moved one period on (0x00E0AB10).
+// Per begin-drawing command (render thread, RenderTag): drawn, or left out by the game's late rule, or a replayed frame.
+volatile LONG gPresentTotal = 0;  // render thread: every present call since the start
+struct Draws {
+    uint32_t passes, late, noWait, odd;
+    double waitSumMs, waitMinMs;
+    RenderTag::Counts c0;
+    uint32_t present0;
+};
+Draws gDrawWin, gDrawSes, gDrawFree;  // a session's window, the session, and the passes outside a session
+volatile LONG gDrawStat = 0;          // 'drawstat 1': a line every 600 passes outside a session too
+void BeginDraws(Draws& d) {
+    memset(&d, 0, sizeof d);
+    d.waitMinMs = 1e9;
+    RenderTag::ReadCounts(&d.c0);
+    d.present0 = (uint32_t)gPresentTotal;
+}
+void PrintDraws(const char* tag, uint32_t gf, const Draws& d) {
+    if (!d.passes) return;
+    RenderTag::Counts c;
+    RenderTag::ReadCounts(&c);
+    const uint32_t timed = d.passes - d.odd;
+    Logger::Info("DRAWS %s gf=%u: %u passes, %u presented; begin-drawing commands queued %u; executed: live %u drawn + %u left out by "
+                 "the game's late rule (late flag set at %u of them), replayed %u left out + %u drawn; limiter: marked %u passes late, "
+                 "did not wait in %u, wait ms avg %.2f min %.2f%s",
+                 tag, gf, d.passes, (uint32_t)gPresentTotal - d.present0, c.queued - d.c0.queued, c.liveDrawn - d.c0.liveDrawn,
+                 c.liveSkipped - d.c0.liveSkipped, c.liveLateSeen - d.c0.liveLateSeen, c.replaySkipped - d.c0.replaySkipped,
+                 c.replayDrawn - d.c0.replayDrawn, d.late, d.noWait, timed ? d.waitSumMs / timed : 0.0, timed ? d.waitMinMs : 0.0,
+                 d.odd ? " (some passes had no limiter reading)" : "");
+}
+
 void Begin(Stats& s) {
     memset(&s, 0, sizeof s);
     s.t0 = Now();
@@ -229,9 +265,42 @@ int64_t Now() {
     return t.QuadPart;
 }
 
+void Pass() {
+    const bool late = *reinterpret_cast<const volatile uint8_t*>(0x00E844A5) != 0;
+    // The limiter left the deadline one period after the one it waited for (or found passed); the mod's own moves of
+    // it come later in this pass. Positive: it waited that long. Negative: the pass began that late.
+    const double waitMs = (*reinterpret_cast<const volatile double*>(0x00E0AB10) - 1.0 / 60.0 -
+                           *reinterpret_cast<const volatile double*>(0x00E0AB18)) * 1000.0;
+    const bool odd = !(waitMs > -500.0 && waitMs < 500.0);  // a pass the limiter did not time (a load, the other branch)
+    for (Draws* d : {&gDrawWin, &gDrawSes, &gDrawFree}) {
+        ++d->passes;
+        if (late) ++d->late;
+        if (odd) {
+            ++d->odd;
+            continue;
+        }
+        if (waitMs <= 0) ++d->noWait;
+        d->waitSumMs += waitMs;
+        if (waitMs < d->waitMinMs) d->waitMinMs = waitMs;
+    }
+    if (gDrawFree.passes >= 600) {
+        if (gDrawStat && !LiveAt()) PrintDraws("(no session)", 0, gDrawFree);
+        BeginDraws(gDrawFree);
+    }
+}
+
+void SetDrawStat(bool on) {
+    InterlockedExchange(&gDrawStat, on ? 1 : 0);
+    BeginDraws(gDrawFree);
+    Logger::Info("DRAWSTAT %d: DRAWS lines %s", on ? 1 : 0,
+                 on ? "every 600 passes outside a session too" : "in sessions only (with each PACE line)");
+}
+
 void SessionStart() {
     Begin(gSes);
     Begin(gWin);
+    BeginDraws(gDrawSes);
+    BeginDraws(gDrawWin);
     InterlockedExchange(&gPresentMaxUs, 0);
     gLast = 0;
     memset(gFramePart, 0, sizeof gFramePart);
@@ -367,6 +436,8 @@ void Report(uint32_t gf) {
     if (mx > gSes.presentMaxUs) gSes.presentMaxUs = mx;
     Print("window", gf, gWin);
     Begin(gWin);
+    PrintDraws("window", gf, gDrawWin);
+    BeginDraws(gDrawWin);
 }
 
 void SessionReport(const char* why) {
@@ -374,6 +445,7 @@ void SessionReport(const char* why) {
     const LONG mx = InterlockedExchange(&gPresentMaxUs, 0);
     if (mx > gSes.presentMaxUs) gSes.presentMaxUs = mx;
     if (gSes.frames) Print(why, 0, gSes);
+    if (gSes.frames) PrintDraws(why, 0, gDrawSes);
     LimiterReport(why);
     if (gSesCoreFrames)
         Logger::Info("CORES %s: %u of %u live frame intervals had the game thread on an efficiency core at a sample", why, gSesEFrames,
@@ -639,6 +711,7 @@ void DefaultStallSample(int ms) {
 void OnPresent() {
     static int64_t last = 0;  // render thread only
     gRenderThread = GetCurrentThreadId();
+    InterlockedIncrement(&gPresentTotal);
     const int64_t t = Now();
     if (last) {
         const int64_t us = (t - last) * 1000000 / Freq();

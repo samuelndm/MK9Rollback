@@ -15,6 +15,9 @@
 //   save snapshot[g], apply recorded/corrected inputs for g, call vt+0xBC(dt) and
 //   vt+0xC0(dt) (the pair TimedEngineFrame 0x004025A0 calls), flush object events, then
 //   advance HostFrame/GameFrame exactly as the main loop does.
+namespace ReplayFile {
+struct Replay;
+}
 namespace Rollback {
 
 extern bool gIsResimulating;
@@ -75,6 +78,17 @@ bool SetSessionDelay(int delay);  // the running P2P session's local input delay
 int SessionDelay();               // that delay now (0 without a running P2P session)
 bool NetplayStarting();  // paused at the first fight frame, waiting for the peer's session
 bool NetplayArmed();     // a netplay session starts at the next fight start
+// Replays (net\ReplayKeeper.h): the playback of a recorded session in an offline fight, started at the next fight's first
+// frame as a session starts there, then one recorded frame per tick with its checksum compared (RollbackManager.cpp has
+// how). PlaybackRefusal: why no playback can be armed now (null: it can). PlaybackArm: the recording must stay in memory
+// until the playback is over; like: its frames run as a session's ('replay like'). PlaybackRunning: the recording drives
+// both fighters (no pause, no other input reaches them). PlaybackPending: armed, or its first fight frame has run.
+const char* PlaybackRefusal();
+bool PlaybackArm(const ReplayFile::Replay* r, bool like);
+void PlaybackStop(const char* why);
+bool PlaybackRunning();
+bool PlaybackPending();
+void PlaybackStatus();  // 'replay status': log lines
 void NetplayDisarm();    // cancel that (online mode: the match is over)
 void NetplayStop(const char* why);  // stop a running P2P session (the online mode disengaged)  // 'resimsleep N'
 void SetForceLod(bool on);  // 'forcelod 0|1': fighters' skeletal LOD forced to 0 (render-independent bone set)  // 'rbtwice 0|1': replay each local rollback window twice and compare  // clamp unrestored anim-node tick tags at load (command "animtagfix 0|1")

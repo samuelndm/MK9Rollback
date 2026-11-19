@@ -360,9 +360,12 @@ struct Verdict {
     uint8_t entry = kNoChoice;  // kStage: the stage table entry
 };
 // needConfirmed: for anything written into the game (the settings message). The panel's own display asks without it.
-inline Verdict Judge(const Exchange& x, const Table& t, bool needConfirmed) {
+// context: what the exchange was opened under, as this game computes it now. The table's own for the stage screen; a
+// re-fight that keeps its fighters opens under RefightVote::ExchangeContext and must be judged against the same.
+// (v20261114-1451 judged it against the table's own: both games agreed and each then refused the agreement.)
+inline Verdict Judge(const Exchange& x, const Table& t, bool needConfirmed, uint32_t context) {
     Verdict v;
-    if (x.contextDiffers || x.context != t.Context()) {
+    if (x.contextDiffers || x.context != context) {
         v.why = Why::kContextDiffers;
         return v;
     }
@@ -393,6 +396,7 @@ inline Verdict Judge(const Exchange& x, const Table& t, bool needConfirmed) {
     v.entry = r.choice;
     return v;
 }
+inline Verdict Judge(const Exchange& x, const Table& t, bool needConfirmed) { return Judge(x, t, needConfirmed, t.Context()); }
 
 inline const char* WhyText(Why w) {
     switch (w) {

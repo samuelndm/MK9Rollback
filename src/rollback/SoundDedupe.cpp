@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <vector>
 
 #include "../debug/Logger.h"
@@ -12,6 +13,9 @@
 namespace {
 constexpr uintptr_t kSlot = 0x00D5E440;  // vt 0x00D5E420 + 0x20
 constexpr uintptr_t kPlay = 0x00921200;
+constexpr uintptr_t kSlotB = 0x00D5E43C;  // vt + 0x1C: the play method of script sound native 0x008E1740
+constexpr uintptr_t kPlayB = 0x00921360;  // (thiscall, 7 stack arguments, ret 0x1C, -1 for "nothing played", as kPlay)
+constexpr uint32_t kNoSound = 0xFFFFFFFF;
 constexpr int kSlots = 32;  // frames remembered (> rollback window)
 constexpr int kNearMax = 4;
 constexpr int kLateFrames = 3;  // a new sound this many frames behind its own frame is counted as audibly late
@@ -40,6 +44,44 @@ struct Totals {
 Totals gSession{};
 
 using PlayFn = uint32_t(__thiscall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+
+// Quiet: asked for by the game thread, read by whichever thread plays a sound.
+volatile LONG gQuietOn = 0, gQuietEnd = 0, gQuietHeld = 0;
+bool gInstalledB = false;
+constexpr int kQuietNames = 24;
+char gQuietName[kQuietNames][72];
+volatile LONG gQuietNamed = 0, gQuietStart = 0;
+bool QuietLive() { return gQuietOn && (LONG)((DWORD)gQuietEnd - GetTickCount()) > 0; }
+
+// A sound that is not started while quiet is asked for: counted, and the first few named (arg2 == 0: arg1 is the
+// cue's name; else the two values). slot: 'a' the method at +0x20, 'b' the one at +0x1C.
+void NoteQuiet(uint32_t a1, uint32_t a2, char slot) {
+    InterlockedIncrement(&gQuietHeld);
+    const LONG i = InterlockedIncrement(&gQuietNamed) - 1;
+    if (i < 0 || i >= kQuietNames) return;
+    char* out = gQuietName[i];
+    const size_t cap = sizeof gQuietName[0];
+    const uint32_t at = GetTickCount() - (DWORD)gQuietStart;  // ms since this quiet began
+    MEMORY_BASIC_INFORMATION mbi;
+    const bool readable = a1 >= 0x10000 && VirtualQuery(reinterpret_cast<void*>(a1), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+                          !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+    const uintptr_t end = readable ? reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize : 0;
+    if (slot == 'a' && a2 == 0 && readable) {
+        const char* s = reinterpret_cast<const char*>(a1);
+        int n = 0;
+        for (; n < 36 && a1 + n < end && s[n]; ++n) out[n] = s[n] >= 0x20 && s[n] < 0x7F && s[n] != ',' ? s[n] : '?';
+        snprintf(out + n, cap - (size_t)n, ":a@%u", at);
+        return;
+    }
+    // The method at +0x1C is not given a name (2026-11-14, one game: its first argument points at a record whose
+    // second value differs from sound to sound): the record's first values, for telling one sound from another.
+    if (readable && a1 + 16 <= end) {
+        const uint32_t* d = reinterpret_cast<const uint32_t*>(a1);
+        snprintf(out, cap, "%c@%u:%X/%X>%08X.%08X.%08X.%08X", slot, at, a1, a2, d[0], d[1], d[2], d[3]);
+        return;
+    }
+    snprintf(out, cap, "%c@%u:%X/%X", slot, at, a1, a2);
+}
 
 uint32_t GameFrame() { return *reinterpret_cast<const uint32_t*>(*reinterpret_cast<const uint32_t*>(0x00DEF4B4) + 0x70); }
 
@@ -99,9 +141,21 @@ bool TakeOriginal(uint32_t gf, uint32_t key, uint32_t arg2, uint32_t* handle) {
 }  // namespace
 
 // fastcall with a dummy EDX = thiscall with 7 stack arguments (callee pops 0x1C).
+extern "C" uint32_t __fastcall MK9R_SoundPlayB(void* self, void* /*edx*/, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
+                                               uint32_t a5, uint32_t a6, uint32_t a7) {
+    if (QuietLive()) {
+        NoteQuiet(a1, a2, 'b');
+        return kNoSound;
+    }
+    return reinterpret_cast<PlayFn>(kPlayB)(self, a1, a2, a3, a4, a5, a6, a7);
+}
 extern "C" uint32_t __fastcall MK9R_SoundPlay(void* self, void* /*edx*/, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4,
                                               uint32_t a5, uint32_t a6, uint32_t a7) {
     const PlayFn play = reinterpret_cast<PlayFn>(kPlay);
+    if (QuietLive()) {
+        NoteQuiet(a1, a2, 'a');
+        return kNoSound;
+    }
     if (GetCurrentThreadId() != ObjectHooks::gGameThread || !Rollback::Enabled()) return play(self, a1, a2, a3, a4, a5, a6, a7);
     const uint32_t gf = GameFrame();
     const uint32_t key = KeyOf(a1, a2);
@@ -128,7 +182,38 @@ bool Install() {
     if (gInstalled) return true;
     gInstalled = HookManager::PatchPointer(kSlot, kPlay, reinterpret_cast<void*>(&MK9R_SoundPlay), "SoundObject vt+0x20 (play)");
     if (!gInstalled) Logger::Info("SOUNDDEDUPE: slot 0x00D5E440 not as expected; resimulated sounds play twice");
+    // The second play method only for the quiet of a re-fight's hidden character select; nothing else changes on it.
+    if (!gInstalledB) {
+        gInstalledB = HookManager::PatchPointer(kSlotB, kPlayB, reinterpret_cast<void*>(&MK9R_SoundPlayB), "SoundObject vt+0x1C (play)");
+        if (!gInstalledB) Logger::Info("SOUNDDEDUPE: slot 0x00D5E43C not as expected; sounds played through it are not held back while quiet is asked for");
+    }
     return gInstalled;
+}
+
+void Quiet(uint32_t keepMs) {
+    const DWORD now = GetTickCount();
+    InterlockedExchange(&gQuietEnd, (LONG)(now + (keepMs ? keepMs : 1)));
+    if (!InterlockedExchange(&gQuietOn, 1)) InterlockedExchange(&gQuietStart, (LONG)now);
+}
+void QuietOff() { InterlockedExchange(&gQuietOn, 0); }
+uint32_t QuietTake(char* out, size_t cap) {
+    const uint32_t held = (uint32_t)InterlockedExchange(&gQuietHeld, 0);
+    LONG named = InterlockedExchange(&gQuietNamed, kQuietNames);  // (no name is begun while these are read)
+    if (named > kQuietNames) named = kQuietNames;
+    if (out && cap) {
+        size_t n = 0;
+        out[0] = 0;
+        for (LONG i = 0; i < named; ++i) {
+            const int w = snprintf(out + n, cap - n, "%s%s", i ? ", " : "", gQuietName[i]);
+            if (w < 0 || (size_t)w >= cap - n) {
+                out[n] = 0;
+                break;
+            }
+            n += (size_t)w;
+        }
+    }
+    InterlockedExchange(&gQuietNamed, 0);
+    return held;
 }
 
 void BeginResim(uint32_t S, uint32_t F) {

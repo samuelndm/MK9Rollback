@@ -56,6 +56,8 @@
 #include "OnlineKeep.h"
 #include "../net/HelloProto.h"
 #include "../net/OnlineMode.h"
+#include "../net/ReplayFile.h"
+#include "../net/ReplayKeeper.h"
 #include "../net/StartSync.h"
 #include "../net/SteamBridge.h"
 
@@ -2322,8 +2324,21 @@ bool __cdecl GgpoSaveState(unsigned char** buffer, int* len, int* checksum, int 
     if (gGgpoIsP2P) {  // machine-independent: GameFrame differs between peers
         GameplayState x = gp;
         x.gameFrame = 0;
-        CsRecord(gf, StateHash::XXH32(&x, sizeof x, 0), x);
+        const uint32_t cs = StateHash::XXH32(&x, sizeof x, 0);
+        CsRecord(gf, cs, x);
         const uint32_t rel = gf - CsStartGf();
+        // The replay's checksum of this frame (net\ReplayKeeper.h): a replay's save overwrites the live one, as above.
+        if (gf >= CsStartGf()) {
+            ReplayFile::State st;
+            const bool sample = rel % ReplayFile::kStateEvery == 0;
+            if (sample) {
+                memcpy(st.life, x.life, sizeof st.life);
+                memcpy(st.pos, x.pos, sizeof st.pos);
+                memcpy(st.meter, x.meter, sizeof st.meter);
+                st.rng = x.rng;
+            }
+            ReplayKeeper::RecChecksum(rel, cs, sample ? &st : nullptr);
+        }
         if (!Rollback::gIsResimulating && gf >= CsStartGf() && (rel < 4 || rel % 300 == 0))
             Logger::Info("NETPLAY STATE frame %u: life %.4f %.4f pos %.3f %.3f %.3f / %.3f %.3f %.3f meter %.4f %.4f rng %08X", rel, x.life[0], x.life[1],
                          x.pos[0][0], x.pos[0][1], x.pos[0][2], x.pos[1][0], x.pos[1][1], x.pos[1][2], x.meter[0], x.meter[1], x.rng);
@@ -2396,6 +2411,7 @@ bool __cdecl GgpoAdvanceFrame(int) {
     const uint32_t g = GameFrame();
     const int64_t tr = FramePace::Now();
     ResimFrame(gGgpoEngine, gGgpoDt, g, (int)(gGgpoLiveF - gGgpoLoadedS), in);
+    if (gGgpoIsP2P && g >= CsStartGf()) ReplayKeeper::RecInputs(g - CsStartGf(), CsStartGf(), in[0], in[1]);  // corrects the live frame's
     if (gGgpoIsP2P) TickSpin();
     FramePace::Add(FramePace::kReplayTick, FramePace::Now() - tr);
     const bool restarted = GameFrame() != g;
@@ -2474,6 +2490,143 @@ void NetplayFrameEvents(uint32_t F) {
 }
 uint32_t gLocalRaw = 0, gSyncMasks[2] = {0, 0};
 bool gLocalScripted = false;  // gLocalRaw holds a scripted (harness) mask taken at the last RecordInputs
+
+// ---- Replays: the playback of a recorded session in an offline fight (net\ReplayKeeper.h, net\ReplayFile.h) ----
+// Armed by 'replay last|<file>' (ReplayKeeper gives the fight the recording's fighters and arena), it takes the netplay
+// start's path at the next fight's first frame: GameFrame renumbered to gNetplayGf, the fighters' stamps rebased, the
+// script clock on its fixed bases, RNG A / B and the script stream seeded, the fighters' input history cleared, the AI
+// drones removed (OnTickEntry, as for a session). Where a session pauses there and waits for the other game, the
+// playback goes on: the seeds are applied once more at the next tick, which is its frame 0 as the first unpaused tick is
+// a session's (gNetplaySeedPin). From there each tick is one recorded frame: its checksum is taken where a session's
+// save of that frame took it (PlaybackBoundary, at the boundary) and compared with the recording's, and its two masks
+// are applied once each at the engine tick's entry (RecordInputs), as a session applies its synchronized ones.
+// 'replay like 1' (the start): the frames run as a session's live frames do, effect actors' deaths deferred and freed
+// blocks quarantined (a session's saves make both happen, and a recording was made under them); 0: as any offline fight.
+// The playback ends with its recording, when the game leaves the fight (a state other than 8, the fight, and 11, its
+// finisher), at a timeline restart, or on 'replay stop'; the pads go back to the controllers.
+const ReplayFile::Replay* gPlay = nullptr;
+bool gPlayArmed = false;     // waits for the next fight's first frame
+bool gPlayStarting = false;  // that frame has run (the netplay start's tick): the next tick is frame 0
+bool gPlayRunning = false;   // the recording drives both fighters
+bool gPlayLike = true;       // 'replay like 0|1'
+uint32_t gPlayStartGf = 0, gPlayGuessed = 0, gPlayOffLogs = 0, gPlayBackLogs = 0;
+ReplayFile::Compare gPlayCmp;
+bool PlayLike() { return gPlayLike && (gPlayStarting || gPlayRunning); }
+
+void PlayStateText(const ReplayFile::State& s, char* out, size_t n) {
+    snprintf(out, n, "life %.4f %.4f pos %.3f %.3f %.3f / %.3f %.3f %.3f meter %.4f %.4f rng %08X", s.life[0], s.life[1], s.pos[0][0],
+             s.pos[0][1], s.pos[0][2], s.pos[1][0], s.pos[1][1], s.pos[1][2], s.meter[0], s.meter[1], s.rng);
+}
+
+void PlaybackEnd(const char* why) {
+    if (!gPlayArmed && !gPlayStarting && !gPlayRunning) return;
+    const bool ran = gPlayRunning, started = gPlayStarting || gPlayRunning;
+    const uint32_t played = ran ? GameFrame() - gPlayStartGf : 0;
+    gPlayArmed = gPlayStarting = gPlayRunning = false;
+    if (!gNetplayArmed) {
+        gNetplayAwaitFight = gNetplayStartNow = false;
+        if (started) gNetplaySeedPin = false;
+    }
+    if (ran) Input::ReleaseAll();  // the fighters' pads go back to the controllers
+    if (!gPlay) return;
+    const ReplayFile::Replay& r = *gPlay;
+    const ReplayFile::Compare& c = gPlayCmp;
+    char first[96] = "no frame differed";
+    if (c.firstOff != 0xFFFFFFFF) snprintf(first, sizeof first, "the first one that differed was frame %u (%.1f s in)", c.firstOff, c.firstOff / 60.0);
+    if (!ran)
+        Logger::Info("REPLAY over (%s) before it began%s", why, started ? " (its first fight frame had run)" : "");
+    else
+        Logger::Info("REPLAY over (%s): %u of the recording's %u frames played (%u of them with guessed inputs); checksums: %u compared, %u the "
+                     "same, %u different; state samples: %u compared, %u the same; %s. VERDICT: %s",
+                     why, played, r.frames, gPlayGuessed, c.compared, c.same, c.differ, c.statesCompared, c.statesSame, first,
+                     c.compared + c.statesCompared == 0 ? "nothing could be compared"
+                     : c.firstOff == 0xFFFFFFFF          ? (played >= r.frames ? "THE SAME FIGHT to its end" : "the same fight as far as it was played")
+                                                        : "OUT OF STEP with the recording");
+    ReplayKeeper::OnPlaybackEnd(why);
+}
+
+// At the boundary of playback frame n = F - start (where a session's save of frame n takes its checksum): the comparison.
+void PlaybackBoundary(uint32_t F) {
+    const ReplayFile::Replay& r = *gPlay;
+    const uint32_t n = F - gPlayStartGf;
+    if (n > r.frames) return PlaybackEnd("past the recording's end");
+    // The Ladder gives P2 an AI drone each round (the only writer of an AI pad); in the fight update it would answer the
+    // recorded inputs with its own. An online session has none: removed here, at the boundary, as the netplay start removes
+    // the first round's.
+    if (const int ai = CommandChannel::KillAiDrones())
+        Logger::Info("REPLAY: %d AI drone(s) removed at gf=%u (frame %u): only the recording drives the fighters", ai, F, n);
+    // A test session's 'netplaymeter' / 'netplaylife' (NetplayFrameEvents): the same writes at the same frame, before its checksum.
+    if (F == gNetplayGf + kNetplayMeterRel && (r.setup.testMeter >= 0 || r.setup.testLife >= 0)) {
+        for (int p = 0; p < 2; ++p) {
+            if (r.setup.testMeter >= 0) *reinterpret_cast<float*>(0x00E89D7C + 0xC8C * p + 0xC14) = r.setup.testMeter;
+            if (r.setup.testLife >= 0) {
+                const Fighter::State f = Fighter::Read(p);
+                if (f.obj) *reinterpret_cast<float*>(f.obj + 0x78C0) = r.setup.testLife;
+            }
+        }
+        Logger::Info("REPLAY the recording's test settings applied at gf=%u as its session did: meters %.4f, lives %.4f", F, r.setup.testMeter,
+                     r.setup.testLife);
+    }
+    GameplayState g = CaptureGameplay();
+    g.gameFrame = 0;
+    const uint32_t cs = StateHash::XXH32(&g, sizeof g, 0);
+    ReplayFile::State live;
+    memcpy(live.life, g.life, sizeof live.life);
+    memcpy(live.pos, g.pos, sizeof live.pos);
+    memcpy(live.meter, g.meter, sizeof live.meter);
+    live.rng = g.rng;
+    const ReplayFile::Compare::Verdict v = gPlayCmp.Frame(r, n, cs, live);
+    char now[200], rec[200] = "none recorded at this frame";
+    if (v == ReplayFile::Compare::kFirstOff || (v == ReplayFile::Compare::kOff && gPlayOffLogs < 12 && n % 60 == 0)) {
+        ++gPlayOffLogs;
+        PlayStateText(live, now, sizeof now);
+        uint8_t kind = 0;
+        if (const ReplayFile::State* s = ReplayFile::Compare::SampleAt(r, n, &kind)) {
+            PlayStateText(*s, rec, sizeof rec);
+            if (kind == ReplayFile::kStateApprox) snprintf(rec + strlen(rec), sizeof rec - strlen(rec), " (rounded, from a log line)");
+        }
+        char inputs[160] = "";
+        int k = 0;
+        for (uint32_t i = n >= 4 ? n - 4 : 0; i < n && i < r.frames; ++i)
+            k = AppendF(inputs, sizeof inputs, k, " %u:%X/%X%s", i, r.mask[i][0], r.mask[i][1], (r.have[i] & ReplayFile::kHaveInputs) ? "" : "?");
+        const bool hasCs = n <= r.frames && (r.have[n] & ReplayFile::kHaveChecksum);
+        Logger::Info("REPLAY %s at frame %u (gf %u, %.1f s in): checksum %08X, recorded %s%08X; now %s; recorded: %s; the inputs before it "
+                     "(frame:P1/P2, ? = guessed):%s",
+                     v == ReplayFile::Compare::kFirstOff ? "OUT OF STEP for the first time" : "still out of step", n, F, n / 60.0, cs,
+                     hasCs ? "" : "(none) ", hasCs ? r.cs[n] : 0, now, rec, inputs[0] ? inputs : " none");
+    } else if (v == ReplayFile::Compare::kBack && gPlayBackLogs < 12) {
+        ++gPlayBackLogs;
+        Logger::Info("REPLAY in step again at frame %u (gf %u) after differing frames (the last at frame %u)", n, F, gPlayCmp.lastOff);
+    }
+    if (n && n % 600 == 0)
+        Logger::Info("REPLAY frame %u of %u: checksums %u compared, %u the same, %u different; state samples %u of %u the same", n, r.frames,
+                     gPlayCmp.compared, gPlayCmp.same, gPlayCmp.differ, gPlayCmp.statesSame, gPlayCmp.statesCompared);
+    if (n >= r.frames) return PlaybackEnd("the recording is over");
+    const uint32_t gi = *reinterpret_cast<const uint32_t*>(kGameInfoPtr);
+    const uint32_t state = gi ? *reinterpret_cast<const uint32_t*>(gi + 0x4) : 0;
+    if (state != 8 && state != 11) {
+        char why[64];
+        snprintf(why, sizeof why, "the game left the fight (game state %u)", state);
+        PlaybackEnd(why);
+    }
+}
+
+// Engine tick entry of playback frame n: both recorded masks, once each, as a session applies its synchronized ones.
+void PlaybackInputs(uint32_t gf, InputFrame& in) {
+    const ReplayFile::Replay& r = *gPlay;
+    const uint32_t n = gf - gPlayStartGf;
+    uint32_t m[2] = {0, 0};
+    if (n < r.frames) {
+        m[0] = r.mask[n][0];
+        m[1] = r.mask[n][1];
+        if (!(r.have[n] & ReplayFile::kHaveInputs)) ++gPlayGuessed;
+    }
+    for (int p = 0; p < 2; ++p) {
+        Input::OverridePlayerInput(p, {m[p]});
+        in.mask[p] = m[p];
+        in.valid[p] = true;
+    }
+}
 int gTimesyncFrames = 0, gBarrierWaits = 0, gP2PFrames = 0;
 int gTimesyncDebt = 0, gTimesyncEvents = 0;  // frames still to give the remote; GGPO time-sync events this session
 // 'paysmooth N': the debt paid by moving the frame limiter's deadline N ms per frame (0: 16 ms waits). Default 2 since
@@ -2813,6 +2966,7 @@ void GgpoStop(const char* why) {
     gGgpoFrameOpen = false;
     OnlineKeep::OnSessionEnd();
     if (gGgpoIsP2P) {
+        ReplayKeeper::RecEnd(why);  // written at the first engine tick without a session
         Input::SetLocalCapture(false);
         Input::ReleaseAll();  // the fighters' pads go back to the local controllers (they held the last network input)
         CsClose();
@@ -3017,6 +3171,10 @@ bool GgpoStartP2P(const P2PConfig& c) {
     Logger::Info("GGPO p2p started at gf=%u (%s): local port %u, player %d, remote %s:%u, frame delay %d", GameFrame(),
                  gLockstep ? "LOCKSTEP" : "rollback", c.localPort, c.player, c.ip, c.remotePort, delay);
     CsOpen(c.ip, c.localPort, c.remotePort);
+    // The replay of this session (net\ReplayKeeper.h): only one that began at a fight's first frame with the netplay start,
+    // the fixed state a playback can start from again (this game is paused there, waiting for the other one).
+    ReplayKeeper::RecBegin((uint32_t)c.player, (uint32_t)gGgpoDelay, GameFrame(),
+                           gNetplayWaitRunning && gNetplayGf && GameFrame() == gNetplayGf, Online::Engaged(), gNetplayMeter, gNetplayLife);
     return true;
 }
 
@@ -4018,6 +4176,42 @@ bool SetSessionDelay(int delay) { return SetSessionDelayImpl(delay); }
 int SessionDelay() { return gGgpo && gGgpoIsP2P && gGgpoRunning ? gGgpoDelay : 0; }
 bool NetplayStarting() { return gNetplayWaitRunning; }
 bool NetplayArmed() { return gNetplayArmed; }
+const char* PlaybackRefusal() {
+    if (!gEnabled || !gTick) return "rollback mode is off (the launcher's 'netcode rollback' switches it on)";
+    if (gLockstep || !gRollbackModules) return "the rollback patch set is not installed ('netcode rollback')";
+    if (gGgpo || gNetplayArmed || gNetplayWaitRunning || gP2PPending) return "a rollback session is armed or running (an online match)";
+    if (!gNetplayGf) return "'netplaygf 0': the fight's frames would not be renumbered as a session's are";
+    return nullptr;
+}
+bool PlaybackArm(const ReplayFile::Replay* r, bool like) {
+    if (const char* no = PlaybackRefusal()) {
+        Logger::Info("REPLAY not armed: %s", no);
+        return false;
+    }
+    if (!r || r->frames == 0 || r->setup.netplayGf != gNetplayGf) {
+        Logger::Info("REPLAY not armed: %s", !r || !r->frames ? "the recording has no frames" : "the recording's start frame is not this mod's");
+        return false;
+    }
+    PlaybackEnd("another playback was armed");
+    gPlay = r;
+    gPlayLike = like;
+    gPlayArmed = true;
+    gPlayCmp.Reset();
+    // A fight already under way waits for its timeline to end, as an armed session does: the next fight's first frame.
+    gNetplayAwaitFight = false;
+    return true;
+}
+void PlaybackStop(const char* why) { PlaybackEnd(why); }
+bool PlaybackRunning() { return gPlayRunning; }
+bool PlaybackPending() { return gPlayArmed || gPlayStarting; }
+void PlaybackStatus() {
+    Logger::Info("REPLAY status: %s", gPlayRunning ? "playing" : gPlayStarting ? "its first fight frame has run" : gPlayArmed ? "armed, waiting for a fight's first frame" : "no playback");
+    if (gPlayRunning && gPlay)
+        Logger::Info("REPLAY frame %u of %u; checksums %u compared, %u the same, %u different (first at %d); state samples %u of %u the same; "
+                     "%u frames with guessed inputs so far",
+                     GameFrame() - gPlayStartGf, gPlay->frames, gPlayCmp.compared, gPlayCmp.same, gPlayCmp.differ,
+                     gPlayCmp.firstOff == 0xFFFFFFFF ? -1 : (int)gPlayCmp.firstOff, gPlayCmp.statesSame, gPlayCmp.statesCompared, gPlayGuessed);
+}
 void NetplayDisarm() {
     if (!gNetplayArmed && !gNetplayWaitRunning) return;
     const bool waiting = gNetplayWaitRunning, awaiting = gNetplayAwaitFight;
@@ -4839,6 +5033,7 @@ void PublishOverlay() {
 }
 
 bool OnTickEntry(void* engine, float dt) {
+    FramePace::Pass();  // DRAWS lines: the limiter's verdict on this pass, before anything here moves its deadline
     // Frame pacing (PACE lines): the interval between live, unpaused P2P boundaries. 'tickspin N' adds N ms of CPU work
     // to each such frame here (and to each replayed one): a slower PC for the two-instance tests.
     if (gGgpo && gGgpoIsP2P && gGgpoRunning && !*reinterpret_cast<const uint32_t*>(0x00E43054)) {
@@ -4904,6 +5099,12 @@ bool OnTickEntry(void* engine, float dt) {
                 CommandChannel::RequestPause(0);
             }
             GgpoStop("timeline restart");
+            if (gPlayStarting || gPlayRunning) {
+                // A session never sees one: its fight's GameFrame runs on through every round to the match's end.
+                char why[96];
+                snprintf(why, sizeof why, "the game restarted its frame count (GameFrame %u after %u), which an online match never does", F0, lastF);
+                PlaybackEnd(why);
+            }
             gListAuditBroken = gHeapAuditBroken = false;  // audits report once per timeline
             if (gFixSeed) {  // reproducible test fights ('fixseed <hex>'): both RNGs from a fixed seed at every timeline start
                 *reinterpret_cast<uint32_t*>(0x00E7C054) = gFixSeed;
@@ -4912,7 +5113,7 @@ bool OnTickEntry(void* engine, float dt) {
             }
             // GameFrame also resets at menu/attract map loads: the session starts at the first frame of
             // this timeline that follows a fight update and has a snapshot (the same frame on both peers).
-            if (gNetplayArmed) gNetplayAwaitFight = true;
+            if (gNetplayArmed || gPlayArmed) gNetplayAwaitFight = true;  // a replay's playback starts as a session does
             // 'netplayload 1': start at the timeline restart itself (map load), so the intro also runs in lockstep;
             // the first fight frame depends on how long each game's intro took (two-instance test, 2026-10-18).
             if (gNetplayArmed && gNetplayFromLoad) gNetplayStartNow = true;
@@ -5111,6 +5312,20 @@ bool OnTickEntry(void* engine, float dt) {
         }
     }
     NetplayFrameEvents(F);  // before frame F's save (live or lazy)
+    // A replay's playback: the tick after its start's is frame 0 (the seeds were applied again just above); each tick from
+    // there is compared with the recording at the point where a session's save of the frame takes its checksum.
+    if (gPlayStarting && !netplayStart && !*reinterpret_cast<const uint32_t*>(0x00E43054)) {
+        gPlayStarting = false;
+        gPlayRunning = true;
+        gPlayStartGf = F;
+        gPlayGuessed = gPlayOffLogs = gPlayBackLogs = 0;
+        gPlayCmp.Reset();
+        Logger::Info("REPLAY frame 0 at gf=%u: the recording drives both fighters from here (%u frames, %s)", F, gPlay ? gPlay->frames : 0,
+                     gPlayLike ? "run as a session's frames are: effect actors' deaths deferred, freed blocks quarantined ('replay like 1')"
+                               : "run as an offline fight's ('replay like 0')");
+        ReplayKeeper::OnPlaybackStart();
+    }
+    if (gPlayRunning && gPlay) PlaybackBoundary(F);
     // Lazy live save in a running P2P rollback session (after its frame 0): GgpoBoundaryP2P saves F after its first poll
     // unless a replay there saved F (gLazySave).
     const bool lazy = snapshotting && gLazySave && gGgpo && gGgpoIsP2P && gGgpoRunning && !gLockstep && !netplayStart && gP2PFrames > 0;
@@ -5134,7 +5349,18 @@ bool OnTickEntry(void* engine, float dt) {
         Logger::Info("ONLINE: this game controls player %d in the online fight%s", gP2P.player,
                      side ? "" : " (side not found in the game's pad lists; keeping the armed side)");
     }
-    if (netplayStart && (saved || gLockstep)) {
+    if (netplayStart && (saved || gLockstep) && gPlayArmed && !gNetplayArmed) {
+        // A replay's playback: the same start, no other game to wait for. The seeds are applied again at the next tick
+        // (gNetplaySeedPin), as at a session's first unpaused tick, and that tick is the recording's frame 0.
+        gNetplayAwaitFight = gNetplayStartNow = false;
+        gPlayArmed = false;
+        gPlayStarting = true;
+        gNetplaySeedPin = true;
+        const GameplayState g = CaptureGameplay();
+        Logger::Info("REPLAY first fight frame gf=%u: started as an online session starts (RNG A/B and the script stream seeded, the fighters' "
+                     "input history cleared); the recording's frame 0 is the next frame; after the first update P1 x %.3f, P2 x %.3f",
+                     F, g.pos[0][1], g.pos[1][1]);
+    } else if (netplayStart && (saved || gLockstep)) {
         gNetplayAwaitFight = false;
         gNetplayStartNow = false;
         CommandChannel::RequestPause(1);
@@ -5178,14 +5404,16 @@ bool OnTickEntry(void* engine, float dt) {
     // Deferring effect-actor destruction keeps actors ticking with a freed MK owner; only worth it while a rollback
     // can actually happen. Two fight-start crashes (0x0042AF1D, the global MK list broken one frame after four
     // deferrals, synctest58/74) came before the fight's GGPO session had started. 'deferggpo 0' = defer always.
-    ActorDefer::SetActive(saved && (gGgpo || !gDeferOnlyGgpo));
-    CinemaRestore::SetActive(saved && (gGgpo || !gDeferOnlyGgpo));
+    // A replay played as a session ('replay like 1', PlayLike): deferred as in a session's live frames, which saved lazily.
+    const bool playLike = PlayLike();
+    ActorDefer::SetActive((saved && (gGgpo || !gDeferOnlyGgpo)) || playLike);
+    CinemaRestore::SetActive((saved && (gGgpo || !gDeferOnlyGgpo)) || playLike);
     // The object scan's first pass classifies every live object (62 ms at a session's first save, soak 14001): done
     // ahead in fight ticks without a snapshot (intros, fights before a session), so the first save only diffs.
-    if (!saved && gEnabled && !gLockstep && GameLoopHook::FoughtThisTick()) CinemaRestore::Prewarm();
+    if (!saved && !playLike && gEnabled && !gLockstep && GameLoopHook::FoughtThisTick()) CinemaRestore::Prewarm();
     // No loadable future for them: destroyed after this tick's fight update (FightTickDone), where the game destroys effect
     // actors itself; here, at the boundary, pool threads may still walk the world lists (soak23, see below).
-    if (!saved) gReleaseDeferredAll = true;
+    if (!saved && !playLike) gReleaseDeferredAll = true;
     QueryPerformanceCounter(&s1);
     QueryPerformanceFrequency(&fq);
     if (gGgpo && gGgpoIsP2P) FramePace::Add(FramePace::kBoundary, s1.QuadPart - s0.QuadPart);
@@ -5245,7 +5473,7 @@ bool OnTickEntry(void* engine, float dt) {
        // both players' games froze in MK9's menus with rollback mode on (MK heap #5 allocation failure at 18:41) and
        // ran 11 minutes of online fights without a freeze in Safe mode, whose only menu-time difference is this.
         const bool want = gEnabled && !gLockstep &&
-                          (gQuarantineMenus || gGgpo || gNetplayArmed || gNetplayAwaitFight || gNetplayWaitRunning || gP2PPending);
+                          (gQuarantineMenus || gGgpo || gNetplayArmed || gNetplayAwaitFight || gNetplayWaitRunning || gP2PPending || PlayLike());
         if (want != gQuarantineOn) {
             gQuarantineOn = want;
             FreeQuarantine::SetActive(want);
@@ -5292,7 +5520,7 @@ void ReleaseDeferredActors() {
     if (!gEnabled || gIsResimulating) return;
     // Deferred actors live (ticking, owner freed) only as long as a load can still reach their death: GGPO SyncTest
     // goes back the check distance (4), P2P the prediction window (8); local rollbacks use the whole ring.
-    const uint32_t oldest = FramesBack(GameFrame(), gGgpo ? (gGgpoIsP2P ? 10 : 6) : (kRing - 1));
+    const uint32_t oldest = FramesBack(GameFrame(), (gGgpo && gGgpoIsP2P) || PlayLike() ? 10 : gGgpo ? 6 : (kRing - 1));  // a replay played as a session: as P2P
     ActorDefer::Release(oldest);
     CinemaRestore::Release(oldest);
 }
@@ -5327,6 +5555,7 @@ void RecordInputs() {
     const uint32_t gf = GameFrame();
     InputFrame& in = gInputs[gf % kInputRing];
     in.gf = gf;
+    if (gPlayRunning && gPlay) return PlaybackInputs(gf, in);  // a replay's frame: the recorded masks, once each
     if (gGgpo) {
         // Exactly one OverridePlayerInput per fighter pad per frame, as in a resimulated frame (see Input.h).
         uint32_t want[2];
@@ -5342,6 +5571,8 @@ void RecordInputs() {
                 in.mask[p] = gSyncValid ? gSyncMasks[p] : 0;
                 if (gSyncValid) Input::OverridePlayerInput(p, {gSyncMasks[p]});
             }
+            // The replay's inputs of this frame (net\ReplayKeeper.h); a rollback's replay of it overwrites them.
+            if (gSyncValid && gf >= gCsStartGf) ReplayKeeper::RecInputs(gf - gCsStartGf, gCsStartGf, gSyncMasks[0], gSyncMasks[1]);
         } else {
             for (int p = 0; p < 2; ++p) ggpo_add_local_input(gGgpo, gGgpoPlayer[p], &want[p], sizeof(uint32_t));
             uint32_t sync[2] = {want[0], want[1]};
@@ -5357,11 +5588,33 @@ void RecordInputs() {
         }
         return;
     }
+    // A replay's start tick (the fight's first frame, renumbered; the recording's frame 0 is the next one): one neutral
+    // input for each fighter, as an idle live pad gives at an online session's start tick (pads released there, MK9's
+    // exchange skipped). Offline the CPU's pad keeps its injection bit (flags 0x0C) after the release and would read the
+    // removed AI drone's last command: the first look (2026-11-17 09:40) found P2 1.121 units back at frame 0, all else equal.
+    if (gPlayStarting && GameLoopHook::FightBodyWillRun())
+        for (int p = 0; p < 2; ++p) Input::OverridePlayerInput(p, {0});
     // Netplay armed: the fight's first update runs before the session can start (the boundary comes after it in the
     // tick), so it must not see each machine's own pads (two-instance test 2026-10-18: one peer's P1 jumped on its AI
     // input before frame 0). Both pads are neutral on every fight update until the session takes over. Twice: the first
     // call moves the last held mask into prev (a previous fight's input was still there: prev 0x8018 on one peer), the
     // second leaves prev = cur = 0 on both.
+    // A replay armed: the fight's first update (the tick before its start renumbers the frames) runs without the AI drone,
+    // which the netplay start removes only at the next boundary. The looks of 2026-11-17 (09:40, 10:34) found P2 1.121
+    // units back at frame 0, all else equal: the drone had walked it in that first update (an online P2 is idle there).
+    // Only the one drone of a fight against the CPU: two are the title's attract demo, which the start must still see
+    // as one (OnTickEntry counts them at the next boundary and lets the demo go by).
+    // The fighters' x is logged there too: P2 stayed 1.121 back at frame 0 after the drone's removal (10:34, 11:21), so
+    // when it moves (before this update or in the next two) is the next question.
+    if (gPlayArmed && gNetplayAwaitFight && GameLoopHook::FightBodyWillRun()) {
+        const int cpu = CommandChannel::CountAiDrones();
+        if (cpu < 2) {
+            const GameplayState g = CaptureGameplay();
+            Logger::Info("REPLAY before the fight's first update at gf=%u: P1 x %.3f, P2 x %.3f; %d AI drone(s)%s", gf, g.pos[0][1], g.pos[1][1], cpu,
+                         cpu ? ", removed now (the replay's fight is about to begin)" : "");
+            if (cpu) CommandChannel::KillAiDrones();
+        }
+    }
     if (gNetplayAwaitFight && GameLoopHook::FightBodyWillRun())
         for (int k = 0; k < 2; ++k)
             for (int p = 0; p < 2; ++p) Input::OverridePlayerInput(p, {0});

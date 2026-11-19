@@ -28,7 +28,7 @@ namespace RefightVote {
 enum Choice : uint8_t { kRefight = 0, kChange = 1, kLeave = 2, kChoices = 3 };
 inline bool IsChoice(uint8_t c) { return c < kChoices; }
 inline const char* ChoiceText(uint8_t c) {
-    return c == kRefight ? "RE-FIGHT" : c == kChange ? "CHANGE FIGHTER OR ARENA" : c == kLeave ? "LEAVE" : "?";
+    return c == kRefight ? "REMATCH" : c == kChange ? "CHANGE FIGHTER OR ARENA" : c == kLeave ? "LEAVE" : "?";
 }
 // Both mods must mean the same three choices by the same three numbers: the exchange's context.
 constexpr uint32_t kContext = 0x52463031u;  // "RF01"
@@ -70,6 +70,94 @@ inline void Reopen(StagePick::Exchange* x, uint32_t nonce, uint32_t serial) {
     x->theirMoves = old.theirMoves;
     x->theirSeq = old.theirSeq;
     x->theirsOpen = old.theirsOpen;
+}
+
+// ---- the same fighters again ----
+// A re-fight starts the next fight with the last fight's fighters and costumes: MK9's character select still runs (its
+// script is the only way to the next fight), but the mod answers it for the player and gives the game the last fight's
+// pair where the script sets the fighters (rollback\ScriptRng.h). Both games must do that or neither, so the pair
+// travels in the stage picks' context: only two games that hold the same pair, written into the game, read each
+// other's pick of the arena at all (net\StageFlow.cpp).
+//
+// A fighter as the game names it for a fight: "char_" in any letter case, then letters, digits and '_'
+// ("CHAR_JohnnyCage_B": the costume is the letter after the last '_'; "char_raiden": the first costume).
+inline bool FighterName(const char* s) {
+    if (!s) return false;
+    static const char kStart[] = "char_";
+    int n = 0;
+    for (; s[n]; ++n) {
+        if (n >= 63) return false;
+        const char c = s[n], low = c >= 'A' && c <= 'Z' ? (char)(c + 32) : c;
+        if (!((low >= 'a' && low <= 'z') || (low >= '0' && low <= '9') || low == '_')) return false;
+        if (n < 5 && low != kStart[n]) return false;
+    }
+    return n > 5;
+}
+// One number for two fighters in their order, letter case ignored; never 0 (0: no pair).
+inline uint32_t PairTag(const char* p1, const char* p2) {
+    uint32_t h = 0x811C9DC5u;
+    const auto add = [&h](const char* s) {
+        for (; s && *s; ++s) h = (h ^ (uint8_t)(*s >= 'A' && *s <= 'Z' ? *s + 32 : *s)) * 0x01000193u;
+        h = (h ^ 0xFFu) * 0x01000193u;  // a name's end: ("ab", "c") is not ("a", "bc")
+    };
+    add(p1);
+    add(p2);
+    h = StagePick::detail::Mix(h);
+    return h ? h : 1;
+}
+// The stage picks' context of a game that holds a re-fight's pair: the stage table's own context and the pair. Never
+// the table's own, so a game without the pair and one with it do not read each other's picks.
+inline uint32_t DirectContext(uint32_t table, uint32_t pairTag) {
+    const uint32_t c = StagePick::detail::Mix(table ^ StagePick::detail::Mix(pairTag ^ 0x44524631u));  // "DRF1"
+    return c != table ? c : ~c;
+}
+// The context a stage exchange is opened under AND judged against (StagePick::Judge): the table's own, or the pair's
+// for a game that holds a re-fight's pair (pairTag 0: none).
+inline uint32_t ExchangeContext(uint32_t table, uint32_t pairTag) { return pairTag ? DirectContext(table, pairTag) : table; }
+
+// ---- MK9's Kombat Kodes ----
+// The six digits two players type on the versus / loading screen. In an online match the game keeps them in its
+// session (read in the game's code on 2026-11-14): a word at +0x4C34 for this game's player and a word at +0x4C36 for
+// the other player, each three digits 0-9 as 0x0abc, and a "locked" flag at +0x4C38.
+//   - The versus screen's tick 0x009273A0 reads this player's pad, hands the three digits to 0x00880790 (which stores
+//     the word and sends it in message 13, and does nothing once the flag is set) and then shows all six from the
+//     session through 0x00880820.
+//   - Message 13 from the other game is stored by 0x00880910 as the other player's word, unless the flag is set.
+//   - When its load ends the host's script runs native 1182 (0x008BFD00 -> 0x008808C0): the flag is set and both words
+//     go to the other game in message 14, whose handler 0x00880970 stores them and sets the flag there.
+//   - The versus screen's start (0x0092AA21 -> 0x008809D0) and script native 0x008BFD10 zero all three.
+// So a session that holds two words and the flag before its load ends loads with those kodes: nothing a player types
+// changes them, and the host's message 14 leaves both games with the host's two words whatever each held.
+struct Kodes {
+    uint16_t mine = 0, theirs = 0;
+    bool locked = false;
+};
+inline bool KodeValid(uint16_t k) { return !(k & 0xF000) && ((k >> 8) & 0xF) <= 9 && ((k >> 4) & 0xF) <= 9 && (k & 0xF) <= 9; }
+// The session's dword at +0x4C34 (this player's word below the other's) and its dword at +0x4C38.
+inline Kodes KodesOf(uint32_t words, uint32_t flag) { return Kodes{(uint16_t)words, (uint16_t)(words >> 16), flag != 0}; }
+inline uint32_t KodeWords(const Kodes& k) { return (uint32_t)k.mine | ((uint32_t)k.theirs << 16); }
+// "1-2-3" (six bytes with its end); a word that is not three digits reads "?-?-?".
+inline void KodeText(uint16_t k, char out[6]) {
+    const bool ok = KodeValid(k);
+    out[0] = ok ? (char)('0' + ((k >> 8) & 0xF)) : '?';
+    out[1] = '-';
+    out[2] = ok ? (char)('0' + ((k >> 4) & 0xF)) : '?';
+    out[3] = '-';
+    out[4] = ok ? (char)('0' + (k & 0xF)) : '?';
+    out[5] = 0;
+}
+// What a re-fight's load can be given: two words of three digits each, seen locked.
+inline bool KodesKeepable(const Kodes& k) { return k.locked && KodeValid(k.mine) && KodeValid(k.theirs); }
+// What the mod does with the session's kodes in one tick of a re-fight's load, where the last fight's are `kept`.
+//   kWrite: the session is not locked (the versus screen has just zeroed it, or a player typed): it gets the kept words
+//           and the flag.
+//   kHold:  it holds the kept words, locked: nothing to do.
+//   kTheirs: it is locked with other words. Those are the host's (message 14), or MK9's own lock: never written over,
+//           the two games must end with the same six digits.
+enum class KodeStep { kWrite, kHold, kTheirs };
+inline KodeStep KodeTick(const Kodes& held, const Kodes& kept) {
+    const bool same = held.mine == kept.mine && held.theirs == kept.theirs;
+    return !held.locked ? KodeStep::kWrite : same ? KodeStep::kHold : KodeStep::kTheirs;
 }
 
 // ---- MK9's own box: which presses a pick is ----

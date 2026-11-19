@@ -18,6 +18,7 @@
 #include "../rollback/ScriptRng.h"
 #include "FlowTrace.h"
 #include "OnlineMode.h"
+#include "RefightVote.h"
 #include "StageHold.h"
 #include "StagePick.h"
 
@@ -51,7 +52,7 @@ constexpr uint32_t kSendMs = 100;        // a packet this often while the exchan
 constexpr uint32_t kMoveSendMs = 30;     // after a cursor move or the lock: the next packet this soon, so the other screen follows
 constexpr uint32_t kQuietMs = 1000;      // no packet of the other panel this long: its cursor is shown as "no signal", not as live
 constexpr uint32_t kSilenceMs = 3000;   // nothing heard from the other panel this long after opening: it is not there
-constexpr uint32_t kFightState = 8;      // GameInfo+0x4 in an online match (7 character select, 1 stage load, 8 fight)
+constexpr uint32_t kFightState = 8, kSelectState = 7;  // GameInfo+0x4 in an online match (7 character select, 1 stage load, 8 fight)
 constexpr uint32_t kUp = 1, kDown = 2, kLeft = 4, kRight = 8, kLockButtons = 0x20 | 0x1000;
 // The lock is the button MK9's own menus confirm with. Read in the game on 2026-11-12 (keyboard and scripted pad): bit
 // 0x20 on a hardware pad confirms in the menus (the game's hint names it: pad A, keys G and numpad 4), the Enter key
@@ -89,11 +90,24 @@ constexpr uint32_t kSilentResultMs = 500;    // such a panel has no result to re
 int gRefightEntry = -1;
 uint64_t gRefightSetAt = 0;
 bool gSilent = false;  // the open panel is that one
+// ... and one that keeps its fighters (Refight.cpp, ScriptRng.h): this game was given the last fight's pair where its
+// script set the fighters, a moment before this panel opened. The panel's exchange then runs under a context of the
+// stage table and the pair, so it comes to an arena only with a game that holds the same pair; the pair stands when
+// the arena is written (Settle) and is taken back in every other ending.
+uint32_t gRefightTag = 0;
+bool gDirect = false;  // the open panel is that one
 
 Step gStep = Step::kIdle;
 uint64_t gStepAt = 0, gOpenedAt = 0, gSentAt = 0, gHeardAt = 0, gBannerUntil = 0, gDecidedAt = 0;
 Exchange gX;
 Table gTable;
+// The pair's tag the open panel's exchange runs under (0: the stage table's own context). It stays as set at the
+// opening while gDirect may end earlier, and every verdict is judged against the context it gives: the released
+// v20261114-1451 opened under the pair's context and judged against the table's own, so both games agreed on the
+// re-fight and each then refused it as "the two games list different stages" (field log of 2026-11-14 17:18:55).
+uint32_t gOpenTag = 0;
+uint32_t OpenContext() { return RefightVote::ExchangeContext(gTable.Context(), gOpenTag); }
+Verdict JudgeOpen(bool needConfirmed) { return Judge(gX, gTable, needConfirmed, OpenContext()); }
 uint8_t gCellChoice[StageScreen::kMaxCells];  // cell -> choice (a stage table entry, or kRandom for the last cell)
 char gCellPic[StageScreen::kMaxCells][ArenaPics::kNameLen];  // cell -> its picture's name ("" for RANDOM), taken when the panel opens
 int gPicsSeen = ArenaPics::kNotAsked;                        // the reading's last state that was logged
@@ -234,14 +248,19 @@ void PublishView(uint64_t now) {
     s.seed = SharedSeed(gX.mine, gX.theirs);
     s.phaseSinceMs = gStepAt;
     snprintf(s.note, sizeof s.note, "%s", gNote);
-    if (gSilent && s.phase != StageScreen::kOff && s.phase != StageScreen::kBanner) {
-        // A re-fight: two lines at the foot of the screen instead of the grid; the banner that follows is the usual one.
+    // A re-fight that keeps its fighters hides MK9's character select for as long as the game shows it.
+    const bool cover = gDirect && GameState() == kSelectState;
+    if (gSilent && s.phase != StageScreen::kOff && (s.phase != StageScreen::kBanner || cover)) {
+        // A re-fight: two lines instead of the grid (at the foot of the screen, or on the cover); the banner that
+        // follows is the usual one.
         static StageScreen::State card;
         card = StageScreen::State{};
         card.phase = StageScreen::kCard;
-        snprintf(card.name[0], sizeof card.name[0], "RE-FIGHT");
+        card.cover = cover ? 1 : 0;
+        snprintf(card.name[0], sizeof card.name[0], "REMATCH");
         const uint8_t cell = CellOf(gX.mine.choice);
-        snprintf(card.note, sizeof card.note, "THE SAME ARENA: %.40s", cell < s.cells ? s.name[cell] : "?");
+        if (gDirect) snprintf(card.note, sizeof card.note, "THE SAME FIGHTERS, THE SAME ARENA");
+        else snprintf(card.note, sizeof card.note, "THE SAME ARENA: %.40s", cell < s.cells ? s.name[cell] : "?");
         StageScreen::Publish(card);
         return;
     }
@@ -275,6 +294,9 @@ void Stop(const char* why, uint64_t now, bool banner, bool fallback) {
     if (gStep == Step::kIdle) return;
     HoldOver(now, why);
     Logger::Info(fallback ? "STAGEPICK ended: %s; the game's own arena choice stands" : "STAGEPICK closed: %s", why);
+    // A re-fight's pair that was not settled with the arena does not stand (nothing happens to one that was).
+    if (gDirect) ScriptRng::UndoMatchPlayers(why);
+    gDirect = false;
     const bool shown = gStep != Step::kDecided;
     gX.Close();
     gBot.Close();
@@ -317,26 +339,32 @@ bool Open(const char* why, bool byTrigger = false) {
         Logger::Info("STAGEPICK not opened (%s): %s; the game's own arena choice stands", why, no);
         return false;
     }
-    gX.Open(kKindStage, gTable.Context(), FreshNonce(), NextSerial());
-    gAuto = byTrigger;
-    gPickMs = gAuto ? kAutoPickMs : kPickMs;
-    gGraceMs = kGraceMs;
-    gHold.Reset();  // it begins when the game's script asks for the wait under this panel (OnSyncPoll)
-    gHoldSaid = false;
-    gX.apply = gOverride && gMode == kModeOn && !gAuto;
     // A re-fight both players chose: this panel is not shown and locks the last fight's arena at once.
-    gSilent = false;
+    gSilent = gDirect = false;
     uint8_t again = kNoChoice;
+    const uint32_t pairTag = gRefightTag;
     if (byTrigger && gRefightEntry >= 0) {
         const uint8_t e = (uint8_t)gRefightEntry;
         const char* name = ScriptRng::StageAt(e);
         gRefightEntry = -1;
+        gRefightTag = 0;
         if (now - gRefightSetAt >= kRefightKeepMs) Logger::Info("REFIGHT the re-fight is too old to be used: the stage screen opens as after any match");
         else if (!gTable.Pickable(e) || CellOf(e) == StageScreen::kNoCell)
             Logger::Info("REFIGHT the last fight's arena (entry %u %.40s) is not one a player may pick: the stage screen opens as after any match",
                          (unsigned)e, name ? name : "?");
         else gSilent = true, again = e;
     }
+    // ... and one that keeps its fighters, where this game holds the last fight's pair now: said in the context, so
+    // this game's pick is read only by a game that holds the same pair.
+    gDirect = gSilent && pairTag && ScriptRng::MatchPlayersWritten();
+    gOpenTag = gDirect ? pairTag : 0;
+    gX.Open(kKindStage, OpenContext(), FreshNonce(), NextSerial());
+    gAuto = byTrigger;
+    gPickMs = gAuto ? kAutoPickMs : kPickMs;
+    gGraceMs = kGraceMs;
+    gHold.Reset();  // it begins when the game's script asks for the wait under this panel (OnSyncPoll)
+    gHoldSaid = false;
+    gX.apply = gOverride && gMode == kModeOn && !gAuto;
     gCursor = gSilent ? CellOf(again) : gView.randomCell;  // a player who only confirms takes the "random" ticket
     gX.MoveCursor(gSilent ? again : kRandom);
     gPrevMask = 0xFFFF;  // what is held now is not a press
@@ -351,7 +379,7 @@ bool Open(const char* why, bool byTrigger = false) {
     gOpenedThisMatch = true;
     gOpenState = GameState();
     if (gMode == kModeTest) {
-        gBot.Open(kKindStage, gTable.Context(), FreshNonce(), NextSerial());
+        gBot.Open(kKindStage, gX.context, FreshNonce(), NextSerial());
         gBotRng = FreshNonce();
         gBotMoveAt = now + 500;
         gBotLockAt = now + 4000;
@@ -361,8 +389,11 @@ bool Open(const char* why, bool byTrigger = false) {
         gX.Lock(again);
         gSendSoon = true;
         const char* name = ScriptRng::StageAt(again);
-        Logger::Info("REFIGHT the stage screen stays shut: this player's pick is the last fight's arena, entry %u %.40s", (unsigned)again,
-                     name ? name : "?");
+        Logger::Info("REFIGHT the stage screen stays shut: this player's pick is the last fight's arena, entry %u %.40s%s", (unsigned)again,
+                     name ? name : "?",
+                     gDirect ? "; this game holds the last fight's fighters, and they stand if the other game holds the same pair and the arena is agreed"
+                     : pairTag ? "; the last fight's fighters were NOT given to this game (its script set no fighters since the choice): its select screen's stand"
+                               : "");
     } else {
         Input::SetPanelHold(true);
     }
@@ -383,7 +414,8 @@ void Heard(const Packet& p, const char* from) {
     if (h == Exchange::Heard::kTaken) gHeardAt = GetTickCount64();
     if (h == Exchange::Heard::kContextDiffers && !gHeardLogged) {
         gHeardLogged = true;
-        Logger::Info("STAGEPICK heard %s with another stage table (context %08X, this game %08X)", from, p.context, gX.context);
+        Logger::Info("STAGEPICK heard %s with another %s (context %08X, this game %08X)", from,
+                     gDirect ? "context: it does not hold this re-fight's fighters (or lists other stages)" : "stage table", p.context, gX.context);
     } else if (h == Exchange::Heard::kTaken && !gHeardLogged) {
         gHeardLogged = true;
         Logger::Info("STAGEPICK heard %s: its panel is open (exchange serial %u, override %s)", from, p.serial, p.apply ? "on" : "off");
@@ -492,9 +524,11 @@ void Settle(uint64_t now) {
         Logger::Info("STAGEPICK the draw is shown only: this game was not held on the select screen (its script asked for no sync wait 2 "
                      "under the panel%s), the game's own arena loads",
                      !gHold.wanted ? "; 'stagehold 0'" : gHold.broken ? "; the hold is off after a match that did not load" : "");
+        if (gDirect) ScriptRng::UndoMatchPlayers("this game was not held on the select screen");
+        gDirect = false;
         return;
     }
-    const Verdict v = Judge(gX, gTable, true);
+    const Verdict v = JudgeOpen(true);
     const StageHold::Use use = StageHold::Decide(gHold, gX, v);
     LogVerdict(v, "the wait ends");
     bool wrote = false;
@@ -527,6 +561,19 @@ void Settle(uint64_t now) {
         SetBanner(StageScreen::kUseGameChose, note, now);
         Logger::Info("STAGEPICK the agreed arena is not written (%s): the game's own arena loads", StageHold::UseText(use));
     }
+    // A re-fight's fighters stand on the same answer as its arena: the other game ran this exchange under the same
+    // context (so it holds the same pair), holds too and has both picks. (Not on 'wrote': that is this game's own
+    // success with the arena, which the other game cannot know.)
+    if (gDirect) {
+        if (use == StageHold::Use::kWrite) {
+            ScriptRng::KeepMatchPlayers();
+            Logger::Info("REFIGHT fighters: the other game holds the same pair and the same arena, and waits too: the last fight's fighters "
+                         "stand for the match that loads now");
+        } else {
+            ScriptRng::UndoMatchPlayers(StageHold::UseText(use));
+            gDirect = false;  // (the cover and its two lines end with it)
+        }
+    }
     HoldOver(now, wrote ? "the arena is written" : StageHold::UseText(use));
 }
 
@@ -548,7 +595,7 @@ void TakeReceived(uint64_t now) {
                      index, got ? got : "no such entry");
         return;
     }
-    const Verdict v = Judge(gX, gTable, false);
+    const Verdict v = JudgeOpen(false);
     const Check c = CheckReceived(v, index);
     const char* name = ScriptRng::StageAt(index);
     Logger::Info("STAGEPICK the settings message arrived with index %u (%.40s); this game %s; the sender's override is %s", index,
@@ -642,9 +689,9 @@ void Tick() {
         ReadControls(now);
         if (!gX.mine.locked && now >= gOpenedAt + gPickMs) LockMine("the countdown ended");
         SendNow(now);
-        if (gX.contextDiffers) return End("the two games list different stages", now, true);
+        if (gX.contextDiffers) return End(gDirect ? "the other game does not hold this re-fight's fighters" : "the two games list different stages", now, true);
         if (gX.Ready()) {
-            gVerdict = Judge(gX, gTable, false);
+            gVerdict = JudgeOpen(false);
             LogVerdict(gVerdict, "both picks are in");
             if (gVerdict.winner == Winner::kNone) return End(WhyText(gVerdict.why), now, true);
             if (gMode == kModeTest || (!gX.apply && !gX.theirsApply)) gUse = StageScreen::kUseTrial;  // neither game will write it
@@ -695,9 +742,10 @@ void Tick() {
 
 bool Idle() { return gStep == Step::kIdle && !gBannerUntil; }
 
-void SetRefight(int entry) {
+void SetRefight(int entry, uint32_t pairTag) {
     if (!OnGameThread()) return;
     gRefightEntry = entry >= 0 && entry < (int)kMaxEntries ? entry : -1;
+    gRefightTag = gRefightEntry >= 0 ? pairTag : 0;
     gRefightSetAt = GetTickCount64();
 }
 
@@ -714,7 +762,18 @@ void OnPacket(const void* data, int size) {
     Heard(p, "the other game");
 }
 
+static void NativeRan(uint32_t id);
 void OnNative(uint32_t id) {
+    NativeRan(id);
+    // The select screen's script has set the fight's fighters and sends its settings (the same run of the script, so
+    // nothing of the game has used the fighters yet). A re-fight's pair that this game was given stands only under a
+    // panel that opened for it just now, whose exchange decides; with any other panel, or none (the stage screen off,
+    // refused, another trigger), the game gets its select screen's fighters back at once.
+    if (id == kAutoNative && OnGameThread() && !(gStep != Step::kIdle && gDirect))
+        ScriptRng::UndoMatchPlayers(gStep != Step::kIdle ? "the stage screen opened as after any match" : "no stage screen opened for the re-fight");
+}
+
+static void NativeRan(uint32_t id) {
     if (gMode != kModeOn) return;
     // An online select screen begins (1261, 455 and 453 run in its first frame): the game's arena pictures are read now,
     // on a thread of their own, so a panel that opens by itself has them.
@@ -776,7 +835,7 @@ bool OnSettingsSend(uint8_t* bytes16) {
         return false;
     }
     const uint64_t now = GetTickCount64();
-    const Verdict v = Judge(gX, gTable, true);
+    const Verdict v = JudgeOpen(true);
     LogVerdict(v, "this game builds the settings message");
     const uint32_t before = SettingsIndex(bytes16);
     if (!gX.apply) {

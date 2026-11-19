@@ -67,7 +67,10 @@ struct Frame {  // the 16:9 frame centred in the picture (MK9 letterboxes to it)
 };
 Frame FrameOf(const View& v);
 bool FacesFor(const View& v);  // Prepare built the two faces for this picture size
-enum FaceId : int { kMainFace = 0, kSmallFace = 1 };  // 30 and 21 units of the frame's 1080; capitals only
+// 30 and 21 units of the frame's 1080; capitals only. kBigFace (58 units): the score's numbers (ScoreView.h, the panel
+// after a match); where it could not be built the main face stands in (BigFace() false).
+enum FaceId : int { kMainFace = 0, kSmallFace = 1, kBigFace = 2 };
+bool BigFace();
 void Rect(Canvas& c, int x0, int y0, int x1, int y1, uint32_t argb);
 int Width(FaceId f, const char* s);
 // y: the baseline. Returns the width. edge false: the glyphs without their dark edge, for text on a panel's own dark

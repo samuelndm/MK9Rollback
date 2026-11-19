@@ -13,12 +13,16 @@
 #include "debug/Logger.h"
 #include "debug/Overlay.h"
 #include "game/MK9Game.h"
+#include "game/MotdSkip.h"
+#include "game/PadPreset.h"
 #include "game/PressLatch.h"
 #include "hook/CodePatch.h"
 #include "hook/GameLoopHook.h"
 #include "hook/ObjectHooks.h"
 #include "hook/Ue3Refs.h"
 #include "net/OnlineMode.h"
+#include "net/ScoreKeeper.h"
+#include "net/ReplayKeeper.h"
 #include "rollback/FramePace.h"
 #include "rollback/FreeQuarantine.h"
 #include "rollback/ParallelMem.h"
@@ -61,6 +65,9 @@ DWORD WINAPI InitThread(LPVOID) {
     // engine-tick hook ran RunFrame on an uninitialized critical section).
     CrashLog::Install();
     CommandChannel::Start(dir);
+    PadPreset::SetFolder(dir);  // controller_presets.txt beside the DLL; read at the first look in the menus
+    ScoreKeeper::SetFolder(dir);  // match_history.txt beside the DLL; written when a counted online match is over
+    ReplayKeeper::SetFolder(dir);  // replays\ beside the DLL; a recorded session is written there once it is over
     // Track UE3 objects that hold raw MK pointers from the start: instances created before
     // tracking are invisible to rollback loads (run43 crash).
     if (!Ue3Refs::Install()) Logger::Info("UE3 reference tracking not installed");
@@ -69,6 +76,8 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
     InterlockedExchange(&gHooksInstalled, 1);
+    // The online menu's "message of the day" answers at once instead of waiting for MK9's dead web server.
+    MotdSkip::Install();
     // A match must keep its pace when the window is not in front (alt-tab, a chat window over it): no EcoQoS / efficiency
     // cores or lowered timer resolution from Windows for this process.
     FramePace::SetPowerThrottling(false);
@@ -122,6 +131,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     Snapshot::StopPageWarmer();
     ParallelMem::Stop();
     ArenaPics::Shutdown();  // the stage screen's reading thread has ended (it runs for a few milliseconds)
+    ReplayKeeper::Shutdown();  // a replay's file being written (its thread runs for a few milliseconds) is finished
     CrashLog::StopWatchdog();
     Overlay::Shutdown();  // its watcher thread (the F9 key) must be gone before the module is
     CrashLog::Uninstall();

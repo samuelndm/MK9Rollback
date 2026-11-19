@@ -29,7 +29,8 @@ struct Canvas {  // the vertices being written (a triangle list, six per rectang
     Vtx* v;
     int n, cap, dropped;
 };
-enum Face : int { kTitle = 0, kLine, kName, kFaces };  // capitals 44, 27 and 17 units of the frame's 1080
+// Capitals 44, 27 and 17 units of the frame's 1080; kScore: the score's numbers after a match (digits and '-' only, 66).
+enum Face : int { kTitle = 0, kLine, kName, kScore, kFaces };
 
 // Rendering thread (in the host test: its one thread). Builds the three faces for this picture size into the art's
 // atlas if they are not built for it yet. False: no look for this picture (no art, or the faces do not fit the atlas).

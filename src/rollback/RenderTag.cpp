@@ -22,6 +22,7 @@ constexpr uint8_t kEnqueueBytes[6] = {0xC7, 0x00, 0x08, 0x9D, 0xD5, 0x00};  // m
 constexpr uintptr_t kLateRead = 0x00666DF9;
 constexpr uint8_t kLateReadBytes[5] = {0xA0, 0xA5, 0x44, 0xE8, 0x00};  // mov al, [0x00E844A5]
 constexpr uintptr_t kSkipFlag = 0x00E84705;  // set by RHIBeginDrawingViewport: this frame's draws and present are left out
+constexpr uintptr_t kLateFlag = 0x00E844A5;  // the frame limiter's verdict on the pass it is in (game thread writes)
 constexpr LONG kMaxRun = 16;                 // replayed frames in a row before one is drawn anyway (a replay is at most ~10)
 constexpr uint32_t kStampSlots = 64;         // queued and not yet executed commands are a handful at most
 
@@ -37,6 +38,8 @@ int64_t gDrawnStamp = 0;
 LONG gRun = 0;  // replayed frames skipped since the last drawn frame
 volatile LONG gSkipped = 0, gDrawn = 0, gForced = 0;
 LONG gForcedLogged = 0;
+// Since the DLL's start, never reset (DRAWS lines, FramePace.cpp, take differences): what became of every command.
+volatile LONG gAllLiveDrawn = 0, gAllLiveSkipped = 0, gAllLiveLateSeen = 0, gAllReplaySkipped = 0, gAllReplayDrawn = 0;
 
 using ExecuteFn = uint32_t(__thiscall*)(void*);
 
@@ -55,6 +58,7 @@ uint32_t MK9R_BeginVtables[2] = {kVtable, kVtable};  // the game's own vtable un
 uint32_t MK9R_BeginQueued = 0;
 const bool* MK9R_ReplayFlag = &Rollback::gIsResimulating;
 uint8_t MK9R_SkipThisDraw = 0;  // render thread: set around the Execute of a replayed frame's command
+uint8_t MK9R_LateMask = 0xFF;   // 'lateskip 0' makes it 0: the limiter's late flag no longer leaves a live frame out
 void MK9R_BeginTagStub();
 void MK9R_LateReadStub();
 
@@ -62,15 +66,28 @@ void MK9R_LateReadStub();
 uint32_t __fastcall MK9R_BeginDrawLive(void* self, void* /*edx*/) {
     gDrawnStamp = NextStamp();
     gRun = 0;
-    return reinterpret_cast<ExecuteFn>(kExecute)(self);
+    const uint8_t late = *reinterpret_cast<const volatile uint8_t*>(kLateFlag);
+    const uint32_t size = reinterpret_cast<ExecuteFn>(kExecute)(self);
+    // What the game decided for this live frame (the skip flag is this frame's until the next command's Execute).
+    if (*reinterpret_cast<const uint8_t*>(kSkipFlag)) {
+        InterlockedIncrement(&gAllLiveSkipped);
+        if (late) InterlockedIncrement(&gAllLiveLateSeen);
+    } else {
+        InterlockedIncrement(&gAllLiveDrawn);
+    }
+    return size;
 }
 uint32_t __fastcall MK9R_BeginDrawReplayed(void* self, void* /*edx*/) {
     NextStamp();  // a replayed frame has none; its slot is passed over
     gDrawnStamp = 0;
-    if (!gSkipWanted) return reinterpret_cast<ExecuteFn>(kExecute)(self);
+    if (!gSkipWanted) {
+        InterlockedIncrement(&gAllReplayDrawn);
+        return reinterpret_cast<ExecuteFn>(kExecute)(self);
+    }
     if (gRun >= kMaxRun) {  // the replay flag never dropped: show something
         gRun = 0;
         InterlockedIncrement(&gForced);
+        InterlockedIncrement(&gAllReplayDrawn);
         return reinterpret_cast<ExecuteFn>(kExecute)(self);
     }
     MK9R_SkipThisDraw = 1;
@@ -79,8 +96,10 @@ uint32_t __fastcall MK9R_BeginDrawReplayed(void* self, void* /*edx*/) {
     if (*reinterpret_cast<const uint8_t*>(kSkipFlag)) {
         ++gRun;
         InterlockedIncrement(&gSkipped);
+        InterlockedIncrement(&gAllReplaySkipped);
     } else {
         InterlockedIncrement(&gDrawn);  // one of the game's own conditions said draw
+        InterlockedIncrement(&gAllReplayDrawn);
     }
     return size;
 }
@@ -88,8 +107,8 @@ uint32_t __fastcall MK9R_BeginDrawReplayed(void* self, void* /*edx*/) {
 
 // _MK9R_BeginTagStub replaces "mov dword [eax], 0x00D59D08" (game thread): the same store with the vtable for this
 // kind of frame, and the queue count; every register and the flags are kept (lea, not inc).
-// _MK9R_LateReadStub replaces "mov al, [0x00E844A5]" (render thread): the limiter's late flag, or this frame's mark.
-// The instruction after it is "test al, al", so the flags are free.
+// _MK9R_LateReadStub replaces "mov al, [0x00E844A5]" (render thread): the limiter's late flag (unless 'lateskip 0'
+// masks it away), or this frame's mark. The instruction after it is "test al, al", so the flags are free.
 asm(R"(
     .text
     .globl _MK9R_BeginTagStub
@@ -107,6 +126,7 @@ _MK9R_BeginTagStub:
     .globl _MK9R_LateReadStub
 _MK9R_LateReadStub:
     movb 0x00E844A5, %al
+    andb _MK9R_LateMask, %al
     orb _MK9R_SkipThisDraw, %al
     ret
 )");
@@ -144,6 +164,22 @@ bool Install() {
 void SetReplaySkip(bool on) {
     InterlockedExchange(&gSkipWanted, on ? 1 : 0);
     Logger::Info("REPLAYSKIP: replayed frames are %s", on ? "not drawn" : "drawn and presented (rc27)");
+}
+
+void SetLateSkip(bool on) {
+    MK9R_LateMask = on ? 0xFF : 0;
+    Logger::Info("LATESKIP %d: a live frame the game's limiter marks late is %s%s", on ? 1 : 0,
+                 on ? "not drawn (the game's rule, as always)" : "drawn all the same (a test: replayed frames stay undrawn)",
+                 gInstalled ? "" : "; the late-flag read is not patched, so this changes nothing");
+}
+
+void ReadCounts(Counts* c) {
+    c->queued = MK9R_BeginQueued;
+    c->liveDrawn = (uint32_t)gAllLiveDrawn;
+    c->liveSkipped = (uint32_t)gAllLiveSkipped;
+    c->liveLateSeen = (uint32_t)gAllLiveLateSeen;
+    c->replaySkipped = (uint32_t)gAllReplaySkipped;
+    c->replayDrawn = (uint32_t)gAllReplayDrawn;
 }
 
 void Disable() {

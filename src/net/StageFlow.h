@@ -51,7 +51,12 @@ void Shutdown();  // the DLL unloads: the game gets the controls back
 // on the screen. SetRefight: both players chose the same fight again; the next panel that opens by itself (the next
 // match's) is not shown, locks stage table entry 'entry' for this player at once, and shows two lines at the foot of the
 // screen instead of the grid (-1: forget it). The exchange, the hold and the write are the usual ones.
+// pairTag (RefightVote::PairTag, 0: none): the re-fight keeps its fighters too. When that panel opens and this game
+// has been given the last fight's pair (ScriptRng::MatchPlayersWritten), its exchange runs under a context of the
+// stage table and the pair, its two lines cover the character select, and the pair stands exactly when the arena is
+// written (both games hold the same pair and have said so to each other). In every other case, also when no panel
+// opens at all, the game is given back the fighters its select screen had set (ScriptRng::UndoMatchPlayers).
 bool Idle();
-void SetRefight(int entry);
+void SetRefight(int entry, uint32_t pairTag = 0);
 
 }  // namespace StageFlow

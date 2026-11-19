@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 
+#include "../net/Score.h"
 #include "Hud.h"
 #include "StageSkin.h"
 
@@ -32,6 +33,8 @@ constexpr uint32_t kRouletteMs = 1800;
 // choices, 'note' what they gave once that is known. kCard: two lines at the foot of the frame, name[0] and the note
 // (a re-fight both chose, on the character select). Both are drawn in MK9's look where its art could be read (the
 // same lettering and gold pieces as the grid's), else in the HUD display's faces; never as tiles.
+// A card with 'cover' hides the game's picture whole and stands in the middle of the frame: a re-fight that keeps its
+// fighters, while MK9's character select runs under it with nothing for the player to do.
 enum Phase : uint8_t { kOff = 0, kPicking, kRoulette, kResult, kBanner, kVote, kCard };
 enum Winner : uint8_t { kNoWinner = 0, kMine, kTheirs, kBoth };
 // silent: nothing heard from the other panel yet. quiet: it was heard, and then nothing for a second: its cursor is
@@ -58,16 +61,28 @@ struct State {  // plain data, no pointers
     uint8_t use = kUsePending;
     uint8_t test = 0;                // the other player is simulated ('stagescreen test'): marked on the panel
     uint8_t tiles = 0;               // picture tiles, where the cells fit them (else the list of names)
+    uint8_t cover = 0;               // kCard: the game's picture is hidden whole, the two lines stand in the middle
     int16_t secondsLeft = -1;        // kPicking: the countdown; -1 none
     uint32_t seed = 0;               // the roulette's length (the same number on both screens)
     uint64_t phaseSinceMs = 0;       // GetTickCount64 when the phase began (the roulette's clock)
     char note[72] = "";              // one more line: the reason of a fallback, a trial run's remark
+    // kVote: the score against this opponent (net\ScoreKeeper.h): a scoreboard over the panel (today's wins of each
+    // player in large numbers, the wins in a row, every day's total), the last matches at its right and today's record
+    // of each fighter this player chose at its left. board.on 0: none of it.
+    Score::Board board;
     char name[kMaxCells][30] = {};
     uint8_t pic[kMaxCells] = {};     // tiles: the cell's picture, its place in ArenaPics' sheet + 1; 0: none (RANDOM)
 };
 
 // Game thread.
 void Publish(const State& s);
+// A cover over the whole picture, apart from the published state and drawn in its place: the two lines of a kCard in
+// the middle of an opaque ground. Its owner asks for it again with every tick; it is drawn for keepMs after the last
+// call and then ends by itself, so a cover nobody renews cannot stay (the game's thread may stand still for a while
+// when a fight loads: keepMs is the longest such stop that still shows no gap).
+void Cover(const char* title, const char* note, uint32_t keepMs);
+void CoverOff();
+bool CoverShown();  // asked for, and not run out
 // The rendering thread has drawn within the last second with faces built for the picture: a panel would be seen.
 bool CanDraw();
 
@@ -92,7 +107,7 @@ void LookCounters(long* draws, long* largest);
 
 // 'stagedemo N': canned state N instead of the published one (0: off). Frozen in time, for screenshots.
 constexpr int kDemos = 13;      // the arena panel's
-constexpr int kVoteDemos = 5;   // numbers kDemos + 1 ...: the choice after a match (four states) and the re-fight's card
+constexpr int kVoteDemos = 6;   // numbers kDemos + 1 ...: the choice after a match (four states), the re-fight's card, and that card covering the character select
 bool Demo(int n, uint64_t nowMs, State* s);
 void SetDemo(int n);
 int DemoShown();

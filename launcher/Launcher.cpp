@@ -12,6 +12,9 @@
 // Exit code: 0 the window is up (or another one was brought to the front), 1 it could not be started.
 // For tools\launcher_selftest.ps1: with the environment variable MK9R_LAUNCHER_TEST set, what a message box would
 // say is written to the standard output instead, and no "Starting" card is shown.
+// Language: the card and the messages are in English or Portuguese (Brazil), chosen as the window chooses
+// (tools\launcher_text.ps1 Get-UiLanguageChoice): MK9R_LANG, else the player's choice (HKCU\Software\MK9Rollback,
+// value Language), else Windows' display language. The Portuguese texts use \u escapes: this file stays ASCII.
 
 #include <windows.h>
 
@@ -106,6 +109,28 @@ bool g_test = false;  // MK9R_LAUNCHER_TEST
 // player's open window.
 std::wstring Named(const wchar_t* base) { return std::wstring(base) + (g_test ? L"Test" : L""); }
 
+// "pt", "pt-BR", "pt_PT", ... (tools\launcher_text.ps1 Resolve-UiLanguage: any Portuguese is Portuguese (Brazil)).
+bool IsPortugueseName(const wchar_t* s) {
+    return (s[0] == L'p' || s[0] == L'P') && (s[1] == L't' || s[1] == L'T') && (s[2] == 0 || s[2] == L'-' || s[2] == L'_');
+}
+bool ChoosePortuguese() {
+    wchar_t v[32] = L"";
+    if (GetEnvironmentVariableW(L"MK9R_LANG", v, 32) && v[0]) return IsPortugueseName(v);
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\MK9Rollback", 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+        DWORD type = 0, size = sizeof v - sizeof(wchar_t);
+        const LONG got = RegQueryValueExW(key, g_test ? L"LanguageTest" : L"Language", nullptr, &type, reinterpret_cast<BYTE*>(v), &size);
+        RegCloseKey(key);
+        if (got == ERROR_SUCCESS && type == REG_SZ && size >= sizeof(wchar_t)) {
+            v[size / sizeof(wchar_t)] = 0;
+            if (v[0]) return IsPortugueseName(v);
+        }
+    }
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE;
+}
+bool g_pt = false;
+const wchar_t* Text(const wchar_t* en, const wchar_t* pt) { return g_pt ? pt : en; }
+
 void Tell(const std::wstring& text, UINT icon) {
     if (g_test) {
         const int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
@@ -161,7 +186,7 @@ void PaintSplash(HWND hwnd) {
     SelectObject(dc, g_splash.textFont);
     SetTextColor(dc, kMuted);
     RECT sub{textX, iconY + Px(33), rc.right - Px(16), iconY + Px(56)};
-    DrawTextW(dc, L"Starting\x2026", -1, &sub, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, Text(L"Starting…", L"Iniciando…"), -1, &sub, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, oldFont);
 
     // A bar that keeps moving along the bottom edge: the start takes a few seconds and has no percentage.
@@ -329,13 +354,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wchar_t testMode[16] = L"";
     g_test = GetEnvironmentVariableW(L"MK9R_LAUNCHER_TEST", testMode, 16) != 0;
     const bool withSplash = !g_test || !lstrcmpW(testMode, L"splash");
+    g_pt = ChoosePortuguese();
     const std::wstring exe = ExePath();
     const std::wstring script = FindScript(ParentOf(exe));
     if (script.empty()) {
         // Opened from inside the zip, Explorer extracts this file alone to a temporary folder.
-        Tell(L"MK9 Rollback's other files are not next to this program.\n\n"
-             L"Extract the whole zip first: right-click the zip, choose \"Extract All\", "
-             L"then open \"MK9 Rollback.exe\" in the extracted folder.",
+        Tell(Text(L"MK9 Rollback's other files are not next to this program.\n\n"
+                  L"Extract the whole zip first: right-click the zip, choose \"Extract All\", "
+                  L"then open \"MK9 Rollback.exe\" in the extracted folder.",
+                  L"Os outros arquivos do MK9 Rollback não estão junto deste programa.\n\n"
+                  L"Extraia o zip inteiro primeiro: clique com o botão direito no zip, escolha \"Extrair Tudo\" "
+                  L"e abra o \"MK9 Rollback.exe\" na pasta extraída."),
              MB_ICONINFORMATION);
         return 1;
     }
@@ -372,9 +401,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!CreateProcessW(ps.c_str(), &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, ParentOf(script).c_str(), &si, &pi)) {
         const DWORD err = GetLastError();
         CloseSplash();
-        Tell(L"MK9 Rollback could not start Windows PowerShell, which runs its window.\n\n" + LastErrorText(err) + L"\n(" + ps + L")\n\n"
-             L"A rule set by whoever manages this PC (a company, a school, or security software) may forbid it. "
-             L"Ask them to allow it, or play from another PC.",
+        Tell(std::wstring(Text(L"MK9 Rollback could not start Windows PowerShell, which runs its window.\n\n",
+                               L"O MK9 Rollback não conseguiu iniciar o Windows PowerShell, que executa a janela dele.\n\n")) +
+                 LastErrorText(err) + L"\n(" + ps + L")\n\n" +
+                 Text(L"A rule set by whoever manages this PC (a company, a school, or security software) may forbid it. "
+                      L"Ask them to allow it, or play from another PC.",
+                      L"Uma regra definida por quem administra este PC (uma empresa, uma escola ou um software de segurança) "
+                      L"pode estar impedindo. Peça que liberem, ou jogue em outro PC."),
              MB_ICONERROR);
         return 1;
     }
@@ -403,10 +436,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         // Nothing printed: the script told the player itself (its own error box), or another window was already open.
         const std::wstring said = code ? ReadCaptured(captured, 900) : std::wstring();
         if (code && !said.empty()) {
-            Tell(L"MK9 Rollback could not open its window. Windows PowerShell said:\n\n" + said + L"\n\n"
-                 L"The usual cause is a rule set by whoever manages this PC (a company, a school, or security software) "
-                 L"that forbids PowerShell scripts. Ask them to allow the scripts in the \"tools\" folder next to this program, "
-                 L"or play from another PC.",
+            Tell(std::wstring(Text(L"MK9 Rollback could not open its window. Windows PowerShell said:\n\n",
+                                   L"O MK9 Rollback não conseguiu abrir a janela dele. O Windows PowerShell disse:\n\n")) +
+                     said + L"\n\n" +
+                     Text(L"The usual cause is a rule set by whoever manages this PC (a company, a school, or security software) "
+                          L"that forbids PowerShell scripts. Ask them to allow the scripts in the \"tools\" folder next to this program, "
+                          L"or play from another PC.",
+                          L"A causa comum é uma regra definida por quem administra este PC (uma empresa, uma escola ou um software "
+                          L"de segurança) que proíbe scripts do PowerShell. Peça que liberem os scripts da pasta \"tools\" "
+                          L"ao lado deste programa, ou jogue em outro PC."),
                  MB_ICONERROR);
         }
         rc = code ? 1 : 0;

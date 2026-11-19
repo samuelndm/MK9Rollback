@@ -15,9 +15,11 @@ players run the mod, and leaves every other match (and Ranked) to the game's own
    yellow so-so, red bad, then the ping, R for the frames rolled back and D for the input delay). F9 switches to a
    line with every number and back.
 
-Both players need the same version. The MK9 Rollback window checks for a new release when it opens; press
-**Update now** (with the game closed) to install it; **Go back to the previous version** undoes the last update. If
-something goes wrong, press "Save logs to the Desktop" and attach the zip to an issue, from both players (send yours
+Both players need the same version. The MK9 Rollback window checks for a new release when it opens (and again before
+a start, when the last check is older than ten minutes) and installs it by itself, then restarts; Play stays off until
+the newest version is in (with the game open, the install waits for it to close). Without an answer from GitHub (no
+internet), Play is allowed. The window speaks English or Portuguese (Brazil), following Windows' display language;
+**Language** at the bottom changes it. If something goes wrong, press "Save logs to the Desktop" and attach the zip to an issue, from both players (send yours
 together with your opponent's). The zip replaces Steam IDs, IP addresses and your Windows user and PC names first;
 PRIVACY.txt inside it lists what was replaced.
 
@@ -31,7 +33,7 @@ The window has a "Having trouble?" button with the same list:
 - On a laptop: plug it in and set the Windows power mode to "Best performance".
 - Close browsers and other heavy apps (downloads, streaming, launchers).
 - Use a wired (Ethernet) connection instead of Wi-Fi.
-- Both players need the same version ("Check for updates" at the bottom of the window).
+- Both players need the same version: this window installs a new one by itself when it opens.
 - In a fight, F9 switches between the HUD display and the detailed network line.
 
 ## What it does
@@ -50,6 +52,11 @@ The window has a "Having trouble?" button with the same list:
   it is read, and no snapshot is taken of a frame whose remote input has already arrived.
 - A delay-based lockstep mode instead of rollback stays in the DLL for testing (`tools\netplay.ps1`); the window
   always plays rollback.
+- Score and match history: each online 1 vs 1 match that reaches MK9's results screen is counted as won, lost or drawn
+  (read from the fighters' life bars, `src\net\Score.h`) and written to `build\clang\match_history.txt`. In a fight
+  each player's wins today stand under the health bar (and the wins in a row of the one on a run); after a match a
+  scoreboard, the last matches and today's record of each fighter stand around the choice; the window lists every
+  match ("Match history").
 
 ## Build
 

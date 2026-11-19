@@ -19,6 +19,12 @@
 # The logs are not in the zip and stay.
 param([switch]$Check, [switch]$Apply, [switch]$Restore, [string]$InstallRoot = '')
 
+# What a player reads goes through Tr (tools\launcher_text.ps1: the window loads it first, in the player's language);
+# run on its own, this file says it in English.
+if (-not (Get-Command Tr -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Tr { $t = "$($args[0])"; if ($args.Count -gt 1) { $t -f @($args[1..($args.Count - 1)]) } else { $t } }
+}
+
 $kUpdateRepo = 'samuelndm/MK9Rollback'
 $kUpdateAgent = 'MK9Rollback-updater'
 # What a release zip may hold (tools\package.ps1 checks its own zip against this list), as paths with backslashes.
@@ -34,7 +40,7 @@ $kOldLauncher = 'Play Online.bat'    # did so before 2026-11; an install that ge
 # The files a release holds today, by name (tools\package.ps1 refuses to pack a file that is not listed here): the
 # ones the window unblocks when it opens (Unblock-PackageFiles).
 $kPackageFiles = @('MK9 Rollback.exe', 'README.txt', 'version.txt', 'build\clang\MK9Rollback.dll', 'build\clang\MK9RollbackInjector.exe',
-    'tools\netplay.ps1', 'tools\netplay_gui.ps1', 'tools\launcher_lib.ps1', 'tools\updater.ps1', 'tools\launch_game.ps1',
+    'tools\netplay.ps1', 'tools\netplay_gui.ps1', 'tools\launcher_lib.ps1', 'tools\launcher_text.ps1', 'tools\updater.ps1', 'tools\launch_game.ps1',
     'docs\netplay_lan_test.md')
 
 function Get-InstalledVersion([string]$root) {
@@ -63,17 +69,17 @@ function Get-LatestRelease([int]$TimeoutSec = 8) {
         if ($status -eq 403 -or $status -eq 429) {
             # 60 unauthenticated API calls an hour per address; GitHub answers 403 (or 429) after that.
             $script:UpdateRateLimited = $true
-            $script:UpdateError = 'GitHub is limiting update checks; try again in an hour.'
+            $script:UpdateError = Tr 'GitHub is limiting update checks; try again in an hour.'
         } else {
-            $script:UpdateError = "could not reach GitHub ($($_.Exception.Message))"
+            $script:UpdateError = Tr 'could not reach GitHub ({0})' $_.Exception.Message
         }
         return $null
     }
     $tag = "$($r.tag_name)"
-    if ($tag -notmatch '^v(\d{8}-\d{4})$') { $script:UpdateError = "unexpected release tag '$tag'"; return $null }
+    if ($tag -notmatch '^v(\d{8}-\d{4})$') { $script:UpdateError = Tr 'unexpected release tag ''{0}''' $tag; return $null }
     $version = $Matches[1]  # now: the -match below replaces $Matches
     $rel = Select-ReleaseAssets $r.assets
-    if (-not $rel) { $script:UpdateError = "release $tag has no zip and checksum"; return $null }
+    if (-not $rel) { $script:UpdateError = Tr 'release {0} has no zip and checksum' $tag; return $null }
     [pscustomobject]@{ Version = $version; Tag = $tag; ZipUrl = $rel.Zip.browser_download_url; ZipName = $rel.Zip.name
         ShaUrl = $rel.Sha.browser_download_url; Full = $rel.Full; Page = $r.html_url; Notes = "$($r.body)" }
 }
@@ -212,18 +218,18 @@ function Install-UpdateFromZip([string]$zipPath, [string]$shaText, [string]$root
     if (-not $say) { $say = { param($s) } }
     $want = ("$shaText".Trim() -split '\s+')[0].ToUpperInvariant()
     $got = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
-    if ($want -notmatch '^[0-9A-F]{64}$' -or $want -ne $got) { & $say 'The download is damaged (checksum mismatch). Nothing was changed; try again later.'; return $false }
+    if ($want -notmatch '^[0-9A-F]{64}$' -or $want -ne $got) { & $say (Tr 'The download is damaged (checksum mismatch). Nothing was changed; try again later.'); return $false }
     $work = Join-Path $env:TEMP "mk9r-install-$(Get-Random)"
     $x = Join-Path $work 'x'
     New-Item -ItemType Directory -Force -Path $x | Out-Null
     try {
         $refused = Expand-ReleaseZip $zipPath $x
-        if ($refused) { & $say "The download holds a file an update must not have ($refused). Nothing was changed."; return $false }
+        if ($refused) { & $say (Tr 'The download holds a file an update must not have ({0}). Nothing was changed.' $refused); return $false }
         $v = Get-InstalledVersion $x
         $dll = Join-Path $x 'build\clang\MK9Rollback.dll'
         $complete = $v.version -and (-not $version -or $v.version -eq $version) -and (Test-Path -LiteralPath $dll)
         if ($complete -and $v.dll) { $complete = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash -eq $v.dll.ToUpperInvariant() }
-        if (-not $complete) { & $say 'The download is not a complete package. Nothing was changed.'; return $false }
+        if (-not $complete) { & $say (Tr 'The download is not a complete package. Nothing was changed.'); return $false }
         $rels = @(Get-TreeFiles $x)
         $next = Join-Path $root 'previous_version.new'
         # A zip that brings the program that opens the window takes the older "Play Online.bat" away (into the
@@ -233,21 +239,21 @@ function Install-UpdateFromZip([string]$zipPath, [string]$shaText, [string]$root
         try {
             Invoke-FileSwap $x $rels $root $next $remove
         } catch {
-            & $say "The update failed: $($_.Exception.Message). Your files are as they were."
+            & $say (Tr 'The update failed: {0}. Your files are as they were.' ("$($_.Exception.Message)".TrimEnd('.')))
             return $false
         }
         $prev = Join-Path $root 'previous_version'
         if (Test-Path -LiteralPath $prev) { Remove-Item -LiteralPath $prev -Recurse -Force -ErrorAction SilentlyContinue }
         if (Test-Path -LiteralPath $prev) {
-            & $say "Updated to version $($v.version). The previous files are in previous_version.new (the old previous_version folder could not be removed)."
+            & $say (Tr 'Updated to version {0}. The previous files are in previous_version.new (the old previous_version folder could not be removed).' $v.version)
         } else {
             Rename-Item -LiteralPath $next -NewName 'previous_version'
-            & $say "Updated to version $($v.version). The previous files are in previous_version."
+            & $say (Tr 'Updated to version {0}. The previous files are in previous_version.' $v.version)
         }
         Unblock-PackageFiles $root $rels  # the files this zip brought, not every file under $root
         return $true
     } catch {
-        & $say "The update failed: $($_.Exception.Message). Nothing was changed."
+        & $say (Tr 'The update failed: {0}. Nothing was changed.' ("$($_.Exception.Message)".TrimEnd('.')))
         return $false
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -271,18 +277,18 @@ function Save-ReleaseZip($release, [string]$work) {
 # Downloads, checks and installs a release into $root. $say: a scriptblock taking one status line. Returns $true when
 # installed; the caller restarts the launcher.
 function Install-Update($release, [string]$root, [scriptblock]$say) {
-    if (Get-Process MKKE -ErrorAction SilentlyContinue) { & $say 'Close the game first: its files cannot be replaced while it runs.'; return $false }
+    if (Get-Process MKKE -ErrorAction SilentlyContinue) { & $say (Tr 'Close the game first: its files cannot be replaced while it runs.'); return $false }
     $work = Join-Path $env:TEMP "mk9r-update-$($release.Version)-$(Get-Random)"
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     try {
-        & $say "Downloading version $($release.Version)..."
+        & $say (Tr 'Downloading version {0}...' $release.Version)
         $got = Save-ReleaseZip $release $work
         return (Install-UpdateFromZip $got.Zip $got.ShaText $root $say $release.Version)
     } catch {
         $status = 0
         try { $status = [int]$_.Exception.Response.StatusCode } catch { }
-        if ($status -eq 403 -or $status -eq 429) { & $say 'GitHub is limiting downloads; try again in an hour. Nothing was changed.' }
-        else { & $say "The download failed: $($_.Exception.Message). Nothing was changed." }
+        if ($status -eq 403 -or $status -eq 429) { & $say (Tr 'GitHub is limiting downloads; try again in an hour. Nothing was changed.') }
+        else { & $say (Tr 'The download failed: {0}. Nothing was changed.' ("$($_.Exception.Message)".TrimEnd('.'))) }
         return $false
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -306,21 +312,21 @@ function Complete-InstallFromZip([string]$zipPath, [string]$shaText, [string]$ro
     if (-not $say) { $say = { param($s) } }
     $want = ("$shaText".Trim() -split '\s+')[0].ToUpperInvariant()
     $got = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
-    if ($want -notmatch '^[0-9A-F]{64}$' -or $want -ne $got) { & $say 'The download is damaged (checksum mismatch). Nothing was changed.'; return $false }
+    if ($want -notmatch '^[0-9A-F]{64}$' -or $want -ne $got) { & $say (Tr 'The download is damaged (checksum mismatch). Nothing was changed.'); return $false }
     $work = Join-Path $env:TEMP "mk9r-finish-$(Get-Random)"
     $x = Join-Path $work 'x'
     New-Item -ItemType Directory -Force -Path $x | Out-Null
     $added = New-Object System.Collections.Generic.List[string]
     try {
         $refused = Expand-ReleaseZip $zipPath $x
-        if ($refused) { & $say "The download holds a file an update must not have ($refused). Nothing was changed."; return $false }
+        if ($refused) { & $say (Tr 'The download holds a file an update must not have ({0}). Nothing was changed.' $refused); return $false }
         $have = Get-InstalledVersion $root
         $v = Get-InstalledVersion $x
         $dllHere = Join-Path $root 'build\clang\MK9Rollback.dll'
         $same = $v.version -and $v.version -eq $have.version -and $v.dll -and [System.IO.File]::Exists($dllHere) -and
             (Get-FileHash -LiteralPath $dllHere -Algorithm SHA256).Hash -eq $v.dll.ToUpperInvariant() -and
             (Get-FileHash -LiteralPath (Join-Path $x 'build\clang\MK9Rollback.dll') -Algorithm SHA256).Hash -eq $v.dll.ToUpperInvariant()
-        if (-not $same -or -not [System.IO.File]::Exists((Join-Path $x $kLauncherExe))) { & $say 'The download is not this version''s package. Nothing was changed.'; return $false }
+        if (-not $same -or -not [System.IO.File]::Exists((Join-Path $x $kLauncherExe))) { & $say (Tr 'The download is not this version''s package. Nothing was changed.'); return $false }
         foreach ($rel in @(Get-TreeFiles $x)) {
             $dest = Join-Path $root $rel
             if ([System.IO.File]::Exists($dest)) { continue }
@@ -340,7 +346,7 @@ function Complete-InstallFromZip([string]$zipPath, [string]$shaText, [string]$ro
     } catch {
         # What this call added goes away again: the install stays as the older updater left it, and still opens.
         foreach ($rel in $added) { try { [System.IO.File]::Delete((Join-Path $root $rel)) } catch { } }
-        & $say "It could not be added: $($_.Exception.Message)."
+        & $say (Tr 'It could not be added: {0}.' ("$($_.Exception.Message)".TrimEnd('.')))
         return $false
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -357,7 +363,7 @@ function Complete-Install($release, [string]$root, [scriptblock]$say) {
         $got = Save-ReleaseZip $release $work
         return (Complete-InstallFromZip $got.Zip $got.ShaText $root $say)
     } catch {
-        & $say "The download failed: $($_.Exception.Message)."
+        & $say (Tr 'The download failed: {0}.' ("$($_.Exception.Message)".TrimEnd('.')))
         return $false
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -369,10 +375,10 @@ function Complete-Install($release, [string]$root, [scriptblock]$say) {
 function Restore-PreviousVersion([string]$root, [scriptblock]$say) {
     if (-not $say) { $say = { param($s) } }
     $prev = Join-Path $root 'previous_version'
-    if (-not (Test-Path -LiteralPath $prev)) { & $say 'There is no previous version to go back to.'; return $false }
-    if (Get-Process MKKE -ErrorAction SilentlyContinue) { & $say 'Close the game first: its files cannot be replaced while it runs.'; return $false }
+    if (-not (Test-Path -LiteralPath $prev)) { & $say (Tr 'There is no previous version to go back to.'); return $false }
+    if (Get-Process MKKE -ErrorAction SilentlyContinue) { & $say (Tr 'Close the game first: its files cannot be replaced while it runs.'); return $false }
     $rels = @(Get-TreeFiles $prev | Where-Object { $_ -ne 'added_files.txt' -and (Get-ReleaseEntryPath $_) })
-    if (-not $rels) { & $say 'The previous_version folder is empty. Nothing was changed.'; return $false }
+    if (-not $rels) { & $say (Tr 'The previous_version folder is empty. Nothing was changed.'); return $false }
     $addedFile = Join-Path $prev 'added_files.txt'
     $remove = @()
     if (Test-Path -LiteralPath $addedFile) { $remove = @(Get-Content -LiteralPath $addedFile | Where-Object { $_ -and (Get-ReleaseEntryPath $_) }) }
@@ -381,12 +387,12 @@ function Restore-PreviousVersion([string]$root, [scriptblock]$say) {
     try {
         Invoke-FileSwap $prev $rels $root $undo $remove
     } catch {
-        & $say "Going back failed: $($_.Exception.Message). Your files are as they were."
+        & $say (Tr 'Going back failed: {0}. Your files are as they were.' ("$($_.Exception.Message)".TrimEnd('.')))
         return $false
     }
     Remove-Item -LiteralPath $undo -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $prev -Recurse -Force -ErrorAction SilentlyContinue
-    & $say "Back to version $(if ($v.version) { $v.version } else { '(unknown)' })."
+    & $say (Tr 'Back to version {0}.' $(if ($v.version) { $v.version } else { Tr '(unknown)' }))
     $true
 }
 

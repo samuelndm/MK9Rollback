@@ -20,6 +20,13 @@ void Gap();                           // a boundary that is not one: the next in
 void Add(Part p, int64_t ticks);
 void Rollback(uint32_t depth);
 void SkippedSave();
+// Every main-loop pass, session or not, first thing at the world tick's entry (right after MK9's frame limiter): the
+// limiter's verdict on this pass and how long it waited. With RenderTag's counts of what the render thread did with
+// each frame this makes the DRAWS line that follows each PACE line: passes, presents, frames drawn, frames the game's
+// late rule left out, replayed frames left out. 'drawstat 1': such a line every 600 passes outside a session too (an
+// offline fight on one PC).
+void Pass();
+void SetDrawStat(bool on);
 void Report(uint32_t gf);             // the window since the last report
 // Live frames of >= 25 ms whose boundary replayed (a rollback's load) and all live frames since the last call, then reset:
 // the online mode's CPU check for a 1-frame delay (src\net\OnlineMode.cpp, gCpuFloor).

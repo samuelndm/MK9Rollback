@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $root = Resolve-Path "$PSScriptRoot\.."
 $bin = if ($BinariesFrom) { Resolve-Path $BinariesFrom } else { "$root\build\clang" }
 # tools\updater.ps1's $kReleaseFiles must allow every file listed here (checked below).
-$files = @('tools\netplay.ps1', 'tools\netplay_gui.ps1', 'tools\launcher_lib.ps1', 'tools\updater.ps1', 'tools\launch_game.ps1',
+$files = @('tools\netplay.ps1', 'tools\netplay_gui.ps1', 'tools\launcher_lib.ps1', 'tools\launcher_text.ps1', 'tools\updater.ps1', 'tools\launch_game.ps1',
     'docs\netplay_lan_test.md')
 . "$PSScriptRoot\updater.ps1"   # the lists the zips are checked against, and the program's file name
 foreach ($f in $files) { if (-not (Test-Path -LiteralPath "$root\$f")) { throw "missing $f" } }
@@ -50,7 +50,8 @@ HOW TO PLAY
 2. Open "MK9 Rollback.exe". If Windows says it protected your PC, click "More info", then "Run anyway"
    (the program is not signed by a company; its source is public).
 3. Press Play. The window starts Mortal Kombat with the mod. There is nothing to set up.
-4. In the game: Online > Player Match, a 1 vs 1 room (not King of the Hill). Play anyone there.
+4. In the game: Online > Player Match, a 1 vs 1 room, or a King of the Hill room with just the two of you (with anyone
+   else in that room, MK9's own netcode plays its matches). Play anyone there.
    If your opponent also runs MK9 Rollback (the same version), its netcode takes over by itself at the
    fight start; under the round timer the game then shows three connection bars (green good, yellow
    so-so, red bad), the ping in ms, R (frames rolled back) and D (input delay). Before the fight the
@@ -60,10 +61,26 @@ HOW TO PLAY
 5. When you are done, or if something goes wrong, press "Save logs to the Desktop" and send the zip it
    makes, together with your opponent's zip. Both players' logs are needed. (Steam IDs, IP addresses and
    your Windows user and PC names are replaced in it; PRIVACY.txt inside lists what.)
-6. Updates: the window checks for a new version when it opens. If it says one is available, close the
-   game and press "Update now"; the window restarts on the new version. Both players need the same
-   version. (The files it replaced are kept in the previous_version folder; "Go back to the previous
-   version" at the bottom of the window puts them back.)
+6. Updates: the window checks for a new version when it opens (and again before a start when its last
+   check is older than ten minutes), installs it by itself and restarts on it. Play stays off until the
+   newest version is in; with the game open, the install waits for the game to close. Both players need
+   the same version. Without an answer from GitHub (no internet), Play is allowed. (The files an update
+   replaced are kept in the previous_version folder.)
+7. CONTROLLER PRESET (AJUSTE DOS COMANDOS): MK9 itself starts every game on preset 1. With the mod, the
+   preset each player picks (pause menu, or the player options on the character select) is kept in
+   build\clang\controller_presets.txt and set again when the game reaches its menus. Delete that file to
+   start on preset 1 again.
+8. SCORE AND MATCH HISTORY: every online 1 vs 1 match (Player Match or a private room) that reaches MK9's
+   results screen is counted as won, lost or drawn, read from the fighters' life bars. In a fight, each
+   player's wins today stand under that player's health bar, with "3 IN A ROW" under the one on a run.
+   After a match, over the choice: today's score against that opponent in large numbers (a day starts at
+   6:00, so a late evening counts as one), the wins in a row, the total over every day; at its right the
+   last 8 matches, at its left today's record of each fighter you chose. The window shows the score under
+   "Last match", and "Match history" at the bottom lists every match: when, the result, the rounds,
+   both fighters, the arena and the opponent. The list is build\clang\match_history.txt (one line per
+   match; updates keep it).
+9. LANGUAGE: the window speaks English or Portuguese (Brazil), following Windows' display language.
+   "Language" at the bottom of the window changes it (O idioma muda em "Idioma", embaixo na janela).
 
 HAVING TROUBLE? (the window has a "Having trouble?" link with the same list)
 - Allow MKKE.exe through the Windows firewall (Windows Security > Firewall > Allow an app).
@@ -72,7 +89,7 @@ HAVING TROUBLE? (the window has a "Having trouble?" link with the same list)
 - On a laptop: plug it in and set the Windows power mode to "Best performance".
 - Close browsers and other heavy apps (downloads, streaming, launchers).
 - Use a wired (Ethernet) connection instead of Wi-Fi.
-- Both players need the same version ("Check for updates" at the bottom of the window).
+- Both players need the same version: the window installs a new one by itself when it opens.
 - In a fight, F9 switches between the HUD display and the detailed network line.
 
 NETCODE

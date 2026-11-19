@@ -34,7 +34,21 @@ namespace RenderTag {
 
 bool Install();
 void SetReplaySkip(bool on);  // 'replayskip 0': replayed frames are drawn and presented again (rc27)
+// 'lateskip 0|1' (1 at the start, the game's rule): 0 = a LIVE frame is drawn even when the limiter's late flag is set
+// at the moment the render thread gets to it. A test for the lost pictures of 2026-11-15 (FramePace.h, DRAWS lines);
+// the picture only, the simulation is the same either way.
+void SetLateSkip(bool on);
 void Disable();               // unload: no new command carries this module's vtables (call before CodePatch::RestoreAll)
+
+// What became of the begin-drawing commands since the DLL's start (never reset; take differences). `queued` is counted
+// on the game thread, the rest on the render thread when it executes a command, so they trail it by the queue's depth.
+struct Counts {
+    uint32_t queued;                       // all commands, live and replayed
+    uint32_t liveDrawn, liveSkipped;       // live frames drawn / left out by the game's own rule (the limiter's late flag)
+    uint32_t liveLateSeen;                 // of the skipped ones: the late flag was set when the command began
+    uint32_t replaySkipped, replayDrawn;   // replayed frames left out (this module's mark) / drawn after all
+};
+void ReadCounts(Counts* c);
 
 // Game thread, after a boundary's replays: the frame queued next shows a local input sampled at `qpc` (0 = none).
 void SetStamp(int64_t qpc);

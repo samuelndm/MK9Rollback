@@ -108,6 +108,14 @@ void Sanitize(State& s) {
     for (uint8_t& p : s.pic)
         if (p > ArenaPics::kSlots) p = 0;
     s.note[sizeof s.note - 1] = 0;
+    Score::Board& b = s.board;
+    if (b.rows < 0 || b.rows > Score::kBoardRows) b.rows = b.rows < 0 ? 0 : Score::kBoardRows;
+    if (b.fighters < 0 || b.fighters > Score::kBoardFighters) b.fighters = b.fighters < 0 ? 0 : Score::kBoardFighters;
+    for (Score::Board::Row& r : b.row) {
+        r.when[sizeof r.when - 1] = r.me[sizeof r.me - 1] = r.them[sizeof r.them - 1] = 0;
+        if (r.result > Score::kDraw) r.result = Score::kDraw;
+    }
+    for (Score::Board::Fighter& f : b.fighter) f.name[sizeof f.name - 1] = 0;
     if (s.phase > kCard) s.phase = kOff;
     if (s.winner > kBoth) s.winner = kNoWinner;
 }
@@ -525,6 +533,219 @@ void DrawBanner(Canvas& c, const State& s, const Hud::View& v) {
     Centre(c, fr, kSmallFace, b, kBannerB, rgbB, true);
 }
 
+// ---- the score against this opponent, around the choice after a match (State::board, net\Score.h) ----
+// Over the panel a scoreboard: each player's wins today in large numbers, YOU at the left and OPP at the right as on
+// the panel's plates; under them the wins in a row and the total over every day. At the panel's right the last
+// matches against this opponent, the newest at the top (the match just played framed); at its left today's record of
+// each fighter this player chose. Both columns stand in the frame's room beside the panel.
+constexpr float kBoardTop = 20.0f, kBoardBottom = 240.0f, kBoardHalfW = 440.0f;
+constexpr float kBoardHead = 54.0f, kBoardNumbers = 146.0f, kBoardRun = 190.0f, kBoardInfo = 225.0f;
+constexpr float kBoardLabel = 236.0f, kBoardNumberGap = 52.0f, kBoardDashW = 36.0f, kBoardDashH = 8.0f;
+constexpr float kColumnGap = 24.0f, kColumnHead = 46.0f, kColumnSub = 70.0f, kColumnTop = 70.0f, kColumnPad = 14.0f;
+constexpr float kMatchRowH = 60.0f, kMatchRowGap = 6.0f, kMatchTag = 50.0f, kFighterTop = 92.0f, kFighterRowH = 52.0f;
+constexpr uint32_t kMineInk = 0xFFE38A, kTheirsInk = 0xFF8466, kWinTag = 0x2C7A36, kLossTag = 0x9E2416, kDrawTag = 0x505050;
+
+const char* TagOf(uint8_t r) { return r == Score::kWin ? "W" : r == Score::kLoss ? "L" : "D"; }
+uint32_t TagRgb(uint8_t r) { return r == Score::kWin ? kWinTag : r == Score::kLoss ? kLossTag : kDrawTag; }
+// "YOU: 3 WINS IN A ROW" / "OPPONENT: 2 WINS IN A ROW"; "" for no run of two or more. *mine: whose run.
+void RunText(const Score::Board& b, char* out, size_t n, bool* mine) {
+    out[0] = 0;
+    *mine = b.streak > 0;
+    if (b.streak >= 2) snprintf(out, n, "YOU: %d WINS IN A ROW", b.streak);
+    else if (b.streak <= -2) snprintf(out, n, "OPPONENT: %d WINS IN A ROW", -b.streak);
+}
+// Every day's total, today's draws and today's longest runs, apart by wide spaces; "" when there is nothing more to say.
+void InfoText(const Score::Board& b, char* out, size_t n) {
+    out[0] = 0;
+    size_t k = 0;
+    const auto add = [&](const char* fmt, int a, int c) {
+        if (k >= n) return;
+        const int w = snprintf(out + k, n - k, "%s", k ? "      " : "");
+        if (w > 0) k += (size_t)w;
+        if (k >= n) return;
+        const int x = snprintf(out + k, n - k, fmt, a, c);
+        if (x > 0) k += (size_t)x;
+    };
+    if (b.allKnown && b.all.Matches() > b.today.Matches()) add("ALL TIME %d - %d", b.all.wins, b.all.losses);
+    if (b.today.draws) add("DRAWN TODAY %d%.0d", b.today.draws, 0);
+    if (b.bestMine >= 2 || b.bestTheirs >= 2) add("BEST RUN TODAY: YOU %d, OPP %d", b.bestMine, b.bestTheirs);
+    if (k >= n) out[n - 1] = 0;
+}
+uint32_t RecordRgb(const Score::Tally& t) { return t.wins > t.losses ? kMineInk : t.wins < t.losses ? kTheirsInk : 0xE0E0E0; }
+
+// MK9's look (StageSkin.h): P is the choice's panel.
+void LookWriteAt(Sk::Canvas& c, Sk::Face f, const char* t, int cx, int base, uint32_t ink) { Sk::Write(c, f, t, cx - Sk::Width(f, t) / 2, base, ink); }
+void LookShadowed(Sk::Canvas& c, const Frame& fr, Sk::Face f, const char* t, int x, int base, uint32_t ink) {
+    const int d = std::max(1, U(fr, 2.5f));
+    Sk::Write(c, f, t, x + d, base + d, Sk::Pm(0x000000, 210));
+    Sk::Write(c, f, t, x, base, ink);
+}
+void DrawBoardLook(Sk::Canvas& c, const State& s, const Hud::View& v, const Box& P) {
+    const Score::Board& b = s.board;
+    if (!b.on) return;
+    const Frame fr = Hud::FrameOf(v);
+    const int cx = fr.x + fr.w / 2, thin = std::max(1, U(fr, 2.0f));
+    char cut[120], t[120];
+    const auto lineWidth = [](const char* x) { return Sk::Width(Sk::kLine, x); };
+
+    // The scoreboard.
+    const Box S{cx - U(fr, kBoardHalfW), fr.y + U(fr, kBoardTop), cx + U(fr, kBoardHalfW), fr.y + U(fr, kBoardBottom)};
+    const int room = S.x1 - S.x0 - 2 * U(fr, 30.0f);
+    LookGround(c, fr, S, cx, 360.0f);
+    LookCentre(c, fr, Sk::kName, "SCORE TODAY", kBoardHead, Grey(205));
+    char mine[12], theirs[12];
+    snprintf(mine, sizeof mine, "%d", std::min(b.today.wins, 9999));
+    snprintf(theirs, sizeof theirs, "%d", std::min(b.today.losses, 9999));
+    const int base = fr.y + U(fr, kBoardNumbers), gap = U(fr, kBoardNumberGap), capS = Sk::CapOf(Sk::kScore), capL = Sk::CapOf(Sk::kLine);
+    LookShadowed(c, fr, Sk::kScore, mine, cx - gap - Sk::Width(Sk::kScore, mine), base, Sk::Pm(kMineInk, 255));
+    LookShadowed(c, fr, Sk::kScore, theirs, cx + gap, base, Sk::Pm(kTheirsInk, 255));
+    const int dw = U(fr, kBoardDashW) / 2, dh = std::max(2, U(fr, kBoardDashH)), dy = base - capS / 2 - dh / 2;
+    Sk::Fill(c, cx - dw + thin, dy + thin, cx + dw + thin, dy + dh + thin, Sk::Pm(0x000000, 210));
+    Sk::Fill(c, cx - dw, dy, cx + dw, dy + dh, Grey(235));
+    const int labelBase = base - capS / 2 + capL / 2;
+    LookWriteAt(c, Sk::kLine, "YOU", cx - U(fr, kBoardLabel), labelBase, Sk::Pm(kMineInk, 255));
+    LookWriteAt(c, Sk::kLine, "OPP", cx + U(fr, kBoardLabel), labelBase, Sk::Pm(kTheirsInk, 255));
+    bool runMine = false;
+    RunText(b, t, sizeof t, &runMine);
+    if (t[0]) LookCentre(c, fr, Sk::kLine, FitBy(lineWidth, t, room, cut, sizeof cut), kBoardRun, Sk::Pm(runMine ? kEmber : kTheirsInk, 255));
+    InfoText(b, t, sizeof t);
+    if (t[0]) LookCentre(c, fr, Sk::kName, FitBy(NameWidth, t, room, cut, sizeof cut), kBoardInfo, Grey(215));
+
+    // The last matches, at the panel's right.
+    const Box R{P.x1 + U(fr, kColumnGap), P.y0, fr.x + fr.w - U(fr, kColumnGap), P.y1};
+    const int pad = U(fr, kColumnPad);
+    if (b.rows > 0 && R.x1 - R.x0 > U(fr, 240.0f)) {
+        const int mid = (R.x0 + R.x1) / 2;
+        LookGround(c, fr, R, mid, 150.0f);
+        LookWriteAt(c, Sk::kLine, "LAST MATCHES", mid, R.y0 + U(fr, kColumnHead), Grey(255));
+        const int rowH = U(fr, kMatchRowH), inner = rowH - U(fr, kMatchRowGap), tag = U(fr, kMatchTag);
+        int y = R.y0 + U(fr, kColumnTop);
+        for (int i = 0; i < b.rows && y + inner <= R.y1 - pad; ++i, y += rowH) {
+            const Score::Board::Row& r = b.row[i];
+            const Box rb{R.x0 + pad, y, R.x1 - pad, y + inner};
+            Sk::Fill(c, rb.x0 - thin - 1, rb.y0 - thin - 1, rb.x1 + thin + 1, rb.y1 + thin + 1, Sk::Pm(0x000000, 200));
+            Sk::FillV(c, rb.x0, rb.y0, rb.x1, rb.y1, Sk::Pm(0x2E0C09, 255), Sk::Pm(0x0C0303, 255));
+            if (i == 0 && r.today) LookFrame(c, rb, thin + 1, Sk::Pm(0xFFF6D8, 255), Sk::Pm(kGoldLight, 255));  // the match just played
+            else LookFrame(c, rb, thin, Sk::Pm(kGoldMid, 170), Sk::Pm(kGoldDark, 170));
+            // The result's letter on its colour, the rounds large beside it, the two fighters on two small lines after
+            // them (this player's first, the time at the right of it).
+            const int middle = (rb.y0 + rb.y1) / 2 + capL / 2;
+            Sk::FillV(c, rb.x0, rb.y0, rb.x0 + tag, rb.y1, Sk::Pm(TagRgb(r.result), 255), Sk::Pm(TagRgb(r.result) >> 1 & 0x7F7F7F, 255));
+            LookWriteAt(c, Sk::kLine, TagOf(r.result), rb.x0 + tag / 2, middle, Grey(255));
+            const int rx = rb.x0 + tag + U(fr, 12.0f), roundsW = lineWidth("8-8"), right = rb.x1 - U(fr, 10.0f);
+            if (r.roundsKnown) snprintf(t, sizeof t, "%d-%d", r.mine, r.theirs);
+            else snprintf(t, sizeof t, "?");
+            LookWriteAt(c, Sk::kLine, t, rx + roundsW / 2, middle, Grey(255));
+            const int x = rx + roundsW + U(fr, 14.0f), timeW = NameWidth(r.when);
+            Sk::Write(c, Sk::kName, r.when, right - timeW, rb.y0 + U(fr, 23.0f), Grey(160));
+            Sk::Write(c, Sk::kName, FitBy(NameWidth, r.me, right - timeW - U(fr, 10.0f) - x, cut, sizeof cut), x, rb.y0 + U(fr, 23.0f), Grey(240));
+            snprintf(t, sizeof t, "VS %s", r.them);
+            Sk::Write(c, Sk::kName, FitBy(NameWidth, t, right - x, cut, sizeof cut), x, rb.y0 + U(fr, 46.0f), Grey(190));
+        }
+    }
+
+    // Today's fighters, at the panel's left.
+    const Box L{fr.x + U(fr, kColumnGap), P.y0, P.x0 - U(fr, kColumnGap), P.y1};
+    if (b.fighters > 0 && L.x1 - L.x0 > U(fr, 240.0f)) {
+        const int mid = (L.x0 + L.x1) / 2;
+        LookGround(c, fr, L, mid, 150.0f);
+        LookWriteAt(c, Sk::kLine, "YOUR FIGHTERS", mid, L.y0 + U(fr, kColumnHead), Grey(255));
+        LookWriteAt(c, Sk::kName, "TODAY, WINS - LOSSES", mid, L.y0 + U(fr, kColumnSub), Grey(180));
+        const int rowH = U(fr, kFighterRowH), inner = rowH - U(fr, kMatchRowGap);
+        int y = L.y0 + U(fr, kFighterTop);
+        for (int i = 0; i < b.fighters && y + inner <= L.y1 - pad; ++i, y += rowH) {
+            const Score::Board::Fighter& f = b.fighter[i];
+            const Box rb{L.x0 + pad, y, L.x1 - pad, y + inner};
+            Sk::FillV(c, rb.x0, rb.y0, rb.x1, rb.y1, Sk::Pm(0x2E0C09, 230), Sk::Pm(0x0C0303, 230));
+            LookFrame(c, rb, thin, Sk::Pm(kGoldMid, 150), Sk::Pm(kGoldDark, 150));
+            snprintf(t, sizeof t, "%d - %d", f.t.wins, f.t.losses);
+            const int wRec = lineWidth(t), textBase = (rb.y0 + rb.y1) / 2 + capL / 2, x = rb.x0 + U(fr, 12.0f), right = rb.x1 - U(fr, 12.0f);
+            Sk::Write(c, Sk::kLine, t, right - wRec, textBase, Sk::Pm(RecordRgb(f.t), 255));
+            Sk::Write(c, Sk::kLine, FitBy(lineWidth, f.name, right - wRec - U(fr, 16.0f) - x, cut, sizeof cut), x, textBase, Grey(240));
+        }
+        snprintf(t, sizeof t, "MATCHES TODAY: %d", b.today.Matches());
+        LookWriteAt(c, Sk::kName, t, mid, L.y1 - U(fr, 22.0f), Grey(190));
+    }
+}
+
+// The same in the HUD display's faces (where MK9's art could not be read); panel: the plain choice's panel.
+void WriteAt(Canvas& c, FaceId f, const char* t, int cx, int base, uint32_t rgb) { Hud::Write(c, f, t, cx - Hud::Width(f, t) / 2, base, rgb, 255, false); }
+void PlainGround(Canvas& c, const Frame& fr, const Box& b) {
+    const int rule = std::max(1, U(fr, 2.0f));
+    Hud::Rect(c, b.x0, b.y0, b.x1, b.y1, Argb(kGround, 245));
+    Hud::Rect(c, b.x0, b.y0, b.x1, b.y0 + rule, Argb(kGold, 210));
+    Hud::Rect(c, b.x0, b.y1 - rule, b.x1, b.y1, Argb(kGold, 210));
+}
+void DrawBoardPlain(Canvas& c, const State& s, const Hud::View& v, const Box& panel) {
+    const Score::Board& b = s.board;
+    if (!b.on) return;
+    const Frame fr = Hud::FrameOf(v);
+    const int cx = fr.x + fr.w / 2;
+    char cut[120], t[120];
+    const Box S{cx - U(fr, kBoardHalfW), fr.y + U(fr, 36.0f), cx + U(fr, kBoardHalfW), panel.y0 - U(fr, 12.0f)};
+    const int room = S.x1 - S.x0 - 2 * U(fr, 30.0f);
+    PlainGround(c, fr, S);
+    Centre(c, fr, kSmallFace, "SCORE TODAY", 70.0f, kLabel, false);
+    char mine[12], theirs[12];
+    snprintf(mine, sizeof mine, "%d", std::min(b.today.wins, 9999));
+    snprintf(theirs, sizeof theirs, "%d", std::min(b.today.losses, 9999));
+    const int base = fr.y + U(fr, 150.0f), gap = U(fr, kBoardNumberGap), capB = Hud::CapOf(Hud::kBigFace), capM = Hud::CapOf(kMainFace);
+    Hud::Write(c, Hud::kBigFace, mine, cx - gap - Hud::Width(Hud::kBigFace, mine), base, kMineInk, 255, false);
+    Hud::Write(c, Hud::kBigFace, theirs, cx + gap, base, kTheirsInk, 255, false);
+    const int dw = U(fr, kBoardDashW) / 2, dh = std::max(2, U(fr, kBoardDashH)), dy = base - capB / 2 - dh / 2;
+    Hud::Rect(c, cx - dw, dy, cx + dw, dy + dh, Argb(kWhite, 235));
+    WriteAt(c, kMainFace, "YOU", cx - U(fr, kBoardLabel), base - capB / 2 + capM / 2, kMineInk);
+    WriteAt(c, kMainFace, "OPP", cx + U(fr, kBoardLabel), base - capB / 2 + capM / 2, kTheirsInk);
+    bool runMine = false;
+    RunText(b, t, sizeof t, &runMine);
+    if (t[0]) Centre(c, fr, kMainFace, Fit(kMainFace, t, room, cut, sizeof cut), 200.0f, runMine ? kOrange : kTheirsInk, false);
+    InfoText(b, t, sizeof t);
+    if (t[0]) Centre(c, fr, kSmallFace, Fit(kSmallFace, t, room, cut, sizeof cut), 236.0f, kLabel, false);
+
+    const int pad = U(fr, kColumnPad), capS = Hud::CapOf(kSmallFace);
+    const Box R{panel.x1 + U(fr, kColumnGap), panel.y0, fr.x + fr.w - U(fr, kColumnGap), panel.y1};
+    if (b.rows > 0 && R.x1 - R.x0 > U(fr, 240.0f)) {
+        const int mid = (R.x0 + R.x1) / 2;
+        PlainGround(c, fr, R);
+        WriteAt(c, kMainFace, "LAST MATCHES", mid, R.y0 + U(fr, 40.0f), kWhite);
+        const int rowH = U(fr, 56.0f), inner = rowH - U(fr, kMatchRowGap), tag = U(fr, 44.0f);
+        int y = R.y0 + U(fr, 58.0f);
+        for (int i = 0; i < b.rows && y + inner <= R.y1 - pad; ++i, y += rowH) {
+            const Score::Board::Row& r = b.row[i];
+            const Box rb{R.x0 + pad, y, R.x1 - pad, y + inner};
+            Hud::Rect(c, rb.x0, rb.y0, rb.x1, rb.y1, Argb(0x1A1A20, 255));
+            if (i == 0 && r.today) Outline(c, rb, std::max(1, U(fr, 2.0f)), Argb(kGold, 255));
+            Hud::Rect(c, rb.x0, rb.y0, rb.x0 + tag, rb.y1, Argb(TagRgb(r.result), 255));
+            WriteAt(c, kMainFace, TagOf(r.result), rb.x0 + tag / 2, (rb.y0 + rb.y1) / 2 + capM / 2, kWhite);
+            const int x = rb.x0 + tag + U(fr, 10.0f), right = rb.x1 - U(fr, 8.0f);
+            if (r.roundsKnown) snprintf(t, sizeof t, "%d-%d", r.mine, r.theirs);
+            else snprintf(t, sizeof t, "%s", r.result == Score::kWin ? "WIN" : r.result == Score::kLoss ? "LOSS" : "DRAW");
+            Hud::Write(c, kMainFace, t, x, rb.y0 + U(fr, 26.0f), kWhite, 255, false);
+            Hud::Write(c, kSmallFace, r.when, right - Hud::Width(kSmallFace, r.when), rb.y0 + U(fr, 22.0f), kLabel, 200, false);
+            snprintf(t, sizeof t, "%s VS %s", r.me, r.them);
+            Hud::Write(c, kSmallFace, Fit(kSmallFace, t, right - x, cut, sizeof cut), x, rb.y1 - U(fr, 5.0f), kLabel, 255, false);
+        }
+    }
+    const Box L{fr.x + U(fr, kColumnGap), panel.y0, panel.x0 - U(fr, kColumnGap), panel.y1};
+    if (b.fighters > 0 && L.x1 - L.x0 > U(fr, 240.0f)) {
+        const int mid = (L.x0 + L.x1) / 2;
+        PlainGround(c, fr, L);
+        WriteAt(c, kMainFace, "YOUR FIGHTERS TODAY", mid, L.y0 + U(fr, 40.0f), kWhite);
+        const int rowH = U(fr, 46.0f);
+        int y = L.y0 + U(fr, 58.0f);
+        for (int i = 0; i < b.fighters && y + rowH <= L.y1 - pad; ++i, y += rowH) {
+            const Score::Board::Fighter& f = b.fighter[i];
+            snprintf(t, sizeof t, "%d - %d", f.t.wins, f.t.losses);
+            const int wRec = Hud::Width(kMainFace, t), x = L.x0 + pad + U(fr, 6.0f), right = L.x1 - pad - U(fr, 6.0f), yb = y + rowH / 2 + capM / 2;
+            Hud::Write(c, kMainFace, t, right - wRec, yb, RecordRgb(f.t), 255, false);
+            Hud::Write(c, kMainFace, Fit(kMainFace, f.name, right - wRec - U(fr, 14.0f) - x, cut, sizeof cut), x, yb, kWhite, 255, false);
+        }
+        snprintf(t, sizeof t, "MATCHES TODAY: %d", b.today.Matches());
+        WriteAt(c, kSmallFace, t, mid, L.y1 - U(fr, 18.0f), kLabel);
+    }
+    (void)capS;
+}
+
 // The choice after a match (net\Refight.cpp): a small panel over MK9's own rematch box. The rows are the State's cells
 // (three: RE-FIGHT, CHANGE FIGHTER OR ARENA, LEAVE), with both players' marks as on the list of arenas; 'note' is what
 // the two choices gave, once it is known.
@@ -538,7 +759,8 @@ void DrawVote(Canvas& c, const State& s, const Hud::View& v) {
     Hud::Rect(c, panel.x0, panel.y0, panel.x1, panel.y0 + rule, Argb(kGold, 210));
     Hud::Rect(c, panel.x0, panel.y1 - rule, panel.x1, panel.y1, Argb(kGold, 210));
     Centre(c, fr, kMainFace, "PLAY AGAIN?", 362.0f, kWhite, false);
-    Centre(c, fr, kSmallFace, "RE-FIGHT: THE SAME FIGHTERS AND ARENA, WHEN BOTH PLAYERS CHOOSE IT.", 398.0f, kLabel, false);
+    Centre(c, fr, kSmallFace, "REMATCH: THE SAME FIGHTERS AND ARENA, WHEN BOTH PLAYERS CHOOSE IT.", 398.0f, kLabel, false);
+    DrawBoardPlain(c, s, v, panel);  // the score: over the panel and beside it
     if (s.test) Hud::Write(c, kSmallFace, "TEST", panel.x0 + U(fr, 26.0f), fr.y + U(fr, 362.0f), kYellow, 255, false);
     const bool theirLock = s.peer == kPeerLocked && s.theirCursor != kNoCell, myLock = s.myLocked && s.myCursor != kNoCell;
     const bool open = !s.note[0];  // still choosing: the rows are live
@@ -603,10 +825,17 @@ void DrawVote(Canvas& c, const State& s, const Hud::View& v) {
 
 // A re-fight both players chose, on the character select: two lines at the foot of the frame, on the game's own
 // picture (name[0], then the note).
+// With 'cover' the game's picture is hidden whole and the two lines stand in the middle of the frame (a re-fight that
+// keeps its fighters: MK9's character select runs under it and asks the player nothing).
+constexpr float kCoverLift = 448.0f;  // the card's lines and band, moved up from the foot by this much
+constexpr uint32_t kCoverGround = 0x000000;
+
 void DrawCard(Canvas& c, const State& s, const Hud::View& v) {
     const Frame fr = Hud::FrameOf(v);
-    Centre(c, fr, kMainFace, s.name[0], kBannerA, kGold, true);
-    Centre(c, fr, kSmallFace, s.note, kBannerB, kWhite, true);
+    const float lift = s.cover ? kCoverLift : 0.0f;
+    if (s.cover) Hud::Rect(c, v.x, v.y, v.x + v.w, v.y + v.h, Argb(kCoverGround, 255));
+    Centre(c, fr, kMainFace, s.name[0], kBannerA - lift, kGold, true);
+    Centre(c, fr, kSmallFace, s.note, kBannerB - lift, kWhite, true);
 }
 
 // ---- the choice after a match and the re-fight's card in MK9's look ----
@@ -630,7 +859,8 @@ void DrawVoteLook(Sk::Canvas& c, const State& s, const Hud::View& v) {
     LookGround(c, fr, P, cx, 440.0f);
     LookCentre(c, fr, Sk::kTitle, "PLAY AGAIN?", kVoteTitle, Grey(255));
     LookBar(c, fr, P.x0 + U(fr, kVoteBarInset), P.x1 - U(fr, kVoteBarInset), fr.y + U(fr, kVoteBarTop));
-    LookCentre(c, fr, Sk::kName, FitBy(NameWidth, "RE-FIGHT: THE SAME FIGHTERS AND ARENA, WHEN BOTH PLAYERS CHOOSE IT.", room, cut, sizeof cut), kVoteSub, Grey(200));
+    LookCentre(c, fr, Sk::kName, FitBy(NameWidth, "REMATCH: THE SAME FIGHTERS AND ARENA, WHEN BOTH PLAYERS CHOOSE IT.", room, cut, sizeof cut), kVoteSub, Grey(200));
+    DrawBoardLook(c, s, v, P);  // the score: over the panel and beside it
     if (s.test) Sk::Write(c, Sk::kName, "TEST", P.x0 + U(fr, 40.0f), P.y0 + U(fr, 36.0f), Sk::Pm(0xFFE070, 255));
 
     const bool theirLock = s.peer == kPeerLocked && s.theirCursor != kNoCell, myLock = s.myLocked && s.myCursor != kNoCell;
@@ -746,19 +976,25 @@ constexpr int kCardShade = 190;
 
 void DrawCardLook(Canvas& plain, Sk::Canvas& c, const State& s, const Hud::View& v) {
     const Frame fr = Hud::FrameOf(v);
-    const int cx = fr.x + fr.w / 2, y0 = fr.y + U(fr, kCardTop), y1 = fr.y + U(fr, kCardBottom);
+    const float lift = s.cover ? kCoverLift : 0.0f;
+    const int cx = fr.x + fr.w / 2, y0 = fr.y + U(fr, kCardTop - lift), y1 = fr.y + U(fr, kCardBottom - lift);
     const int out = std::min(U(fr, kCardHalfW), fr.w / 2), core = std::min(U(fr, kCardCore), out), rule = std::max(1, U(fr, 2.0f));
-    Hud::Rect(plain, cx - core, y0, cx + core, y1, Argb(0x000000, kCardShade));
-    Sk::FillH(c, cx - out, y0, cx - core, y1, Sk::Pm(0x000000, 0), Sk::Pm(0x000000, kCardShade));
-    Sk::FillH(c, cx + core, y0, cx + out, y1, Sk::Pm(0x000000, kCardShade), Sk::Pm(0x000000, 0));
+    if (s.cover) {
+        // The one plain rectangle is the cover itself: the whole picture, opaque. The band needs no shade on it.
+        Hud::Rect(plain, v.x, v.y, v.x + v.w, v.y + v.h, Argb(kCoverGround, 255));
+    } else {
+        Hud::Rect(plain, cx - core, y0, cx + core, y1, Argb(0x000000, kCardShade));
+        Sk::FillH(c, cx - out, y0, cx - core, y1, Sk::Pm(0x000000, 0), Sk::Pm(0x000000, kCardShade));
+        Sk::FillH(c, cx + core, y0, cx + out, y1, Sk::Pm(0x000000, kCardShade), Sk::Pm(0x000000, 0));
+    }
     LookRule(c, cx - out, cx + out, y0, y0 + rule, kGoldLight, 255);
     LookRule(c, cx - out, cx + out, y0 + rule, y0 + 2 * rule, kGoldDark, 255);
     LookRule(c, cx - out, cx + out, y1 - 2 * rule, y1 - rule, kGoldLight, 255);
     LookRule(c, cx - out, cx + out, y1 - rule, y1, kGoldDark, 255);
     char cut[120];
     const int room = 2 * out - 2 * U(fr, 60.0f);
-    LookCentre(c, fr, Sk::kLine, FitBy([](const char* t) { return Sk::Width(Sk::kLine, t); }, s.name[0], room, cut, sizeof cut), kBannerA, Sk::Pm(kGoldLight, 255));
-    LookCentre(c, fr, Sk::kName, FitBy(NameWidth, s.note, room, cut, sizeof cut), kBannerB, Grey(240));
+    LookCentre(c, fr, Sk::kLine, FitBy([](const char* t) { return Sk::Width(Sk::kLine, t); }, s.name[0], room, cut, sizeof cut), kBannerA - lift, Sk::Pm(kGoldLight, 255));
+    LookCentre(c, fr, Sk::kName, FitBy(NameWidth, s.note, room, cut, sizeof cut), kBannerB - lift, Grey(240));
 }
 
 State gBuf[2];
@@ -940,6 +1176,34 @@ void Publish(const State& s) {
     InterlockedExchange(&gFront, back);
 }
 
+// The cover: its own two buffers (the text changes rarely, so a call that changes nothing writes no buffer), and the
+// tick count at which it ends unless it is asked for again.
+namespace {
+State gCoverBuf[2];
+volatile LONG gCoverFront = 0, gCoverOn = 0, gCoverEnd = 0;
+bool CoverLive() { return gCoverOn && (LONG)((DWORD)gCoverEnd - GetTickCount()) > 0; }
+}  // namespace
+void Cover(const char* title, const char* note, uint32_t keepMs) {
+    const State& f = gCoverBuf[gCoverFront & 1];
+    char t[sizeof f.name[0]], n[sizeof f.note];
+    snprintf(t, sizeof t, "%s", title ? title : "");
+    snprintf(n, sizeof n, "%s", note ? note : "");
+    if (f.phase != kCard || strcmp(f.name[0], t) || strcmp(f.note, n)) {
+        const LONG back = (gCoverFront & 1) ^ 1;
+        State& s = gCoverBuf[back];
+        s = State{};
+        s.phase = kCard;
+        s.cover = 1;
+        memcpy(s.name[0], t, sizeof t);
+        memcpy(s.note, n, sizeof n);
+        InterlockedExchange(&gCoverFront, back);
+    }
+    InterlockedExchange(&gCoverEnd, (LONG)(GetTickCount() + (keepMs ? keepMs : 1)));
+    InterlockedExchange(&gCoverOn, 1);
+}
+void CoverOff() { InterlockedExchange(&gCoverOn, 0); }
+bool CoverShown() { return CoverLive(); }
+
 bool CanDraw() { return gFaces && (LONG)GetTickCount() - gSeenTick < 1000; }
 
 int Build(const Hud::View& v, bool faces, uint64_t nowMs, Hud::Vtx* out, int cap) {
@@ -951,6 +1215,8 @@ int Build(const Hud::View& v, bool faces, uint64_t nowMs, Hud::Vtx* out, int cap
     gPicN = gSplit = gLookN = 0;
     if (demo > 0) {
         if (!Demo(demo, nowMs, &s)) return 0;
+    } else if (CoverLive()) {
+        s = gCoverBuf[gCoverFront & 1];  // (in place of the published state: the picture is hidden whole)
     } else {
         if (gBuf[gFront & 1].phase == kOff) return 0;  // the usual case: nothing copied
         s = gBuf[gFront & 1];
@@ -981,9 +1247,63 @@ void LookCounters(long* draws, long* largest) {
 void SetDemo(int n) { InterlockedExchange(&gDemo, n < 0 || n > kDemos + kVoteDemos ? 0 : n); }
 int DemoShown() { return gDemo; }
 
+// The score of the canned choices: 2 an evening's first five matches (this player on a run of three), 3 a longer
+// history (every day's total), 4 the fullest (draws, six fighters, the opponent on a run, four-figure-wide totals).
+static void DemoMatch(Score::Board* b, Score::Result r, int mine, int theirs, const char* me, const char* them, const char* time, bool today) {
+    Score::Entry e;
+    e.result = r, e.roundsKnown = true, e.mine = mine, e.theirs = theirs;
+    snprintf(e.myFighter, sizeof e.myFighter, "%s", me);
+    snprintf(e.theirFighter, sizeof e.theirFighter, "%s", them);
+    snprintf(e.time, sizeof e.time, "%s", time);
+    b->Add(e, today);
+}
+static void DemoBoard(int kind, Score::Board* b) {
+    *b = Score::Board{};
+    b->on = 1, b->allKnown = 1;
+    using Score::kDraw;
+    using Score::kLoss;
+    using Score::kWin;
+    char t[24];
+    const int olderW = kind == 3 ? 37 : kind == 4 ? 128 : 0, olderL = kind == 3 ? 36 : kind == 4 ? 127 : 0;
+    for (int i = 0, w = 0, l = 0; w < olderW || l < olderL; ++i) {
+        const bool win = (i % 2 == 0 && w < olderW) || l >= olderL;
+        snprintf(t, sizeof t, "2026-11-15 2%d:%02d:00", i / 60 % 4, i % 60);
+        DemoMatch(b, win ? kWin : kLoss, win ? 2 : 1, win ? 1 : 2, "CHAR_SCORPION", "CHAR_SUBZERO_B", t, false);
+        (win ? w : l) += 1;
+    }
+    struct M {
+        Score::Result r;
+        int a, c;
+        const char *me, *them;
+    };
+    static const M two[] = {{kLoss, 1, 2, "CHAR_JOHNNYCAGE_B", "CHAR_NIGHTWOLF"}, {kLoss, 0, 2, "CHAR_JOHNNYCAGE_B", "CHAR_NIGHTWOLF"},
+                            {kWin, 2, 0, "CHAR_JOHNNYCAGE_B", "CHAR_NIGHTWOLF"},  {kWin, 2, 1, "CHAR_CYRAX", "CHAR_REPTILE_C"},
+                            {kWin, 2, 0, "CHAR_CYRAX", "CHAR_REPTILE_C"}};
+    static const M three[] = {{kWin, 2, 1, "CHAR_KUNGLAO", "CHAR_MILEENA_B"}, {kLoss, 0, 2, "CHAR_KUNGLAO", "CHAR_MILEENA_B"},
+                              {kWin, 2, 0, "CHAR_KUNGLAO", "CHAR_MILEENA_B"}, {kLoss, 1, 2, "CHAR_SINDEL", "CHAR_MILEENA_B"},
+                              {kWin, 2, 1, "CHAR_SINDEL", "CHAR_KABAL"},      {kWin, 2, 0, "CHAR_SINDEL", "CHAR_KABAL"}};
+    static const char* const mine4[] = {"CHAR_CYBERSUBZERO", "CHAR_FREDDYKRUEGER", "CHAR_SHANGTSUNG_B", "CHAR_NOOBSAIBOT", "CHAR_JOHNNYCAGE_C", "CHAR_KUNGLAO"};
+    static const char* const theirs4[] = {"CHAR_SHANGTSUNG", "CHAR_NIGHTWOLF", "CHAR_QUANCHI_B", "CHAR_KITANA"};
+    if (kind == 4) {
+        static const char kRun[] = "WLWWLWLWWLWWLWLWWLWDLLLL";  // 12 won, 11 lost, 1 drawn; the opponent's run of four at the end
+        for (int i = 0; i < 24; ++i) {
+            const Score::Result r = kRun[i] == 'W' ? kWin : kRun[i] == 'D' ? kDraw : kLoss;
+            snprintf(t, sizeof t, "2026-11-16 2%d:%02d:00", 1 + i / 12, i % 12 * 5);
+            DemoMatch(b, r, r == kWin ? 2 : r == kDraw ? 1 : 0, r == kLoss ? 2 : r == kDraw ? 1 : 1, mine4[i % 6], theirs4[i % 4], t, true);
+        }
+        return;
+    }
+    const M* list = kind == 2 ? two : three;
+    const int n = kind == 2 ? 5 : 6;
+    for (int i = 0; i < n; ++i) {
+        snprintf(t, sizeof t, "2026-11-16 21:%02d:00", 10 + 3 * i);
+        DemoMatch(b, list[i].r, list[i].a, list[i].c, list[i].me, list[i].them, t, true);
+    }
+}
+
 // The choice after a match and the re-fight's card (canned states kDemos + 1 ...).
 static bool DemoVote(int n, State* s) {
-    static const char* const rows[] = {"RE-FIGHT", "CHANGE FIGHTER OR ARENA", "LEAVE"};
+    static const char* const rows[] = {"REMATCH", "CHANGE FIGHTER OR ARENA", "LEAVE"};
     for (int i = 0; i < 3; ++i) snprintf(s->name[i], sizeof s->name[i], "%s", rows[i]);
     s->cells = 3;
     s->phase = kVote;
@@ -991,22 +1311,32 @@ static bool DemoVote(int n, State* s) {
     switch (n) {
     case 1:  // both choosing
         break;
-    case 2:  // this player has locked RE-FIGHT, the opponent's cursor stands on it too
+    case 2:  // this player has locked RE-FIGHT, the opponent's cursor stands on it too; the evening's score
         s->myLocked = 1, s->theirCursor = 0;
+        DemoBoard(2, &s->board);
         break;
     case 3:  // both chose RE-FIGHT
         s->myLocked = 1, s->theirCursor = 0, s->peer = kPeerLocked;
-        snprintf(s->note, sizeof s->note, "RE-FIGHT: THE SAME FIGHTERS, THE SAME ARENA");
+        snprintf(s->note, sizeof s->note, "REMATCH: THE SAME FIGHTERS, THE SAME ARENA");
+        DemoBoard(3, &s->board);
         break;
-    case 4:  // one wants a change
+    case 4:  // one wants a change; the fullest board
         s->myLocked = 1, s->theirCursor = 1, s->peer = kPeerLocked;
         snprintf(s->note, sizeof s->note, "BACK TO THE CHARACTER SELECT");
+        DemoBoard(4, &s->board);
         break;
     case 5:  // the card on the character select
         *s = State{};
         s->phase = kCard;
-        snprintf(s->name[0], sizeof s->name[0], "RE-FIGHT");
+        snprintf(s->name[0], sizeof s->name[0], "REMATCH");
         snprintf(s->note, sizeof s->note, "THE SAME ARENA AGAIN. CONFIRM YOUR FIGHTER.");
+        break;
+    case 6:  // the card that covers the character select: a re-fight that keeps its fighters
+        *s = State{};
+        s->phase = kCard;
+        s->cover = 1;
+        snprintf(s->name[0], sizeof s->name[0], "REMATCH");
+        snprintf(s->note, sizeof s->note, "THE SAME FIGHTERS, THE SAME ARENA");
         break;
     default:
         return false;

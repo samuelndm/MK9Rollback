@@ -20,7 +20,8 @@ struct Spec {
     const char* only;  // the signs this face is asked for (nullptr: all)
 };
 // The title face is the largest and only ever writes the panel's headings and the mark of "random".
-constexpr Spec kSpec[kFaces] = {{ArenaPics::kLargeMenu, 44.0f, "ABCDEFGHIJKLMNOPQRSTUVWXYZ?"}, {ArenaPics::kLargeMenu, 27.0f, nullptr}, {ArenaPics::kSmallMenu, 17.0f, nullptr}};
+constexpr Spec kSpec[kFaces] = {{ArenaPics::kLargeMenu, 44.0f, "ABCDEFGHIJKLMNOPQRSTUVWXYZ?"}, {ArenaPics::kLargeMenu, 27.0f, nullptr}, {ArenaPics::kSmallMenu, 17.0f, nullptr},
+                                {ArenaPics::kLargeMenu, 66.0f, "0123456789-"}};  // kScore: the score's numbers after a match
 
 constexpr int kFineBelow = 15;  // capitals lower than this many pixels: letters placed between pixels (Write)
 
@@ -140,8 +141,8 @@ bool BuildFaces(const ArenaPics::Art* art, const Hud::View& v) {
     }
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&fq);
-    snprintf(gText, sizeof gText, "MK9 lettering for %dx%d: capitals %d, %d and %d px, %d letters in %d of %d rows of the texture, %.1f ms", v.w, v.h, gFace[kTitle].cap,
-             gFace[kLine].cap, gFace[kName].cap, letters, pack.y + pack.rowH - kAtlasH / 2, kAtlasH / 2,
+    snprintf(gText, sizeof gText, "MK9 lettering for %dx%d: capitals %d, %d and %d px, numbers %d px, %d letters in %d of %d rows of the texture, %.1f ms", v.w, v.h,
+             gFace[kTitle].cap, gFace[kLine].cap, gFace[kName].cap, gFace[kScore].cap, letters, pack.y + pack.rowH - kAtlasH / 2, kAtlasH / 2,
              (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)(fq.QuadPart ? fq.QuadPart : 1));
     return true;
 }

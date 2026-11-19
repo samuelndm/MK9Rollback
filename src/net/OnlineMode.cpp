@@ -19,6 +19,7 @@
 #include "EnvFingerprint.h"
 #include "FinisherRule.h"
 #include "HelloProto.h"
+#include "KothRoom.h"
 #include "Refight.h"
 #include "StageFlow.h"
 #include "StagePick.h"
@@ -153,6 +154,34 @@ bool gLinkRelayed = false;      // Steam's P2P session with the opponent goes th
 bool gLinkLogged = false;       // per match
 ULONGLONG gPeerKnownAt = 0;     // the opponent of this connection phase has been known since (0: not known)
 bool gMatchModeLogged = false;  // per match
+
+// King of the Hill (KothRoom.h): the room, who is in it, and MK9's connection timers there. The verdict is read by
+// OneOnOne on any thread; the book by IdleHook on whatever thread MK9 asks its timers from.
+KothRoom::Room gKoth;
+KothRoom::Sticky gKothSticky;
+volatile LONG gKothVerdict = (LONG)KothRoom::Verdict::kUnknown;
+KothRoom::Members gKothMembers;  // the last read (game thread)
+ULONGLONG gKothReadAt = 0;
+uint32_t gKothVerdictLines = 0;  // per room
+KothRoom::IdleBook gIdleBook;    // under gIdleLock
+SRWLOCK gIdleLock = SRWLOCK_INIT;
+// 64-bit tick values shared with IdleHook: read and written whole (cmpxchg8b), never torn on this 32-bit build.
+volatile LONG64 gRoomEngagedAt = 0;  // this game's latest engagement in the room (GetTickCount64; 0: none)
+volatile LONG64 gLastHeardAt = 0;    // the opponent's mod was last heard from (any datagram of it)
+volatile LONG64 gLastExOk64 = 0;     // MK9's exchange last got the opponent's data
+volatile LONG gStarvedShownMax = -1, gStarvedRealMax = 0;  // this second: the most MK9 was shown on a starved connection
+uint32_t gStarvedLines = 0;          // per room
+ULONGLONG Load64(volatile LONG64* p) { return (ULONGLONG)InterlockedCompareExchange64(p, 0, 0); }
+void Store64(volatile LONG64* p, ULONGLONG v) { InterlockedExchange64(p, (LONG64)v); }
+void RaiseTo(volatile LONG* p, LONG v) {  // *p = max(*p, v), from any thread
+    LONG was = *p;
+    while (v > was) {
+        const LONG seen = InterlockedCompareExchange(p, v, was);
+        if (seen == was) break;
+        was = seen;
+    }
+}
+KothRoom::Verdict KothVerdict() { return (KothRoom::Verdict)gKothVerdict; }
 
 uint32_t GameState() {
     const uint32_t gi = *reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().gameInfoPtr);
@@ -544,6 +573,7 @@ int __fastcall ExchangeHook(uint8_t* self, void*, int arg) {
     } else if (r == 1) {
         ++gExOne;
         gLastExOk = GetTickCount();
+        Store64(&gLastExOk64, GetTickCount64());
     } else {
         ++gExOther;
     }
@@ -568,7 +598,25 @@ uint32_t __fastcall IdleHook(void* self, void*) {
     if (IdleSocketReceived(self, ms) && ms > gIdlePeak) gIdlePeak = ms;
     // The grace after a session does not need gPeer (an 'online auto' re-arm outside a fight forgets the opponent until
     // it is found again).
-    if (Online::SkipNative() || GetTickCount64() < gGraceUntil) return 0;
+    const ULONGLONG now = GetTickCount64();
+    const bool hidden = Online::SkipNative() || now < gGraceUntil;
+    // A King of the Hill room: each connection apart (KothRoom::IdleBook). A connection the rollback fights starved stays
+    // hidden while the opponent's game is heard from, also between the room's matches, where no rematch screen keeps
+    // MK9's exchange going; every other connection (a later player's, a silence from before the fights) is MK9's own.
+    if (gKoth.in) {
+        const ULONGLONG heardHello = Load64(&gLastHeardAt), heardExchange = Load64(&gLastExOk64);
+        const ULONGLONG heard = heardHello > heardExchange ? heardHello : heardExchange;
+        AcquireSRWLockExclusive(&gIdleLock);
+        const uint32_t shown = gIdleBook.Show(self, now, ms, hidden, Load64(&gRoomEngagedAt), heard);
+        const bool starved = gIdleBook.lastWasStarved;
+        ReleaseSRWLockExclusive(&gIdleLock);
+        if (starved) {  // for Tick's line, once a second: the most MK9 was shown on such a connection, and its own value
+            RaiseTo(&gStarvedShownMax, (LONG)shown);
+            RaiseTo(&gStarvedRealMax, (LONG)ms);
+        }
+        return shown;
+    }
+    if (hidden) return 0;
     // After a session this timer can stay at the session's start while MK9's exchange runs again: 2026-11-03 one game read
     // 166 s at the rematch's character select (exchange results all 1) and its connection closed 34 ms after the grace
     // ran out. Once a session ran in this match, the gap counts from the exchange's last success when that is newer; a
@@ -613,23 +661,78 @@ void LogLayout(const char* why) {
 
 // The match description (GameContext, dumped by 0x0081B8A0 at 0x0093B5A8): online manager [0x00E924F0] + 0x73C;
 // +0x00 Mode (None/Looking/Found/Cancel), +0x04 Type (None/Ranked/Player/Private), +0x10 MatchType (DM/KOTH).
-// Rollback replaces the exchange of exactly two games: a King of the Hill room has spectators that receive the
-// fighters' pads through the same exchange (they would get nothing, and the idle-time hook keeps their timeouts from
-// firing), and ranked matches are never touched. Anything unreadable or unexpected: not engaged.
+// Rollback replaces the exchange of exactly two games: a King of the Hill room's watchers receive the fighters' pads
+// through the same exchange (they would get nothing), and ranked matches are never touched. Anything unreadable or
+// unexpected: not engaged.
 constexpr uint32_t kGameContext = 0x73C;
-bool OneOnOneMatch(uint32_t* type, uint32_t* matchType) {
+bool ReadContext(uint32_t* type, uint32_t* matchType) {
     *type = *matchType = 0xFFFFFFFF;
     const uint32_t mgr = *reinterpret_cast<const volatile uint32_t*>(kOnlineManager);
     if (!mgr || !Readable(reinterpret_cast<void*>(mgr + kGameContext), 0x18)) return false;
     const volatile uint8_t* ctx = reinterpret_cast<const volatile uint8_t*>(mgr + kGameContext);
     *type = U32(ctx, 0x04);
     *matchType = U32(ctx, 0x10);
-    // Type 0 (None) too: the first real two-PC test (2026-10-29 18:55, a 1 vs 1 room joined by invite) read type 0 for
-    // the whole match, so every fight was refused. Ranked (1) stays refused; King of the Hill is match type 1.
-    return (*type == 0 || *type == 2 || *type == 3) && *matchType == 0;  // None (invited room), Player or Private; DM
+    return true;
 }
 
-// The match mode, with the fields OneOnOneMatch decides on: logged once per match in the fight's phase. Nothing is
+// The match is one this mode engages in. Type 0 (None) too: the first real two-PC test (2026-10-29 18:55, a 1 vs 1
+// room joined by invite) read type 0 for the whole match, so every fight was refused. Ranked (1) stays refused.
+// - A one-on-one room (match type 0, never in MK9's King of the Hill state): as it always was.
+// - A King of the Hill room (match type 1, or MK9's King of the Hill state seen since the menus; KothRoom.h): only while
+//   it holds just the two players. 2026-11-14 such a room read match type 0 like a one-on-one room, so the match type
+//   alone cannot tell; with a third player in it rollback would leave them nothing to watch.
+// *koth: the match is in a King of the Hill room.
+bool MatchAllowsRollback(uint32_t* type, uint32_t* matchType, bool* koth) {
+    *koth = false;
+    if (!ReadContext(type, matchType)) return false;
+    if (*type != 0 && *type != 2 && *type != 3) return false;  // None (invited room), Player or Private
+    *koth = gKoth.in || *matchType == 1;
+    if (!*koth) return *matchType == 0;  // DM
+    return *matchType <= 1 && KothVerdict() == KothRoom::Verdict::kTwoPlayers;
+}
+
+// Who is in the King of the Hill room: the session's four connection arrays (KothRoom.h has the layout). Every read
+// goes through the crash handler's guarded read: MK9 changes these arrays while players come and go.
+constexpr uint32_t kManagerSession = 0x1F4, kSessionLists = 0x40D0, kListStride = 0xC, kSessionOwnName = 0x4B38, kConnName = 0x1778;
+bool ReadName(uintptr_t at, char* out) {  // KothRoom::kNameMax bytes, as they are (need not end in a zero)
+    for (uint32_t i = 0; i < KothRoom::kNameMax; i += 4) {
+        uint32_t v = 0;
+        if (!CrashLog::SafeRead32(at + i, &v)) return false;
+        memcpy(out + i, &v, 4);
+    }
+    return true;
+}
+KothRoom::Members ReadMembers() {
+    uint32_t mgr = 0, session = 0;
+    if (!CrashLog::SafeRead32(kOnlineManager, &mgr) || !mgr || !CrashLog::SafeRead32(mgr + kManagerSession, &session) || !session)
+        return KothRoom::Members{};
+    char own[KothRoom::kNameMax];
+    if (!ReadName(session + kSessionOwnName, own)) return KothRoom::Members{};
+    return KothRoom::Count(
+        [&](uint32_t i, uintptr_t* data, uint32_t* count) {
+            uint32_t d = 0, c = 0;
+            const uintptr_t a = session + kSessionLists + i * kListStride;
+            if (!CrashLog::SafeRead32(a, &d) || !CrashLog::SafeRead32(a + 4, &c)) return false;
+            *data = d;
+            *count = c;
+            return true;
+        },
+        [&](uintptr_t data, uint32_t k, uintptr_t* conn) {
+            uint32_t v = 0;
+            if (!CrashLog::SafeRead32(data + 4 * k, &v)) return false;
+            *conn = v;
+            return true;
+        },
+        [&](uintptr_t conn, char* out) { return ReadName(conn + kConnName, out); }, own);
+}
+// "4 entries in the session's connection arrays, 2 connection(s), 1 with this player's name, 0 nameless": counts only.
+int AppendMembers(char* out, size_t cap, int n, const KothRoom::Members& m) {
+    if (!m.read) return AppendF(out, cap, n, "the session's connection arrays could not be read");
+    return AppendF(out, cap, n, "%u entr%s in the session's connection arrays, %u connection(s), %u with this player's name, %u nameless",
+                   (unsigned)m.entries, m.entries == 1 ? "y" : "ies", (unsigned)m.distinct, (unsigned)m.self, (unsigned)m.unnamed);
+}
+
+// The match mode, with the fields MatchAllowsRollback decides on: logged once per match in the fight's phase. Nothing is
 // refused on it yet. docs\reverse_engineering.md puts MatchMode at GameContext +0x14 with the names 1V1, TAG, TAG_2P
 // (0x0081A660) but no values, and its layout of the fields before it (+0x08 GameType) is not the one read here at
 // runtime (+0x04 Type). The name function itself (static, 2026-11-10) returns "1V1" for 0, "TAG" for 1, "TAG_2P" for 2;
@@ -645,10 +748,16 @@ void LogMatchMode() {
     Logger::Info("ONLINE: match description (GameContext): match mode (+0x14) %u (the game's names: 0 1V1, 1 TAG, 2 TAG_2P; not "
                  "checked yet); mode (+0x00) %u, type (+0x04) %u, +0x08 %u, +0x0C %u, match type (+0x10) %u",
                  U32(ctx, 0x14), U32(ctx, 0x00), U32(ctx, 0x04), U32(ctx, 0x08), U32(ctx, 0x0C), U32(ctx, 0x10));
+    // Who is in the room, every match: in a King of the Hill room what the decision rests on; in a one-on-one room what a
+    // room of two looks like in MK9's arrays (whether MK9 keeps a connection for the local player is not known yet).
+    char who[200];
+    AppendMembers(who, sizeof who, 0, gKoth.in ? gKothMembers : ReadMembers());
+    if (gKoth.in) Logger::Info("ONLINE: King of the Hill room: %s; the room holds %s", who, KothRoom::VerdictText(KothVerdict()));
+    else Logger::Info("ONLINE: one-on-one room: %s (read for the record; one-on-one rooms do not depend on it)", who);
 }
 
 // This game's own conditions to engage (the engage path in Tick adds the other game's): the fight's connection phase,
-// a final delay proposal, no failure this match, a one-on-one Player/Private match.
+// a final delay proposal, no failure this match, a one-on-one Player/Private match or a King of the Hill room of two.
 HelloProto::Local LocalState() {
     HelloProto::Local l;
     l.fightActive = FightActive();
@@ -656,7 +765,8 @@ HelloProto::Local LocalState() {
     l.delayFinal = OwnDelayFinal();
     l.failedThisMatch = gFailedThisMatch;
     uint32_t type = 0, matchType = 0;
-    l.oneOnOne = l.fightActive && l.fightState && OneOnOneMatch(&type, &matchType);
+    bool koth = false;
+    l.oneOnOne = l.fightActive && l.fightState && MatchAllowsRollback(&type, &matchType, &koth);
     return l;
 }
 
@@ -706,6 +816,7 @@ void ReadHellos() {
         const int got = SteamBridge::ReadRaw(kHelloChannel, buf, sizeof buf, &from);
         if (got < 0) break;
         if (from != gPeer) continue;
+        Store64(&gLastHeardAt, GetTickCount64());  // the opponent's game runs (IdleHook, King of the Hill rooms)
         // The mods' second datagram on this channel (the stage screen's picks, StagePick.h): not a hello.
         // Each takes the packets of its own kind: the stage picks, the choice after a match (Refight.h).
         if (StagePick::IsPacket(buf, (size_t)got)) {
@@ -939,6 +1050,65 @@ void MatchReset(const char* why) {
         gNarrowMisses = 0;
         if (gWideState == 3) InterlockedExchange(&gWideState, 0);  // a running pass finishes first
     }
+    Store64(&gLastHeardAt, 0);
+    Store64(&gLastExOk64, 0);
+}
+
+// The King of the Hill room (KothRoom.h): entered at MK9's King of the Hill state, left in MK9's menus. While in it,
+// who is in it is read every 100 ms; the verdict decides whether a match of the room engages (MatchAllowsRollback).
+// Every engine tick, also when the online mode is not armed (OneOnOne answers the stage screen and the score then too).
+constexpr ULONGLONG kKothReadMs = 100;
+constexpr uint32_t kKothVerdictLinesMax = 24;
+void ClearIdleBook() {
+    AcquireSRWLockExclusive(&gIdleLock);
+    gIdleBook.Clear();
+    ReleaseSRWLockExclusive(&gIdleLock);
+    Store64(&gRoomEngagedAt, 0);
+    gStarvedLines = 0;
+    InterlockedExchange(&gStarvedShownMax, -1);
+    InterlockedExchange(&gStarvedRealMax, 0);
+}
+void UpdateKothRoom(ULONGLONG now) {
+    const uint32_t mgr = *reinterpret_cast<const volatile uint32_t*>(kOnlineManager);
+    uint32_t type = 0, matchType = 0;
+    const bool context = mgr && ReadContext(&type, &matchType);
+    const uint32_t state = GameState();
+    switch (gKoth.Update(state, mgr != 0, context && matchType == 1)) {
+        case KothRoom::Change::kEntered:
+            gKothSticky.Reset();
+            InterlockedExchange(&gKothVerdict, (LONG)KothRoom::Verdict::kUnknown);
+            gKothReadAt = 0;
+            gKothVerdictLines = 0;
+            ClearIdleBook();
+            Logger::Info("ONLINE: King of the Hill room (game state %u, match type %d): rollback in its matches only while it holds just "
+                         "the two players; with anyone else in it MK9's netcode plays (watchers receive the fight through MK9's exchange)",
+                         state, context ? (int)matchType : -1);
+            break;
+        case KothRoom::Change::kLeft:
+            Logger::Info("ONLINE: left the King of the Hill room (game state %u%s)", state, mgr ? "" : ", offline");
+            if (gPeer || gAuto) MatchReset("left the King of the Hill room");
+            gKothSticky.Reset();
+            InterlockedExchange(&gKothVerdict, (LONG)KothRoom::Verdict::kUnknown);
+            ClearIdleBook();
+            return;
+        case KothRoom::Change::kNone: break;
+    }
+    if (!gKoth.in || now - gKothReadAt < kKothReadMs) return;
+    gKothReadAt = now;
+    gKothMembers = ReadMembers();
+    const KothRoom::Verdict was = KothVerdict(), v = gKothSticky.Feed(KothRoom::Judge(gKothMembers), now);
+    if (v == was) return;
+    InterlockedExchange(&gKothVerdict, (LONG)v);
+    if (gKothVerdictLines >= kKothVerdictLinesMax) return;
+    char who[200];
+    AppendMembers(who, sizeof who, 0, gKothMembers);
+    const bool fight = Online::SkipNative();
+    Logger::Info("ONLINE: King of the Hill room: it holds %s now (%s)%s%s", KothRoom::VerdictText(v), who,
+                 v == KothRoom::Verdict::kTwoPlayers ? "; its next match can run on rollback" : "; its matches run on MK9's netcode",
+                 fight && v != KothRoom::Verdict::kTwoPlayers
+                     ? "; this rollback fight goes on to its end, and a player who came in during it cannot watch it"
+                     : "");
+    if (++gKothVerdictLines == kKothVerdictLinesMax) Logger::Info("ONLINE: King of the Hill room: no more lines about who is in it in this room");
 }
 }  // namespace
 
@@ -951,8 +1121,13 @@ bool SendToPeer(const void* data, uint32_t size) {
 
 bool OneOnOne() {
     uint32_t type = 0, matchType = 0;
-    return OneOnOneMatch(&type, &matchType);
+    bool koth = false;
+    return MatchAllowsRollback(&type, &matchType, &koth);
 }
+
+bool KingOfTheHill() { return gKoth.in; }
+
+uint64_t Opponent() { return gPeer && gPeer != kAutoPeer ? gPeer : 0; }
 
 bool Install() {
     if (gExchangeTramp && gIdleTramp && gSendTramp) return true;
@@ -1048,6 +1223,7 @@ constexpr const char* Fits(const char (&text)[N]) {
 
 const char* StatusText() {  // game thread (overlay publish); null outside an online fight or while engaged
     if ((!gPeer && !gAuto) || gEngaged || !FightActive()) return nullptr;
+    if (gMatchRefused && gKoth.in) return Fits("MK9 NETCODE  (King of the Hill: more players than the two)");
     if (gMatchRefused) return Fits("MK9 NETCODE  (rollback off: 1 vs 1 Player Match / private only)");
     if (gFailedThisMatch) return Fits("MK9 NETCODE  (rollback stopped for this match)");
     if (!gPeer) return Fits("MK9 NETCODE  (looking for the opponent's mod...)");
@@ -1074,9 +1250,11 @@ int PreFight(int* rttMs, const char** why) {  // game thread (overlay publish)
         return Overlay::kPreBlocked;
     }
     if (gVerdict != HelloProto::Match::kSame || now - gAnyHelloRx > kHelloFreshMs) return Overlay::kPreNone;
-    // The fight's own check (Tick) refuses anything but a one-on-one Player/Private match: no promise before those.
+    // The fight's own check (Tick) refuses anything but a one-on-one Player/Private match or a King of the Hill room of
+    // two: no promise before those.
     uint32_t type = 0, matchType = 0;
-    if (gMatchRefused || !OneOnOneMatch(&type, &matchType)) return Overlay::kPreNone;
+    bool koth = false;
+    if (gMatchRefused || !MatchAllowsRollback(&type, &matchType, &koth)) return Overlay::kPreNone;
     if (gPingCount && gPingPeer == gPeer) {
         uint32_t median = 0;
         PingEstimate(&median);
@@ -1087,7 +1265,9 @@ int PreFight(int* rttMs, const char** why) {  // game thread (overlay publish)
 
 bool SameBuildPeer() {
     uint32_t type = 0, matchType = 0;
-    return gPeer && gPeer != kAutoPeer && HeardPeer() && gVerdict == HelloProto::Match::kSame && !gMatchRefused && OneOnOneMatch(&type, &matchType);
+    bool koth = false;
+    return gPeer && gPeer != kAutoPeer && HeardPeer() && gVerdict == HelloProto::Match::kSame && !gMatchRefused &&
+           MatchAllowsRollback(&type, &matchType, &koth);
 }
 
 void TestScan() {  // 'onlinescan': the fallback pass on demand (its log line gives size and time); results unused
@@ -1186,8 +1366,9 @@ int LocalPlayer() {
 }
 
 void Tick() {
-    if (!gPeer && !gAuto) return;
     const ULONGLONG now = GetTickCount64();
+    UpdateKothRoom(now);
+    if (!gPeer && !gAuto) return;
     if (gPeer) {
         UpdateOwnId();  // ReadHellos compares a first hello with it
         ReadHellos();
@@ -1225,6 +1406,17 @@ void Tick() {
         gIdlePeaks[gIdlePeakPos++ % 8] = peak;
         if (peak >= 1000 && active && gIdleLogs++ < 20)
             Logger::Info("ONLINE: MK9's connection went %u ms without a packet from the opponent", peak);
+        // King of the Hill: a connection the rollback fights starved, as MK9 was shown it (IdleHook). The first second
+        // after a fight's grace in which MK9 saw it, and any second in which MK9 was shown a second or more.
+        const LONG shownMax = InterlockedExchange(&gStarvedShownMax, -1), realMax = InterlockedExchange(&gStarvedRealMax, 0);
+        if (gKoth.in && shownMax >= 0 && (gStarvedLines == 0 || shownMax >= 1000) && gStarvedLines < 12) {
+            const ULONGLONG heard = Load64(&gLastHeardAt);
+            Logger::Info("ONLINE: King of the Hill room: one of MK9's connections has been silent since a rollback fight (%ld ms); MK9 "
+                         "is shown at most %ld ms, the time since the opponent's game was last heard (its mod %s)%s",
+                         realMax, shownMax, heard ? "answers" : "was not heard in this room",
+                         shownMax >= 1000 ? ": the opponent's game is quiet, MK9's own timeouts count from its last sign" : "");
+            if (++gStarvedLines == 12) Logger::Info("ONLINE: King of the Hill room: no more lines about MK9's silent connection in this room");
+        }
     }
     if (active != gWasActive) {
         gWasActive = active;
@@ -1310,6 +1502,8 @@ void Tick() {
             Logger::Info("ONLINE: results screen: rollback stopped during this match; the next fight tries it again");
         }
         gModeMismatchLogged = false;
+        // A King of the Hill room's next match may have other players in it, or no longer: decided again, and said again.
+        if (gKoth.in) gMatchRefused = false;
     }
     // The results state, once a second while it lasts (about 2 s after a normal ending). 2026-11-11: after a fatality
     // that did not play (MK9's finisher phase ran into its 1800-tick limit on both PCs) both games stayed in this state
@@ -1343,6 +1537,22 @@ void Tick() {
     if (!active) {
         // The writes around the close are logged by now; the gamepad data may be freed and its memory reused.
         if (gInactiveSince && now - gInactiveSince > 3000) DisarmConnectionWatch();
+        // A King of the Hill room goes on between its matches (MK9's King of the Hill state, then the next character
+        // select), and it has no rematch screen whose exchange would show that the opponent's game is there. So the
+        // hellos keep going twice a second (MK9's connection timers in the room count from them: IdleHook), and the match
+        // is not reset after 20 s; leaving the room resets it (UpdateKothRoom). 2026-11-14 the reset would have come 20 s
+        // after the second match's end, and with it MK9 would have seen its connection silent since that fight. An
+        // opponent whose Steam connection is gone has left the room: looked for again at the next match.
+        if (gKoth.in) {
+            if (gPeer && gPeer != kAutoPeer) {
+                if (!SteamBridge::SessionActive(gPeer)) {
+                    if (gAuto && !gEngaged) MatchReset("the opponent left the King of the Hill room");
+                } else if (now - gLastHelloTx >= kHelloEveryMs) {
+                    SendHello();
+                }
+            }
+            return;
+        }
         // The online match is over: ready for the next one. Long enough to outlast a quiet stretch between rounds (a
         // re-engagement after the next round's start would miss that round). Not while MK9 loads the online fight or
         // waits for the other player's load (up to 40 s now): the match is still on, and the fight's phase needs the
@@ -1451,12 +1661,22 @@ void Tick() {
     if (!OwnDelayFinal()) FinalizeDelay("at the fight's connection");
     if (!gPeerDelayFinal) return;
     uint32_t type = 0, matchType = 0;
-    if (!OneOnOneMatch(&type, &matchType)) {
+    bool koth = false;
+    if (!MatchAllowsRollback(&type, &matchType, &koth)) {
         if (!gMatchRefused) {
             gMatchRefused = true;
-            Logger::Info("ONLINE: not engaging in this match (GameContext type %u, match type %u: only one-on-one Player/Private "
-                         "matches, type 0/2/3 and match type 0; ranked is type 1); MK9's netcode plays it",
-                         type, matchType);
+            if (koth) {
+                char who[200];
+                AppendMembers(who, sizeof who, 0, gKothMembers);
+                Logger::Info("ONLINE: not engaging in this match (a King of the Hill room that holds %s: %s; GameContext type %u, "
+                             "match type %u); MK9's netcode plays it",
+                             KothRoom::VerdictText(KothVerdict()), who, type, matchType);
+            } else {
+                Logger::Info("ONLINE: not engaging in this match (GameContext type %u, match type %u: only one-on-one Player/Private "
+                             "matches, type 0/2/3 and match type 0, and King of the Hill rooms of two; ranked is type 1); MK9's "
+                             "netcode plays it",
+                             type, matchType);
+            }
         }
         return;
     }
@@ -1469,6 +1689,7 @@ void Tick() {
     gEngaged = true;
     gSessionThisMatch = true;
     gEngagedAt = now;
+    Store64(&gRoomEngagedAt, now);  // King of the Hill: connections silent from here on are this fight's doing (IdleHook)
     SteamBridge::SetSharedSession(true);
     gSessionDelay = AgreedDelay();
     gLockedTicks = 0;
@@ -1483,8 +1704,13 @@ void Tick() {
     Logger::Info("ONLINE: the session starts at the %s", thisFight ? "first fight frame of this fight" : "next fight start");
     if (gPeerPlayer && gPeerPlayer == Online::LocalPlayer())
         Logger::Info("ONLINE: both games report side %d; the fight start will fail the frame-0 check if they really agree", gPeerPlayer);
-    Logger::Info("ONLINE: both games run MK9Rollback in a one-on-one %s match (GameContext type %u); rollback delay %d",
-                 type == 3 ? "private" : type == 2 ? "player" : "invited", type, gSessionDelay);
+    if (koth)
+        Logger::Info("ONLINE: both games run MK9Rollback in a King of the Hill room that holds just the two of them (GameContext "
+                     "type %u, match type %u); rollback delay %d",
+                     type, matchType, gSessionDelay);
+    else
+        Logger::Info("ONLINE: both games run MK9Rollback in a one-on-one %s match (GameContext type %u); rollback delay %d",
+                     type == 3 ? "private" : type == 2 ? "player" : "invited", type, gSessionDelay);
     Logger::Info("ONLINE: input delay %d agreed (this game proposed %d, the other %d)", gSessionDelay, OwnDelay(), gPeerDelay);
     char p2p[200];
     DescribePeer(p2p, sizeof p2p);

@@ -12,9 +12,15 @@
 #   New-LogTail / Read-LogTail     the lines appended to MK9Rollback.log since the last read
 #   New-LogScrubState / Protect-LogLine / Protect-LogFile / Save-LogsZip   logs for a public bug report
 #   New-MatchFacts / Update-MatchFacts / Format-MatchFacts   the window's "Last match" line
+#   Read-MatchHistory / Get-MatchTally / Format-MatchRecord   the window's score line and its match list (the DLL's
+#                          match_history.txt); Get-FighterName / Get-ArenaName / Get-OpponentLabel for the list
 #   Get-ConnectionHint     Wi-Fi or cable (slow: run it in the background)
 #   New-LogoBitmap         the mark (window icon, header, launcher\app.ico), and $script:UiColors
-# Windows PowerShell 5.1, ASCII only.
+# Windows PowerShell 5.1, ASCII only. What a player reads is written in English and goes through Tr
+# (tools\launcher_text.ps1, loaded first by the window: the player's language); without that file, English.
+if (-not (Get-Command Tr -CommandType Function -ErrorAction SilentlyContinue)) {
+    function Tr { $t = "$($args[0])"; if ($args.Count -gt 1) { $t -f @($args[1..($args.Count - 1)]) } else { $t } }
+}
 
 # ---- log line -> status ----
 # First match wins; m = $null: matched but not shown. {1} {2}: the pattern's groups, {mode}: Rollback or Safe mode.
@@ -31,14 +37,14 @@ $script:LauncherMessages = @(
     @{ p = 'ONLINE auto: the game''s online opponent is'; m = 'Online fight found. Checking whether your opponent runs the mod...'; h = 'Opponent found: checking for the mod...'; t = 'busy' },
     @{ p = 'ONLINE auto: no opponent found yet'; m = $null },
     # The three version lines (one per disagreement) of the DLL's hello check.
-    @{ p = 'ONLINE: the other player''s mod is older'; m = 'Your opponent''s mod is older: they must press ''Check for updates'', then ''Update now''. MK9''s netcode plays this match.'; h = 'Your opponent needs to update'; t = 'warn' },
-    @{ p = 'ONLINE: this mod is older than the other player''s'; m = 'Your mod is older than your opponent''s: close the game and press ''Update now''. MK9''s netcode plays this match.'; check = $true; h = 'You need to update'; t = 'warn' },
+    @{ p = 'ONLINE: the other player''s mod is older'; m = 'Your opponent''s mod is older: they must close the game and open MK9 Rollback again, which updates it. MK9''s netcode plays this match.'; h = 'Your opponent needs to update'; t = 'warn' },
+    @{ p = 'ONLINE: this mod is older than the other player''s'; m = 'Your mod is older than your opponent''s: close the game, and this window installs the new version by itself. MK9''s netcode plays this match.'; check = $true; h = 'You need to update'; t = 'warn' },
     @{ p = 'ONLINE: the other player''s mod is a different build'; m = 'You and your opponent run different builds of the mod: both extract the same zip. MK9''s netcode plays this match.'; h = 'You and your opponent need the same version'; t = 'warn' },
     @{ p = 'ONLINE: the other player''s game files differ'; m = 'Your game files differ from your opponent''s: both need the unmodified Steam Komplete Edition (Steam: Properties, Installed Files, Verify). MK9''s netcode plays this match.' },
     @{ p = 'ONLINE: the other player''s mod runs with other settings'; m = 'Your mod''s settings differ from your opponent''s: both close the game and start it from this window again. MK9''s netcode plays this match.' },
     @{ p = 'ONLINE: hello from the other player'; m = 'Your opponent''s mod answered: {mode} can take over.' },
     @{ p = 'ONLINE: both games run MK9Rollback'; m = 'Both games run the mod.'; h = 'Both games run the mod'; t = 'good' },
-    @{ p = 'ONLINE: not engaging in this match'; m = 'This room is not a 1 vs 1 Player/Private match (King of the Hill or Ranked): MK9''s own netcode plays this match.'; h = 'Not a 1 vs 1 Player Match: MK9''s own netcode'; t = 'warn' },
+    @{ p = 'ONLINE: not engaging in this match'; m = 'This match is not a 1 vs 1 Player/Private match or a King of the Hill room with just the two players (Ranked, or more players in the room): MK9''s own netcode plays this match.'; h = 'Not a 1 vs 1 Player Match: MK9''s own netcode'; t = 'warn' },
     @{ p = 'ONLINE: the other player runs (Safe mode|Rollback), this game (Safe mode|Rollback)'; m = 'Your opponent''s mod runs in {1} and yours in {2}: both must update MK9 Rollback and start the game from its window. MK9''s netcode plays until then.'; h = 'Your opponent''s mod is set up differently'; t = 'warn' },
     @{ p = 'ONLINE: the session starts at the first fight frame'; m = '{mode} takes over when this fight starts.'; kind = 'reset' },
     @{ p = 'ONLINE: the session starts at the next fight start'; m = 'This fight already started: {mode} takes over from the next fight.'; kind = 'reset' },
@@ -54,7 +60,7 @@ $script:LauncherMessages = @(
     @{ p = 'GGPO synchronized with peer'; m = 'Connected to your opponent.' },
     @{ p = 'NETPLAY: both peers running'; m = 'FIGHT! Both games are running.' },
     @{ p = 'NETPLAY environment matches'; m = 'Game files and mod version match your opponent''s.' },
-    @{ p = 'NETPLAY ENVIRONMENT MISMATCH: (.*) differs'; m = 'Your setup differs from your opponent''s: {1}. Use the same mod version (''Check for updates'' at the bottom) and an unmodified game.' },
+    @{ p = 'NETPLAY ENVIRONMENT MISMATCH: (.*) differs'; m = 'Your setup differs from your opponent''s: {1}. Both need the newest mod version (this window installs it when it opens) and an unmodified game.' },
     @{ p = 'NETPLAY: frame 0 differs'; m = 'The two fights don''t match. Pick the same characters on the same sides, the same stage and settings, then fight again.' },
     @{ p = 'NETPLAY DESYNC: frame (\d+)'; m = 'OUT OF SYNC at frame {1}: the two screens may now differ. Please save the logs after this fight.'; kind = 'desync'; h = 'Out of sync'; t = 'bad' },
     # 'desyncstop' (round 3): an online match's session stops once the two games stay different.
@@ -76,14 +82,16 @@ $script:LauncherMessages = @(
     @{ p = 'GGPO p2p stopped'; m = $null; rearm = $true }  # each fight is one session; arm the next one
 )
 
-# $null when no entry matches; else Text ($null: not shown), Rearm, Kind, CheckUpdate, Head, Tone, Pattern.
+# $null when no entry matches; else Text ($null: not shown), Rearm, Kind, CheckUpdate, Head, Tone, Pattern. Text and
+# Head in the player's language (Tr; the groups and the mode are filled in afterwards).
 function Get-LauncherMessage([string]$line, [string]$mode = 'Rollback') {
     foreach ($e in $script:LauncherMessages) {
         $m = [regex]::Match($line, $e.p)
         if (-not $m.Success) { continue }
         $text = $null
-        if ($e.m) { $text = $e.m.Replace('{1}', $m.Groups[1].Value).Replace('{2}', $m.Groups[2].Value).Replace('{mode}', $mode) }
-        return [pscustomobject]@{ Text = $text; Rearm = [bool]$e.rearm; Kind = "$($e.kind)"; CheckUpdate = [bool]$e.check; Head = "$($e.h)"; Tone = "$($e.t)"; Pattern = $e.p }
+        if ($e.m) { $text = (Tr $e.m).Replace('{1}', $m.Groups[1].Value).Replace('{2}', $m.Groups[2].Value).Replace('{mode}', (Tr $mode)) }
+        $head = if ($e.h) { Tr $e.h } else { '' }
+        return [pscustomobject]@{ Text = $text; Rearm = [bool]$e.rearm; Kind = "$($e.kind)"; CheckUpdate = [bool]$e.check; Head = $head; Tone = "$($e.t)"; Pattern = $e.p }
     }
     $null
 }
@@ -106,6 +114,7 @@ $script:InjectorTexts = @{
 # NULL, 6 already loaded, 7 timeout, anything else a failure worth another try.
 function Get-InjectorResult([int]$code) {
     $text = $script:InjectorTexts[$code]
+    if ($text) { $text = Tr $text }
     [pscustomobject]@{
         Code = $code
         Loaded = ($code -eq 0 -or $code -eq 6)
@@ -120,7 +129,7 @@ function Get-InjectorResult([int]$code) {
 function Invoke-Injector([string]$exe) {
     $r = [pscustomobject]@{ Started = $false; Code = -1; Output = ''; Error = '' }
     if (-not [System.IO.File]::Exists($exe)) {
-        $r.Error = 'MK9RollbackInjector.exe is missing (often removed by antivirus). Restore it from quarantine or extract the zip again, then add the folder to the exclusions.'
+        $r.Error = Tr 'MK9RollbackInjector.exe is missing (often removed by antivirus). Restore it from quarantine or extract the zip again, then add the folder to the exclusions.'
         return $r
     }
     try {
@@ -147,7 +156,7 @@ function Invoke-Injector([string]$exe) {
         $e = $_.Exception
         if ($e.InnerException) { $e = $e.InnerException }
         $why = ("$($e.Message)".Trim() -split "`r?`n")[0]
-        $r.Error = "Windows could not start MK9RollbackInjector.exe ($why). Your antivirus may be blocking it: add the MK9 Rollback folder to its exclusions, then press Play again."
+        $r.Error = Tr 'Windows could not start MK9RollbackInjector.exe ({0}). Your antivirus may be blocking it: add the MK9 Rollback folder to its exclusions, then press Play again.' $why
     }
     $r
 }
@@ -159,9 +168,9 @@ $script:InjectClosedText = 'The game was closed before the mod was loaded. Press
 $script:InjectBlockedText = 'Could not load the mod into the game. Your antivirus may have blocked MK9RollbackInjector.exe. Press ''Having trouble?'' for what to try, then save the logs if it keeps failing.'
 function Get-InjectFailureText($result, [bool]$gameRunning) {
     if ($result -and $result.Text -and -not $result.Retry) { return $result.Text }  # 2, 3, 4: the injector knew why
-    if (-not $gameRunning) { return $script:InjectClosedText }
+    if (-not $gameRunning) { return (Tr $script:InjectClosedText) }
     if ($result -and $result.Text) { return $result.Text }
-    $script:InjectBlockedText
+    Tr $script:InjectBlockedText
 }
 
 # Before an injection: the last session's logs go to previous_logs ("Save logs" zips them too: a player who restarts
@@ -216,11 +225,11 @@ function Test-InstalledFiles([string]$root) {
     foreach ($line in Get-Content -LiteralPath $v) { if ($line -match '^dll=([0-9A-Fa-f]{64})\s*$') { $want = $Matches[1].ToUpperInvariant() } }
     if (-not $want) { return $ok }
     $dll = Join-Path $root 'build\clang\MK9Rollback.dll'
-    if (-not (Test-Path -LiteralPath $dll)) { return [pscustomobject]@{ Ok = $false; Message = $script:InjectorTexts[3] } }
+    if (-not (Test-Path -LiteralPath $dll)) { return [pscustomobject]@{ Ok = $false; Message = (Tr $script:InjectorTexts[3]) } }
     $got = ''
     try { $got = (Get-FileHash -LiteralPath $dll -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant() } catch { }
     if ($got -ne $want) {
-        return [pscustomobject]@{ Ok = $false; Message = "MK9 Rollback's files are damaged or mixed (MK9Rollback.dll). Extract the zip again into an empty folder." }
+        return [pscustomobject]@{ Ok = $false; Message = (Tr 'MK9 Rollback''s files are damaged or mixed (MK9Rollback.dll). Extract the zip again into an empty folder.') }
     }
     $ok
 }
@@ -449,17 +458,17 @@ function Save-LogsZip([string]$dir, [string]$destDir, [string[]]$selfIds = @()) 
             try { Protect-LogFile $s.From $to $state } catch { Remove-Item -LiteralPath $to -Force -ErrorAction SilentlyContinue }
         }
         Get-ChildItem -LiteralPath $stage -File | Where-Object { $_.Length -eq 0 } | Remove-Item -Force -ErrorAction SilentlyContinue
-        if (-not @(Get-ChildItem -LiteralPath $stage -File)) { return [pscustomobject]@{ Zip = ''; Error = 'No logs yet (or they could not be read).'; Note = '' } }
+        if (-not @(Get-ChildItem -LiteralPath $stage -File)) { return [pscustomobject]@{ Zip = ''; Error = (Tr 'No logs yet (or they could not be read).'); Note = '' } }
         $note = Get-PrivacyNote $state
         [System.IO.File]::WriteAllLines((Join-Path $stage 'PRIVACY.txt'), [string[]]$note, [System.Text.Encoding]::ASCII)
         $zip = Join-Path $destDir "mk9r-logs-$stamp.zip"
         if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
-        if (-not (Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).Length -le 0) { return [pscustomobject]@{ Zip = ''; Error = 'The logs zip could not be made.'; Note = '' } }
+        if (-not (Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).Length -le 0) { return [pscustomobject]@{ Zip = ''; Error = (Tr 'The logs zip could not be made.'); Note = '' } }
         [pscustomobject]@{ Zip = $zip; Error = ''; Note = $note[8] }
     } catch {
-        [pscustomobject]@{ Zip = ''; Error = "The logs zip could not be made ($($_.Exception.Message))."; Note = '' }
+        [pscustomobject]@{ Zip = ''; Error = (Tr 'The logs zip could not be made ({0}).' $_.Exception.Message); Note = '' }
     } finally {
         Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -497,13 +506,155 @@ function Update-MatchFacts($f, [string]$line) {
     $false
 }
 function Format-MatchFacts($f) {
-    if (-not $f.Seen) { return 'Last match: none yet.' }
+    if (-not $f.Seen) { return (Tr 'Last match: none yet.') }
     $parts = @()
-    if ($null -ne $f.Delay) { $parts += "input delay $($f.Delay)" }
-    if ($null -ne $f.Rtt) { $parts += "ping $($f.Rtt) ms" }
-    if ($f.Frames -ge 600) { $parts += "$([Math]::Round($f.Loads * 3600.0 / $f.Frames)) rollbacks a minute" }
-    if ($f.Fights) { $parts += $(if ($f.DesyncFights) { "out of sync in $($f.DesyncFights) fight(s)" } else { 'always in sync' }) }
-    "Last match: $($parts -join ', ')."
+    if ($null -ne $f.Delay) { $parts += Tr 'input delay {0}' $f.Delay }
+    if ($null -ne $f.Rtt) { $parts += Tr 'ping {0} ms' $f.Rtt }
+    if ($f.Frames -ge 600) { $parts += Tr '{0} rollbacks a minute' ([Math]::Round($f.Loads * 3600.0 / $f.Frames)) }
+    if ($f.Fights) { $parts += $(if ($f.DesyncFights) { Tr 'out of sync in {0} fight(s)' $f.DesyncFights } else { Tr 'always in sync' }) }
+    Tr 'Last match: {0}.' ($parts -join ', ')
+}
+
+# ---- score and history ----
+# The DLL's build\clang\match_history.txt (src\net\Score.h, FormatEntry): one line per online one-on-one match that
+# reached MK9's results screen, the fields apart by a tab: the local time ("2026-11-16 00:41:38"), WIN / LOSS / DRAW,
+# the rounds ("2-1", the player's first; "?" not known), the player's fighter and the opponent's as the game names them
+# ("CHAR_JohnnyCage_B"), the arena ("BGND_PitDay"), the opponent's SteamID64 (0 not known), the player's side (1 or
+# 2). Comment lines start with '#'. A day begins at 06:00 (an evening past midnight is one day), as on the game's panel.
+function ConvertFrom-MatchHistoryLine([string]$line) {
+    if (-not $line) { return $null }
+    $line = $line.TrimEnd("`r", "`n")
+    if (-not $line.Trim() -or $line.TrimStart().StartsWith('#')) { return $null }
+    $f = $line -split "`t"
+    if ($f.Count -ne 8) { return $null }
+    foreach ($x in $f) { if ($x -eq '') { return $null } }
+    $time = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($f[0], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$time)) { return $null }
+    if (@('WIN', 'LOSS', 'DRAW') -cnotcontains $f[1]) { return $null }
+    if ($f[2] -ne '?' -and $f[2] -notmatch '^\d{1,2}-\d{1,2}$') { return $null }
+    $opp = [uint64]0
+    if ($f[6] -notmatch '^\d+$' -or -not [uint64]::TryParse($f[6], [ref]$opp)) { return $null }
+    if ($f[7] -ne '1' -and $f[7] -ne '2') { return $null }
+    [pscustomobject]@{ Time = $time; Result = $f[1]; Rounds = $f[2]; Mine = $f[3]; Theirs = $f[4]; Arena = $f[5]; Opponent = $opp; Side = [int]$f[7] }
+}
+# Every entry of the file, oldest first (the DLL may be writing it: read shared), one object each on the pipeline:
+# callers take them as @(Read-MatchHistory $path).
+function Read-MatchHistory([string]$path) {
+    $list = New-Object System.Collections.Generic.List[object]
+    try {
+        if (Test-Path -LiteralPath $path) {
+            $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+            try { $text = (New-Object System.IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+            foreach ($line in ($text -split "`n")) { $e = ConvertFrom-MatchHistoryLine $line; if ($e) { $list.Add($e) } }
+        }
+    } catch { }
+    $list.ToArray()
+}
+# Where today began: 06:00 of this date, or of the day before when it is earlier.
+function Get-ScoreDayStart([datetime]$now = (Get-Date)) {
+    $d = $now.Date.AddHours(6)
+    if ($now -lt $d) { $d = $d.AddDays(-1) }
+    $d
+}
+# Wins, losses and draws of the entries (an array of ConvertFrom-MatchHistoryLine's objects), from $since on.
+function Get-MatchTally($entries, [datetime]$since = [datetime]::MinValue) {
+    $t = [pscustomobject]@{ Wins = 0; Losses = 0; Draws = 0; Matches = 0 }
+    foreach ($e in @($entries)) {
+        if (-not $e -or $e.Time -lt $since) { continue }
+        switch ($e.Result) { 'WIN' { $t.Wins++ } 'LOSS' { $t.Losses++ } 'DRAW' { $t.Draws++ } }
+        $t.Matches++
+    }
+    $t
+}
+function Format-Tally($t) {
+    $s = "$(if ($t.Wins -eq 1) { Tr '{0} win' $t.Wins } else { Tr '{0} wins' $t.Wins }), $(if ($t.Losses -eq 1) { Tr '{0} loss' $t.Losses } else { Tr '{0} losses' $t.Losses })"
+    if ($t.Draws) { $s += ", $(if ($t.Draws -eq 1) { Tr '{0} draw' $t.Draws } else { Tr '{0} draws' $t.Draws })" }
+    $s
+}
+# The DLL's line for a counted match (src\net\ScoreKeeper.cpp FinishMatch) -> a status line; '' for any other line.
+function Get-ScoreSay([string]$line) {
+    if ($line -notmatch 'SCORE: the match is over \([^)]*\): this player (WIN|LOSS|DRAW), rounds (\d+-\d+|not known)') { return '' }
+    $r = if ($Matches[2] -ne 'not known') { " ($($Matches[2]))" } else { '' }
+    switch ($Matches[1]) { 'WIN' { Tr 'Match over: you won{0}.' $r } 'LOSS' { Tr 'Match over: you lost{0}.' $r } default { Tr 'Match over: a draw.' } }
+}
+# The window's score line.
+function Format-MatchRecord($entries, [datetime]$now = (Get-Date)) {
+    $all = Get-MatchTally $entries
+    if (-not $all.Matches) { return (Tr 'Score: no online match counted yet.') }
+    $today = Get-MatchTally $entries (Get-ScoreDayStart $now)
+    if (-not $today.Matches) { return (Tr 'Score: none today. All time: {0}.' (Format-Tally $all)) }
+    if ($today.Matches -eq $all.Matches) { return (Tr 'Score today: {0}.' (Format-Tally $today)) }
+    Tr 'Score today: {0}. All time: {1}.' (Format-Tally $today) "$($all.Wins)-$($all.Losses)$(if ($all.Draws) { "-$($all.Draws)" })"
+}
+# The game's names in the list: "CHAR_JohnnyCage_B" -> "Johnny Cage (B)" (B, C, ...: the other costumes),
+# "BGND_STGardensN" -> "Shang Tsung Gardens Night" (as src\debug\StageScreen.cpp DisplayName makes them, in mixed case).
+$script:FighterNames = @{
+    baraka = 'Baraka'; cyberzero = 'Cyber Sub-Zero'; cyrax = 'Cyrax'; ermac = 'Ermac'; freddykrueger = 'Freddy Krueger'; freddy = 'Freddy Krueger'
+    goro = 'Goro'; jade = 'Jade'; jax = 'Jax'; johnnycage = 'Johnny Cage'; kabal = 'Kabal'; kano = 'Kano'; kenshi = 'Kenshi'; kintaro = 'Kintaro'
+    kitana = 'Kitana'; kratos = 'Kratos'; kunglao = 'Kung Lao'; liukang = 'Liu Kang'; mileena = 'Mileena'; nightwolf = 'Nightwolf'; noob = 'Noob Saibot'
+    noobsaibot = 'Noob Saibot'; quanchi = 'Quan Chi'; raiden = 'Raiden'; rain = 'Rain'; reptile = 'Reptile'; scorpion = 'Scorpion'; sektor = 'Sektor'
+    shangtsung = 'Shang Tsung'; shaokahn = 'Shao Kahn'; sheeva = 'Sheeva'; sindel = 'Sindel'; skarlet = 'Skarlet'; smoke = 'Smoke'; sonya = 'Sonya'
+    stryker = 'Stryker'; subzero = 'Sub-Zero'
+}
+function Split-NameWords([string]$s) {
+    @([regex]::Matches($s, '[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|[A-Z]+|\d+') | ForEach-Object { $_.Value })
+}
+function Get-FighterName([string]$code) {
+    if (-not $code -or $code -eq '?') { return '?' }
+    $s = $code -replace '(?i)^char_', ''
+    $costume = ''
+    if ($s -match '^(.+?)_([A-Za-z])$') { $s = $Matches[1]; $costume = $Matches[2].ToUpper() }
+    $key = ($s -replace '_', '').ToLower()
+    $name = if ($script:FighterNames.ContainsKey($key)) { $script:FighterNames[$key] } else {
+        $w = Split-NameWords ($s -replace '_', ' ')
+        if ($w.Count) { ($w | ForEach-Object { $_.Substring(0, 1).ToUpper() + $_.Substring(1).ToLower() }) -join ' ' } else { $s }
+    }
+    if ($costume -and $costume -ne 'A') { "$name ($costume)" } else { $name }
+}
+function Get-ArenaName([string]$code) {
+    if (-not $code -or $code -eq '?') { return '?' }
+    $s = $code -replace '(?i)^bgnd_', ''
+    $words = New-Object System.Collections.Generic.List[string]
+    if ($s -cmatch '^S([TK])(?=[A-Z][a-z])') { $words.Add($(if ($Matches[1] -eq 'T') { 'Shang Tsung' } else { 'Shao Kahn' })); $s = $s.Substring(2) }
+    $w = @(Split-NameWords ($s -replace '_', ' '))
+    for ($i = 0; $i -lt $w.Count; $i++) {
+        $x = $w[$i]
+        if ($i -eq $w.Count - 1 -and ($i -gt 0 -or $words.Count) -and $x -ceq 'N') { $words.Add('Night'); continue }
+        if ($x -eq 'Kahns') { $words.Add("Kahn's"); continue }
+        if ($x -eq 'Goros') { $words.Add("Goro's"); continue }
+        $words.Add($(if ($x -cmatch '^[A-Z]+$' -and $x.Length -gt 1) { $x.Substring(0, 1) + $x.Substring(1).ToLower() } else { $x.Substring(0, 1).ToUpper() + $x.Substring(1) }))
+    }
+    if (-not $words.Count) { return $code }
+    $words -join ' '
+}
+# The names of the player's Steam friends, by account number (a SteamID64's low 32 bits), as Steam keeps them on this
+# PC (userdata\<account>\config\localconfig.vdf, "friends"): for the opponent column. Read only; empty when anything
+# is missing.
+function Get-SteamFriendNames {
+    $names = @{}
+    try {
+        $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath
+        $me = (Get-ItemProperty 'HKCU:\Software\Valve\Steam\ActiveProcess' -ErrorAction Stop).ActiveUser
+        if (-not $steam -or -not $me) { return $names }
+        $vdf = Join-Path $steam "userdata\$me\config\localconfig.vdf"
+        if (-not (Test-Path -LiteralPath $vdf)) { return $names }
+        $text = [System.IO.File]::ReadAllText($vdf)
+        foreach ($m in [regex]::Matches($text, '"(\d{1,10})"\s*\{[^{}]*?"name"\s*"([^"]*)"')) {
+            $id = [uint64]$m.Groups[1].Value
+            if (-not $names.ContainsKey($id)) { $names[$id] = $m.Groups[2].Value }
+        }
+    } catch { }
+    $names
+}
+function Get-OpponentLabel([uint64]$steamId, $friendNames) {
+    if (-not $steamId) { return '?' }
+    $base = [uint64]76561197960265728
+    if ($steamId -gt $base -and $friendNames) {
+        $acct = $steamId - $base
+        if ($friendNames.ContainsKey($acct)) { return $friendNames[$acct] }
+    }
+    $s = "$steamId"
+    Tr 'player ...{0}' $s.Substring([Math]::Max(0, $s.Length - 4))
 }
 
 # ---- connection ----
@@ -516,7 +667,7 @@ function Get-ConnectionHint {
         if (-not $routes) { return '' }
         $best = $routes | Sort-Object { [int]$_.RouteMetric + [int]$_.InterfaceMetric } | Select-Object -First 1
         $a = Get-NetAdapter -InterfaceIndex $best.ifIndex -ErrorAction Stop
-        if ("$($a.PhysicalMediaType)" -eq 'Native 802.11' -or "$($a.PhysicalMediaType)" -eq 'Wireless LAN') { return 'You are on Wi-Fi: a cable gives steadier fights.' }
+        if ("$($a.PhysicalMediaType)" -eq 'Native 802.11' -or "$($a.PhysicalMediaType)" -eq 'Wireless LAN') { return (Tr 'You are on Wi-Fi: a cable gives steadier fights.') }
     } catch { }
     ''
 }

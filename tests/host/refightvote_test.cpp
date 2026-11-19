@@ -361,9 +361,308 @@ void OtherKinds() {
     c.OnPacket(p);
     Expect(c.theirs.choice == RefightVote::kLeave, "a leftover of the earlier exchange does not bring the RE-FIGHT back");
 }
+
+// The same fighters again: which names are a fighter's, the pair's number, and the stage picks' context of a game
+// that holds the pair.
+void Fighters() {
+    using RefightVote::DirectContext;
+    using RefightVote::FighterName;
+    using RefightVote::PairTag;
+    // The names of the field log of 2026-11-14: a costume letter, another one, and the first costume in small letters.
+    Expect(FighterName("CHAR_JohnnyCage_B") && FighterName("CHAR_Sektor_C") && FighterName("char_raiden") && FighterName("CHAR_Cyrax_C"),
+           "the fighters of a real evening are fighters' names");
+    Expect(!FighterName(nullptr) && !FighterName("") && !FighterName("char_") && !FighterName("CHAR"), "nothing, or the start alone, is no fighter");
+    Expect(!FighterName("BGND_Pit") && !FighterName("random") && !FighterName("empty_map"), "an arena, \"random\" and the empty map are no fighters");
+    Expect(!FighterName("CHAR_Johnny Cage") && !FighterName("CHAR_Raiden\n") && !FighterName("CHAR_R\x01"), "a name with anything but letters, digits and '_' is none");
+    char longName[80];
+    memset(longName, 'a', sizeof longName);
+    memcpy(longName, "char_", 5);
+    longName[62] = 0;
+    Expect(FighterName(longName), "62 characters still fit the game's 64 bytes");
+    longName[62] = 'a', longName[63] = 0;
+    Expect(FighterName(longName), "63 too");
+    longName[63] = 'a', longName[64] = 0;
+    Expect(!FighterName(longName), "64 do not");
+
+    const uint32_t t = PairTag("CHAR_JohnnyCage_B", "CHAR_Sektor_C");
+    Expect(t != 0 && PairTag("", "") != 0 && PairTag(nullptr, nullptr) != 0, "a pair's number is never 0");
+    Expect(t == PairTag("char_johnnycage_b", "CHAR_SEKTOR_C"), "letter case does not change it");
+    Expect(t != PairTag("CHAR_Sektor_C", "CHAR_JohnnyCage_B"), "the two players' order does");
+    Expect(t != PairTag("CHAR_JohnnyCage_B", "CHAR_Sektor_B") && t != PairTag("CHAR_JohnnyCage", "CHAR_Sektor_C"), "a costume does");
+    Expect(PairTag("char_ab", "c") != PairTag("char_a", "bc"), "the names' ends count");
+    // Every pair of the evening's seven fighters in both orders: 49 different numbers.
+    static const char* const names[] = {"CHAR_JohnnyCage_B", "CHAR_Sektor_C", "CHAR_Raiden_B", "char_raiden", "CHAR_Cyrax_C", "CHAR_Scorpion", "CHAR_SubZero_B"};
+    std::vector<uint32_t> tags;
+    bool distinct = true;
+    for (const char* a : names)
+        for (const char* b : names) {
+            const uint32_t x = PairTag(a, b);
+            // (char_raiden and CHAR_Raiden_B differ; a name against itself in another letter case would not.)
+            for (uint32_t y : tags) distinct = distinct && x != y;
+            tags.push_back(x);
+        }
+    Expect(distinct && tags.size() == 49, "49 pairs give 49 numbers");
+
+    const uint32_t table = 0x5A17C0DEu;
+    const uint32_t d = DirectContext(table, t);
+    Expect(d != table && d == DirectContext(table, t), "a game with the pair names another context than one without, the same every time");
+    Expect(d != DirectContext(table, PairTag("CHAR_JohnnyCage_B", "CHAR_Raiden_B")), "another pair, another context");
+    Expect(d != DirectContext(table ^ 1, t), "another stage table, another context");
+    bool never = true;
+    for (uint32_t i = 0; i < 200000; ++i) never = never && DirectContext(i * 0x9E3779B9u, i + 1) != i * 0x9E3779B9u;
+    Expect(never, "never the table's own context");
+
+    // What the context does: two games that hold the same pair read each other's arena pick; a game with the pair and
+    // one without, or two with different pairs, read nothing of each other and both know it.
+    const auto meet = [&](uint32_t ctxA, uint32_t ctxB, bool* differA, bool* differB) {
+        Exchange a, c;
+        a.Open(kKindStage, ctxA, 31, 200);
+        c.Open(kKindStage, ctxB, 32, 300);
+        a.Lock(7);
+        c.Lock(7);
+        uint8_t b[kSize];
+        Packet p;
+        for (int i = 0; i < 4; ++i) {
+            Build(a.Next(), b, sizeof b);
+            Parse(b, sizeof b, &p);
+            c.OnPacket(p);
+            Build(c.Next(), b, sizeof b);
+            Parse(b, sizeof b, &p);
+            a.OnPacket(p);
+        }
+        *differA = a.contextDiffers;
+        *differB = c.contextDiffers;
+        return a.Confirmed() && c.Confirmed();
+    };
+    bool da = false, db = false;
+    Expect(meet(d, d, &da, &db) && !da && !db, "two games with the same pair agree on the arena as ever");
+    Expect(!meet(d, table, &da, &db) && da && db, "a game with the pair and one without: no agreement, and both see why");
+    Expect(!meet(d, DirectContext(table, t + 1), &da, &db) && da && db, "two games with different pairs: the same");
+
+    // ... and the verdict on such an exchange: it is opened under the pair's context, so it is judged against the
+    // pair's context. v20261114-1451 judged it against the table's own: on 2026-11-14 17:18:55 two games that held the
+    // same pair and had locked the same arena each read "the two games list different stages", took the pair back and
+    // loaded the select screen's fighters on the game's own arena.
+    using RefightVote::ExchangeContext;
+    Table tb;
+    tb.count = 34;
+    for (uint8_t i = 0; i < tb.count; ++i) {
+        char n[16];
+        snprintf(n, sizeof n, "BGND_%u", (unsigned)i);
+        tb.nameHash[i] = NameHash(n);
+        tb.selectable[i] = i >= 1 && i <= 28;
+    }
+    Expect(ExchangeContext(tb.Context(), 0) == tb.Context() && ExchangeContext(tb.Context(), t) == DirectContext(tb.Context(), t),
+           "a stage exchange's context: the table's own without a pair, the pair's with one");
+    Verdict va, vb, old;
+    const auto judged = [&](uint32_t tagA, uint32_t tagB) {
+        Exchange a, c;
+        a.Open(kKindStage, ExchangeContext(tb.Context(), tagA), 41, 500);
+        c.Open(kKindStage, ExchangeContext(tb.Context(), tagB), 42, 600);
+        a.Lock(11);
+        c.Lock(11);
+        uint8_t b[kSize];
+        Packet p;
+        for (int i = 0; i < 4; ++i) {
+            Build(a.Next(), b, sizeof b);
+            Parse(b, sizeof b, &p);
+            c.OnPacket(p);
+            Build(c.Next(), b, sizeof b);
+            Parse(b, sizeof b, &p);
+            a.OnPacket(p);
+        }
+        va = Judge(a, tb, true, ExchangeContext(tb.Context(), tagA));
+        vb = Judge(c, tb, true, ExchangeContext(tb.Context(), tagB));
+        old = Judge(a, tb, true);  // against the table's own context
+    };
+    const auto stage11 = [](const Verdict& v) { return v.why == Why::kAgreed && v.outcome == Outcome::kStage && v.entry == 11; };
+    judged(t, t);
+    Expect(stage11(va) && stage11(vb), "two games with the same pair and the same arena: both verdicts are that arena");
+    Expect(old.why == Why::kContextDiffers && old.outcome == Outcome::kFallback,
+           "the same exchange judged against the table's own context is refused: the fault of v20261114-1451");
+    judged(t, 0);
+    Expect(va.why == Why::kContextDiffers && vb.why == Why::kContextDiffers, "a game with the pair and one without: no arena for either");
+    judged(t, t + 1);
+    Expect(va.why == Why::kContextDiffers && vb.why == Why::kContextDiffers, "two games with different pairs: no arena for either");
+    judged(0, 0);
+    Expect(stage11(va) && stage11(vb) && stage11(old), "without a pair nothing changed: the stage screen's verdict as ever");
+}
+
+// ---- Kombat Kodes: the game's session as its code reads (RefightVote.h), and the mod's rule on top of it ----
+struct KodeMsg {
+    int id, due;
+    uint32_t data;
+};
+struct KodeGame {
+    bool host = false;
+    uint16_t mine = 0, theirs = 0;  // the session's +0x4C34, +0x4C36
+    uint32_t locked = 0;            // +0x4C38
+    int box[6] = {0, 0, 0, 0, 0, 0};  // the versus screen's six digits: the host's three, then the other player's
+    std::vector<KodeMsg> out;
+    int sent13 = 0;
+    // the mod on this game
+    bool mod = false, stopped = false;
+    RefightVote::Kodes kept;
+    int writes = 0;
+
+    void Reset() { mine = theirs = 0, locked = 0; }  // 0x008809D0
+    void SetLocal(const int d[3], int now) {         // 0x00880790
+        if (locked) return;
+        const uint16_t w = (uint16_t)(((d[0] & 0xF) << 8) | ((d[1] & 0xF) << 4) | (d[2] & 0xF));
+        if (w == mine) return;
+        mine = w;
+        out.push_back({13, now + Between(0, 5), w});
+        ++sent13;
+    }
+    void Lockdown(int now) {  // 0x008808C0: the host's script, when its load ends
+        if (!host) return;
+        locked = 1;
+        out.push_back({14, now + Between(0, 5), ((uint32_t)mine << 16) | theirs});
+    }
+    void Take(const KodeMsg& m) {
+        if (m.id == 13) {  // 0x00880910
+            if (!locked) theirs = (uint16_t)m.data;
+        } else {  // 0x00880970: the first word is this game's player's, the second the sender's
+            mine = (uint16_t)m.data;
+            theirs = (uint16_t)(m.data >> 16);
+            locked = 1;
+        }
+    }
+    // The versus screen's tick 0x009273A0. press: 0 none, 1-3 that digit up, -1..-3 that digit down.
+    void VersusTick(int press, int now) {
+        int d[3];
+        for (int i = 0; i < 3; ++i) d[i] = box[(host ? 0 : 3) + i];
+        if (press > 0) d[press - 1] = (d[press - 1] + 1) % 10;
+        if (press < 0) d[-press - 1] = (d[-press - 1] + 9) % 10;
+        SetLocal(d, now);
+        const uint16_t first = host ? mine : theirs, second = host ? theirs : mine;  // 0x00880820
+        for (int i = 0; i < 3; ++i) {
+            box[i] = (first >> (8 - 4 * i)) & 0xF;
+            box[3 + i] = (second >> (8 - 4 * i)) & 0xF;
+        }
+    }
+    void ModTick() {  // Refight.cpp, KeepKodes
+        if (!mod || stopped) return;
+        switch (RefightVote::KodeTick(RefightVote::Kodes{mine, theirs, locked != 0}, kept)) {
+        case RefightVote::KodeStep::kHold:
+            return;
+        case RefightVote::KodeStep::kTheirs:
+            stopped = true;
+            return;
+        case RefightVote::KodeStep::kWrite:
+            if (writes >= 8) return;
+            mine = kept.mine, theirs = kept.theirs, locked = 1;
+            ++writes;
+        }
+    }
+};
+// One load of a re-fight: both versus screens start (and zero their sessions) a few ticks in, both players press
+// blind, the host locks at tick 240, and every message arrives up to five ticks late.
+void KodeLoad(KodeGame& h, KodeGame& c, bool presses) {
+    h.host = true;
+    const int startH = Between(0, 6), startC = Between(0, 6);
+    for (int now = 0; now < 300; ++now) {
+        for (KodeGame* g : {&h, &c}) {
+            KodeGame* o = g == &h ? &c : &h;
+            for (size_t i = 0; i < o->out.size();) {
+                if (o->out[i].due > now) {
+                    ++i;
+                    continue;
+                }
+                g->Take(o->out[i]);
+                o->out.erase(o->out.begin() + (long)i);
+            }
+        }
+        h.ModTick();
+        c.ModTick();
+        if (now == startH) h.Reset();
+        if (now == startC) c.Reset();
+        if (now >= startH) h.VersusTick(presses && Rnd() % 7 == 0 ? Between(-3, 3) : 0, now);
+        if (now >= startC) c.VersusTick(presses && Rnd() % 7 == 0 ? Between(-3, 3) : 0, now);
+        if (now == 240) h.Lockdown(now);
+    }
+}
+void KodeChecks() {
+    using namespace RefightVote;
+    Expect(KodeValid(0x000) && KodeValid(0x999) && KodeValid(0x123), "three digits are a kode");
+    Expect(!KodeValid(0x1000) && !KodeValid(0x0A0) && !KodeValid(0x00F) && !KodeValid(0xB00), "a fourth digit or a hex digit is not");
+    char t[6];
+    KodeText(0x123, t);
+    Expect(!strcmp(t, "1-2-3"), "a kode's text");
+    KodeText(0x0A0, t);
+    Expect(!strcmp(t, "?-?-?"), "the text of a word that is no kode");
+    const Kodes k = KodesOf(0x04560123u, 1);
+    Expect(k.mine == 0x123 && k.theirs == 0x456 && k.locked && KodeWords(k) == 0x04560123u, "the session's two words, there and back");
+    Expect(KodesKeepable(k) && !KodesKeepable(KodesOf(0x04560123u, 0)) && !KodesKeepable(KodesOf(0x0A000123u, 1)), "kept: locked, three digits each");
+    Expect(KodeTick(KodesOf(0, 0), k) == KodeStep::kWrite && KodeTick(KodesOf(0x04560123u, 0), k) == KodeStep::kWrite, "not locked: written");
+    Expect(KodeTick(k, k) == KodeStep::kHold, "the kept kodes, locked: nothing to do");
+    Expect(KodeTick(KodesOf(0x04560124u, 1), k) == KodeStep::kTheirs && KodeTick(KodesOf(0, 1), k) == KodeStep::kTheirs, "locked with others: left alone");
+
+    const auto same = [](const KodeGame& h, const KodeGame& c) {
+        return h.locked && c.locked && h.mine == c.theirs && h.theirs == c.mine && !memcmp(h.box, c.box, sizeof h.box);
+    };
+    for (int run = 0; run < 400; ++run) {
+        const uint16_t kh = (uint16_t)((Between(0, 9) << 8) | (Between(0, 9) << 4) | Between(0, 9));
+        const uint16_t kc = (uint16_t)((Between(0, 9) << 8) | (Between(0, 9) << 4) | Between(0, 9));
+        {  // both mods hold the last fight's kodes: both games load with them, whatever is pressed
+            KodeGame h, c;
+            h.mod = c.mod = true;
+            h.kept = Kodes{kh, kc, true};
+            c.kept = Kodes{kc, kh, true};
+            KodeLoad(h, c, true);
+            Expect(same(h, c) && h.mine == kh && h.theirs == kc, "both mods: the last fight's kodes on both games");
+            Expect(h.box[0] == ((kh >> 8) & 0xF) && h.box[2] == (kh & 0xF) && h.box[3] == ((kc >> 8) & 0xF) && h.box[5] == (kc & 0xF),
+                   "both mods: the versus screen holds the last fight's six digits");
+            // (A press in the very tick the versus screen zeroes its session travels, and changes nothing: the next
+            // tick writes the kept kodes again, and a locked game does not take it.)
+            Expect(h.sent13 <= 1 && c.sent13 <= 1, "both mods: no blind press travels after the versus screen's own start");
+            Expect(h.writes >= 1 && h.writes <= 2 && c.writes >= 1 && c.writes <= 2 && !h.stopped && !c.stopped,
+                   "both mods: one write, and one more after the versus screen's own start");
+        }
+        {  // the same without a press
+            KodeGame h, c;
+            h.mod = c.mod = true;
+            h.kept = Kodes{kh, kc, true};
+            c.kept = Kodes{kc, kh, true};
+            KodeLoad(h, c, false);
+            Expect(same(h, c) && h.mine == kh && h.theirs == kc, "both mods, nothing pressed: the last fight's kodes on both games");
+        }
+        {  // only the host's mod holds them: the host's two words reach the other game
+            KodeGame h, c;
+            h.mod = true;
+            h.kept = Kodes{kh, kc, true};
+            KodeLoad(h, c, true);
+            Expect(same(h, c) && h.mine == kh && h.theirs == kc, "the host's mod alone: its kodes on both games");
+        }
+        {  // only the other game's mod holds them: the host's lock rules, the two games still end alike
+            KodeGame h, c;
+            c.mod = true;
+            c.kept = Kodes{kc, kh, true};
+            KodeLoad(h, c, true);
+            Expect(same(h, c), "the other game's mod alone: both games end with the host's six digits");
+            Expect(c.writes <= 2, "the other game's mod alone: it does not write over the host's lock");
+        }
+        {  // the two mods hold different kodes (never seen; a fault somewhere): the host's rule, both games alike
+            KodeGame h, c;
+            h.mod = c.mod = true;
+            h.kept = Kodes{kh, kc, true};
+            c.kept = Kodes{(uint16_t)(kc ^ 1), kh, true};
+            KodeLoad(h, c, true);
+            Expect(same(h, c) && h.mine == kh && h.theirs == kc, "two mods that differ: the host's kodes on both games");
+            Expect(c.stopped || c.kept.mine == kc, "two mods that differ: the other game's mod steps back");
+        }
+        {  // no mod: MK9 as it is (the model's own check)
+            KodeGame h, c;
+            KodeLoad(h, c, true);
+            Expect(same(h, c), "no mod: both games end with the same six digits");
+        }
+    }
+}
 }  // namespace
 
 int main() {
+    KodeChecks();
+    Fighters();
     Rule();
     Presses();
     OtherKinds();

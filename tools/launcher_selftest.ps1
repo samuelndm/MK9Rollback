@@ -4,6 +4,10 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\launcher_selftest.ps1
 # Prints PASS/FAIL per check; the exit code is the number of failures.
 $ErrorActionPreference = 'Continue'
+# The texts first (as the window loads them), in English: the checks below compare English texts. Section 19 checks
+# the translations.
+. "$PSScriptRoot\launcher_text.ps1"
+Set-UiLanguage 'en'
 . "$PSScriptRoot\updater.ps1"
 . "$PSScriptRoot\launcher_lib.ps1"
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
@@ -228,8 +232,8 @@ try {
     $m1 = Get-LauncherMessage "[12:00:00.000] ONLINE: the other player's mod is older (theirs 20261101-1200, this 20261110-1200); not engaging"
     $m2 = Get-LauncherMessage "[12:00:00.000] ONLINE: this mod is older than the other player's (x)"
     $m3 = Get-LauncherMessage "[12:00:00.000] ONLINE: the other player's mod is a different build (x)"
-    Check 'message: opponent older' ($m1.Text -eq "Your opponent's mod is older: they must press 'Check for updates', then 'Update now'. MK9's netcode plays this match." -and -not $m1.CheckUpdate)
-    Check 'message: this mod older (runs the update check)' ($m2.Text -eq "Your mod is older than your opponent's: close the game and press 'Update now'. MK9's netcode plays this match." -and $m2.CheckUpdate)
+    Check 'message: opponent older' ($m1.Text -eq "Your opponent's mod is older: they must close the game and open MK9 Rollback again, which updates it. MK9's netcode plays this match." -and -not $m1.CheckUpdate)
+    Check 'message: this mod older (runs the update check)' ($m2.Text -eq "Your mod is older than your opponent's: close the game, and this window installs the new version by itself. MK9's netcode plays this match." -and $m2.CheckUpdate)
     Check 'message: different build' ($m3.Text -eq "You and your opponent run different builds of the mod: both extract the same zip. MK9's netcode plays this match.")
     Check 'message: old "speaks online version" line no longer matched' ($null -eq (Get-LauncherMessage "ONLINE: the other player's MK9Rollback speaks online version 3 (this one 4); not engaging"))
     $m4 = Get-LauncherMessage '[21:13:29.793] ONLINE: input delay 2 agreed (this game proposed 2, the other 2)'
@@ -330,6 +334,48 @@ try {
     [void](Update-MatchFacts $f '[21:16:12.342] ONLINE: the match is over (results screen): ... (hello round trip this match: median 49 ms, second-highest 49 ms; delay 2 at the end')
     [void](Update-MatchFacts $f '[21:30:00.000] ONLINE: input delay 3 agreed (this game proposed 3, the other 2)')
     Check 'last match line resets at the next match' ((Format-MatchFacts $f) -eq 'Last match: input delay 3.') (Format-MatchFacts $f)
+
+    # ---- 11b. score and match history (the DLL's match_history.txt, src\net\Score.h FormatEntry) ----
+    $hp = Join-Path $tmp 'match_history.txt'
+    Check 'match history: a missing file reads as no match' (@(Read-MatchHistory $hp).Count -eq 0 -and (Format-MatchRecord @(Read-MatchHistory $hp)) -eq 'Score: no online match counted yet.')
+    $hl = @(
+        '# MK9 Rollback: your online matches, one line per match that reached MK9''s results screen (written by the mod).',
+        "# time`tresult`trounds (yours first)`tyour fighter`tthe opponent's fighter`tarena`tthe opponent's Steam ID`tyour side",
+        "2026-11-14 23:00:00`tWIN`t2-0`tCHAR_Scorpion`tCHAR_SubZero_B`tBGND_STGardensN`t76561197960265733`t1",
+        "2026-11-15 22:10:00`tLOSS`t1-2`tCHAR_JOHNNYCAGE`tCHAR_KUNGLAO`tBGND_PitDay`t76561197960265733`t2",
+        "2026-11-16 00:41:38`tWIN`t?`tCHAR_JohnnyCage_B`tCHAR_Cyrax`tBGND_Graveyard`t76561197960265733`t1",
+        "2026-11-16 00:45:00`tDRAW`t?`t?`t?`t?`t0`t1",
+        "garbage`tWIN",
+        "2026-11-16 00:46:00`tWON`t2-0`ta`tb`tc`t5`t1",
+        "2026-11-16 00:47:00`tWIN`t2-0`ta`tb`tc`t5`t3",
+        "2026-11-16 0:48:00`tWIN`t2-0`ta`tb`tc`t5`t1"
+    )
+    [System.IO.File]::WriteAllText($hp, (($hl -join "`r`n") + "`r`n"), [System.Text.Encoding]::ASCII)
+    $he = @(Read-MatchHistory $hp)
+    Check 'match history: entries read, comments and malformed lines skipped' ($he.Count -eq 4 -and $he[0].Result -eq 'WIN' -and $he[1].Rounds -eq '1-2' -and $he[3].Opponent -eq 0) "$($he.Count) entries"
+    $now = [datetime]::ParseExact('2026-11-16 01:00:00', 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    Check 'match history: a day begins at 06:00' ((Get-ScoreDayStart $now) -eq [datetime]'2026-11-15 06:00:00' -and (Get-ScoreDayStart $now.AddHours(6)) -eq [datetime]'2026-11-16 06:00:00')
+    $rec = Format-MatchRecord $he $now
+    Check 'match history: the score line (today since 06:00 the day before, and all time)' ($rec -eq 'Score today: 1 win, 1 loss, 1 draw. All time: 2-1-1.') $rec
+    $rec2 = Format-MatchRecord $he ([datetime]'2026-11-20 20:00:00')
+    Check 'match history: the score line with nothing today' ($rec2 -eq 'Score: none today. All time: 2 wins, 1 loss, 1 draw.') $rec2
+    $rec3 = Format-MatchRecord @($he[2]) $now
+    Check 'match history: the score line when every match is today''s' ($rec3 -eq 'Score today: 1 win, 0 losses.') $rec3
+    $names = @((Get-FighterName 'CHAR_JOHNNYCAGE'), (Get-FighterName 'CHAR_JohnnyCage_B'), (Get-FighterName 'CHAR_SubZero_F'), (Get-FighterName 'CHAR_CyberZero_C'),
+        (Get-FighterName 'CHAR_Noob'), (Get-FighterName 'CHAR_NewGuy'), (Get-FighterName '?'), (Get-FighterName ''))
+    Check 'match history: fighter names' (($names -join '|') -eq 'Johnny Cage|Johnny Cage (B)|Sub-Zero (F)|Cyber Sub-Zero (C)|Noob Saibot|New Guy|?|?') ($names -join '|')
+    $arenas = @((Get-ArenaName 'BGND_PitDay'), (Get-ArenaName 'BGND_STGardensN'), (Get-ArenaName 'BGND_SKKahnsArena'), (Get-ArenaName 'BGND_Graveyard'), (Get-ArenaName '?'))
+    Check 'match history: arena names' (($arenas -join '|') -eq "Pit Day|Shang Tsung Gardens Night|Shao Kahn Kahn's Arena|Graveyard|?") ($arenas -join '|')
+    $fn = @{ [uint64]5 = 'Friend Name' }
+    $ol = @((Get-OpponentLabel ([uint64]76561197960265733) $fn), (Get-OpponentLabel ([uint64]76561197960269999) $fn), (Get-OpponentLabel ([uint64]0) $fn))
+    Check 'match history: opponent labels (a Steam friend by name, else the ID''s end)' (($ol -join '|') -eq 'Friend Name|player ...9999|?') ($ol -join '|')
+    $sn = $null; $threw = $false
+    try { $sn = Get-SteamFriendNames } catch { $threw = $true }
+    Check 'match history: Get-SteamFriendNames returns a table without failing' ((-not $threw) -and $sn -is [hashtable])
+    $says = @((Get-ScoreSay '[00:41:44.001] SCORE: the match is over (MK9''s results screen): this player WIN, rounds 2-1 (1 - 1 - 0 drawn read before the last), x'),
+        (Get-ScoreSay '[00:41:44.001] SCORE: the match is over (MK9''s results screen): this player LOSS, rounds not known (0 - 0 - 0 drawn read before the last), x'),
+        (Get-ScoreSay '[00:41:44.001] SCORE: the match is over (x) but not counted: the lives were still moving'), (Get-ScoreSay 'ONLINE: something else'))
+    Check 'match history: the status lines of a counted match' (($says -join '|') -eq 'Match over: you won (2-1).|Match over: you lost.||') ($says -join '|')
 
     # ---- 12. connection hint ----
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -446,7 +492,7 @@ try {
 
     # ---- 17. the scripts themselves ----
     $parseErrors = @()
-    foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'updater.ps1', 'netplay.ps1', 'launch_game.ps1', 'package.ps1', 'publish_release.ps1', 'make_icon.ps1') {
+    foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'launcher_text.ps1', 'updater.ps1', 'netplay.ps1', 'launch_game.ps1', 'package.ps1', 'publish_release.ps1', 'make_icon.ps1') {
         $f = Join-Path $PSScriptRoot $s
         if (-not (Test-Path -LiteralPath $f)) { continue }
         $tokens = $null; $errs = $null
@@ -456,11 +502,13 @@ try {
     Check 'the scripts parse without errors in this PowerShell' (-not $parseErrors) ($parseErrors -join ' | ')
     # The "Play Online.bat" of the versions before 2026-11 runs this first (it stays after an update until the program
     # is fetched): it must end at once with code 0, before anything of the window exists.
+    $script:runLang = 'en'
     function Run-Hidden([string]$exe, [string]$arguments, [int]$timeoutMs = 30000) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo $exe, $arguments
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
         $psi.EnvironmentVariables['MK9R_LAUNCHER_TEST'] = '1'  # "MK9 Rollback.exe" then prints what it would show in a box
+        $psi.EnvironmentVariables['MK9R_LANG'] = $script:runLang  # in English, whatever Windows' language
         $p = [System.Diagnostics.Process]::Start($psi)
         $p.StandardInput.Close()  # a "pause" reads the end of the input and goes on
         $read = $p.StandardOutput.ReadToEndAsync()
@@ -475,7 +523,7 @@ try {
     $program = @(Get-ChildItem -Path (Join-Path $PSScriptRoot '..\build\*\MK9 Rollback.exe'), (Join-Path $PSScriptRoot '..\MK9 Rollback.exe') -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1)
     if (-not $program) {
-        'SKIP  "MK9 Rollback.exe" checks (6): none is built (.\build.ps1 -LauncherOnly)'
+        'SKIP  "MK9 Rollback.exe" checks (7): none is built (.\build.ps1 -LauncherOnly)'
     } else {
         $pd = Join-Path $tmp 'program test'
         $pexe = Join-Path $pd 'MK9 Rollback.exe'
@@ -485,6 +533,10 @@ try {
         Check 'MK9 Rollback.exe: named as a program of its own in its file details' ($vi.FileDescription -eq 'MK9 Rollback' -and $vi.ProductName -eq 'MK9 Rollback' -and $vi.OriginalFilename -eq 'MK9 Rollback.exe') "$($vi.FileDescription) / $($vi.ProductName)"
         $r0 = Run-Hidden $pexe ''
         Check 'MK9 Rollback.exe: alone in a folder (opened from inside the zip) it says to extract the zip' ($r0.Done -and $r0.Code -eq 1 -and $r0.Output -like '*Extract the whole zip first*') "code $($r0.Code): $($r0.Output)"
+        $script:runLang = 'pt-BR'
+        $r0pt = Run-Hidden $pexe ''
+        $script:runLang = 'en'
+        Check 'MK9 Rollback.exe: says it in Portuguese when the language is Portuguese (Brazil)' ($r0pt.Done -and $r0pt.Code -eq 1 -and $r0pt.Output -like '*Extraia o zip inteiro primeiro*') "code $($r0pt.Code): $($r0pt.Output)"
         # A PC that refuses the script: PowerShell ends with an error before any window (here a stand-in that does).
         Write-Files $pd @{ 'tools\netplay_gui.ps1' = '"stand-in: scripts are disabled on this system"; exit 1' }
         $r1 = Run-Hidden $pexe ''
@@ -505,7 +557,89 @@ try {
         Copy-Item -LiteralPath $program[0].FullName -Destination (Join-Path $pd2 'build\clang\MK9 Rollback.exe')
         $r4 = Run-Hidden (Join-Path $pd2 'build\clang\MK9 Rollback.exe') ''
         Check 'MK9 Rollback.exe: finds the scripts two folders up (build\<name>\ in the source tree)' ($r4.Done -and $r4.Code -eq 0) "code $($r4.Code): $($r4.Output)"
-    }} finally {
+    }
+
+    # ---- 19. the window's texts in other languages (tools\launcher_text.ps1) ----
+    # Every English text the scripts pass to Tr as written, and every text of launcher_lib's tables, has its Portuguese
+    # (Brazil) one, with the same placeholders and keyboard marks (&); no Portuguese text is left over. (This file is
+    # ASCII: the Portuguese letters below are written as character codes.)
+    $trKeys = New-Object System.Collections.Generic.List[string]
+    $trOdd = @()
+    foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'updater.ps1') {
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $s), [ref]$tokens, [ref]$errs)
+        foreach ($call in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Tr' }, $true)) {
+            $arg = $call.CommandElements[1]
+            if ($arg -is [System.Management.Automation.Language.StringConstantExpressionAst] -and "$($arg.StringConstantType)" -eq 'SingleQuoted') {
+                if (-not $trKeys.Contains($arg.Value)) { $trKeys.Add($arg.Value) }
+            } elseif (-not ($arg -is [System.Management.Automation.Language.VariableExpressionAst] -or $arg -is [System.Management.Automation.Language.MemberExpressionAst] -or
+                    $arg -is [System.Management.Automation.Language.IndexExpressionAst])) { $trOdd += "$s line $($call.Extent.StartLineNumber)" }
+        }
+    }
+    # The texts Tr is given through variables: the tables of launcher_lib, and the mode.
+    foreach ($e in $script:LauncherMessages) { foreach ($v in @($e.m, $e.h)) { if ($v -and -not $trKeys.Contains($v)) { $trKeys.Add($v) } } }
+    foreach ($v in @($script:InjectorTexts.Values) + @($script:InjectClosedText, $script:InjectBlockedText, 'Rollback', 'Safe mode')) { if (-not $trKeys.Contains($v)) { $trKeys.Add($v) } }
+    $pt = @($script:UiTextPtBr)
+    $ptEn = @($pt | ForEach-Object { $_[0] })
+    Check 'translations: Tr is given a single-quoted text or a table''s text, nothing else' (-not $trOdd) ($trOdd -join ', ')
+    Check 'translations: each Portuguese entry is one pair of texts, no English text twice' ($pt.Count -gt 100 -and -not @($pt | Where-Object { $_.Count -ne 2 -or $_[0] -isnot [string] -or $_[1] -isnot [string] -or -not $_[1] }) -and
+        -not @($ptEn | Group-Object -CaseSensitive | Where-Object { $_.Count -gt 1 })) "$($pt.Count) pairs"
+    $noPt = @($trKeys | Where-Object { $ptEn -cnotcontains $_ })
+    Check 'translations: every text of the window has its Portuguese one' ($trKeys.Count -gt 100 -and -not $noPt) "$($trKeys.Count) texts; missing: $($noPt -join ' | ')"
+    $leftOver = @($ptEn | Where-Object { $trKeys -cnotcontains $_ })
+    Check 'translations: no Portuguese text is left unused' (-not $leftOver) ($leftOver -join ' | ')
+    $badMarks = @()
+    foreach ($p in $pt) {
+        $a = @([regex]::Matches($p[0], '\{(\d+|mode)\}') | ForEach-Object { $_.Value } | Sort-Object) -join ','
+        $b = @([regex]::Matches($p[1], '\{(\d+|mode)\}') | ForEach-Object { $_.Value } | Sort-Object) -join ','
+        if ($a -ne $b -or ([regex]::Matches($p[0], '&')).Count -ne ([regex]::Matches($p[1], '&')).Count) { $badMarks += $p[0] }
+    }
+    Check 'translations: the same placeholders and keyboard marks as the English text' (-not $badMarks) ($badMarks -join ' | ')
+    # Windows PowerShell 5.1 reads a script without a byte order mark in the PC's ANSI code page.
+    $tb = [IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'launcher_text.ps1'))
+    $notAscii = @(foreach ($s in 'netplay_gui.ps1', 'launcher_lib.ps1', 'updater.ps1', 'launcher_selftest.ps1', 'package.ps1') {
+        if ([regex]::IsMatch([IO.File]::ReadAllText((Join-Path $PSScriptRoot $s)), '[^\x00-\x7F]')) { $s } })
+    $ao = "$([char]0xE3)o"
+    Check 'translations: launcher_text.ps1 is UTF-8 with a byte order mark (and read as such), the other scripts ASCII' ($tb.Length -gt 3 -and $tb[0] -eq 0xEF -and $tb[1] -eq 0xBB -and $tb[2] -eq 0xBF -and
+        -not $notAscii -and ((New-UiTable $pt)['Version {0}']) -eq "Vers$ao {0}") ($notAscii -join ', ')
+    $res = @('pt-BR', 'pt-PT', 'pt', 'PT_br', 'en-US', 'es-ES', '', 'en', 'portuguese') | ForEach-Object { Resolve-UiLanguage $_ }
+    Check 'translations: Windows'' languages map to Portuguese (Brazil) or English' (($res -join ',') -eq 'pt-BR,pt-BR,pt-BR,pt-BR,en,en,en,en,en') ($res -join ',')
+    $lkey = 'HKCU:\Software\MK9RollbackSelfTest'
+    $envLang = $env:MK9R_LANG
+    $fromWindows = $null; $saved = $false; $afterPt = $null; $afterEn = $null; $byEnv = $null
+    try {
+        $env:MK9R_LANG = $null
+        Remove-Item -LiteralPath $lkey -Recurse -Force -ErrorAction SilentlyContinue
+        $fromWindows = Get-UiLanguageChoice $lkey
+        $saved = Save-UiLanguageChoice 'pt-BR' $lkey
+        $afterPt = Get-UiLanguageChoice $lkey
+        [void](Save-UiLanguageChoice 'en' $lkey)
+        $afterEn = Get-UiLanguageChoice $lkey
+        $env:MK9R_LANG = 'pt-BR'
+        $byEnv = Get-UiLanguageChoice $lkey
+    } finally {
+        $env:MK9R_LANG = $envLang
+        Remove-Item -LiteralPath $lkey -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Check 'translations: the player''s choice is kept and wins over Windows'' language; MK9R_LANG wins over both' ($saved -and $afterPt -eq 'pt-BR' -and $afterEn -eq 'en' -and $byEnv -eq 'pt-BR' -and
+        $fromWindows -eq (Resolve-UiLanguage ([Globalization.CultureInfo]::CurrentUICulture.Name))) "windows $fromWindows, saved $saved, $afterPt / $afterEn / env $byEnv"
+    Set-UiLanguage 'pt-BR'
+    try {
+        $ptMsg = Get-LauncherMessage '[21:13:30.001] ONLINE: this game controls player 2'
+        $ptRec = Format-MatchRecord $he $now
+        $pf = New-MatchFacts
+        [void](Update-MatchFacts $pf '[21:30:00.000] ONLINE: input delay 3 agreed (this game proposed 3, the other 2)')
+        $ptFacts = Format-MatchFacts $pf
+        $ptInj = (Get-InjectorResult 4).Text
+        $ptVer = Tr 'Version {0}' '20261116-1500'
+        $ptOther = Tr 'Not a text of the window {0}' 'x'
+    } finally { Set-UiLanguage 'en' }
+    $o = [char]0xF3
+    Check 'translations: in Portuguese, the log lines, the score, the last match and the injector''s texts' ($ptMsg.Text -eq "Rollback ligado. Voc$([char]0xEA) $([char]0xE9) o jogador 2." -and
+        $ptMsg.Head -eq 'Rollback ligado' -and $ptRec -eq "Placar de hoje: 1 vit${o}ria, 1 derrota, 1 empate. No total: 2-1-1." -and
+        $ptFacts -eq "$([char]0xDA)ltima partida: atraso 3." -and $ptInj -like 'O jogo est* rodando como administrador.*' -and $ptVer -eq "Vers$ao 20261116-1500" -and
+        $ptOther -eq 'Not a text of the window x' -and (Tr 'Version {0}' 'x') -eq 'Version x') "$($ptMsg.Text) / $ptRec / $ptFacts / $ptInj / $ptVer"
+} finally {
     Get-ChildItem -LiteralPath $tmp -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
