@@ -226,7 +226,7 @@ $kVersionText = if ($installed.version) { Tr 'Version {0}' $installed.version } 
 $form = if ('MK9R.QuietForm' -as [type]) { New-Object MK9R.QuietForm } else { New-Object System.Windows.Forms.Form }
 $form.SuspendLayout()
 $form.Text = 'MK9 Rollback'
-$form.ClientSize = New-Object System.Drawing.Size(460, 620)
+$form.ClientSize = New-Object System.Drawing.Size(460, 644)
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -388,6 +388,12 @@ $updLink = Link $form (Tr '&Check for updates') 300 568 142 'MiddleRight'
 # would only be updated again at the next start.
 $langLink = Link $form (Tr '&Language: {0}' (Get-UiLanguageName $script:UiLang)) 19 592 240
 $historyLink = Link $form (Tr '&Matches and replays') 280 592 162 'MiddleRight'
+# The credit line: the author's nickname and the project's page (the releases' repository, updater.ps1 $kUpdateRepo).
+$kProjectUrl = 'https://github.com/samuelndm/MK9Rollback'
+$creditLabel = Label $form (Tr 'Made by Gyros') 21 616 170 22 (UiFont 9) $c.Muted
+$creditLabel.TextAlign = 'MiddleLeft'
+$creditLink = Link $form 'github.com/samuelndm/MK9Rollback' 192 616 250 'MiddleRight'
+$creditLink.Add_LinkClicked({ try { Start-Process $kProjectUrl } catch { Say $kProjectUrl } })
 
 # The window's icon: the mark at the title bar's and the taskbar's sizes. The title bar and the window's edge take the
 # header's colours where Windows can (dark title bar: Windows 10 1809 and later; the colours: Windows 11). Registered

@@ -1,5 +1,7 @@
 # MK9Rollback
 
+Made by **Gyros** — https://github.com/samuelndm/MK9Rollback
+
 Rollback netcode for **Mortal Kombat Komplete Edition** on PC (Steam, `MKKE.exe` build 344915). A DLL injected into the
 running game replaces MK9's own online input exchange with [GGPO](https://github.com/pond3r/ggpo) rollback when both
 players run the mod, and leaves every other match (and Ranked) to the game's own netcode. The game files are not changed.

@@ -87,6 +87,7 @@ $script:UiTextPtBr = @(
     @('&Check for updates', 'Buscar &atualizações'),
     @('&Language: {0}', '&Idioma: {0}'),
     @('&Matches and replays', '&Partidas e replays'),
+    @('Made by Gyros', 'Feito por Gyros'),
     @('update available', 'atualização disponível'),
     @('&PLAY', '&JOGAR'),
     @('STARTING...', 'INICIANDO...'),
