@@ -387,7 +387,7 @@ $updLink = Link $form (Tr '&Check for updates') 300 568 142 'MiddleRight'
 # Where "Go back to the previous version" was until 2026-11-16: with updates installed by themselves, an older version
 # would only be updated again at the next start.
 $langLink = Link $form (Tr '&Language: {0}' (Get-UiLanguageName $script:UiLang)) 19 592 240
-$historyLink = Link $form (Tr '&Match history') 300 592 142 'MiddleRight'
+$historyLink = Link $form (Tr '&Matches and replays') 280 592 162 'MiddleRight'
 
 # The window's icon: the mark at the title bar's and the taskbar's sizes. The title bar and the window's edge take the
 # header's colours where Windows can (dark title bar: Windows 10 1809 and later; the colours: Windows 11). Registered
@@ -543,13 +543,31 @@ $historyPath = Join-Path $dir 'match_history.txt'
 function UpdateRecord {
     try { $recordLabel.Text = Format-MatchRecord @(Read-MatchHistory $historyPath) } catch { }
 }
+# Every match, with its replay where the DLL wrote one (src\net\ReplayKeeper.h). The in-game score is the room's only
+# since 2026-11-21 ("all matches should be saved elsewhere, so the user may find them in a History menu option or a
+# better name (probably replay, this way we can also see the replay of the match)"): this list keeps all of them.
+$replaysPath = Join-Path $dir 'replays'
+# Arms the playback of one replay in the running game ('replay <file>'): the next offline fight plays it.
+function WatchReplay($r, $note) {
+    if (-not $r -or -not (Test-Path -LiteralPath $r.Path)) { $note.Text = Tr 'This replay file is gone.'; return }
+    if ($script:state -ne 'watch' -or -not (Get-Process MKKE -ErrorAction SilentlyContinue)) {
+        $note.ForeColor = $c.Warn
+        $note.Text = Tr 'Press PLAY first: a replay plays in the game with the mod. Then choose it here again.'
+        return
+    }
+    if (-not (Cmd @("replay $($r.Name)"))) { $note.ForeColor = $c.Bad; $note.Text = Tr 'The game could not be told (the command file is busy). Try again.'; return }
+    $note.ForeColor = $c.Good
+    $note.Text = Tr 'Ready: in the game, start an offline fight (Ladder or Versus) and the replay plays in it. Not in an online room.'
+    Say (Tr 'Replay {0} is ready: start an offline fight (Ladder or Versus) in the game and it plays there.' $r.Name)
+}
 function ShowHistory {
     $entries = @(Read-MatchHistory $historyPath)
+    $entries = @(Add-MatchReplays $entries @(Get-ReplayFiles $replaysPath))
     $friends = Get-SteamFriendNames
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.SuspendLayout()
-    $dlg.Text = Tr 'Match history'
-    $dlg.ClientSize = New-Object System.Drawing.Size(860, 480)
+    $dlg.Text = Tr 'Matches and replays'
+    $dlg.ClientSize = New-Object System.Drawing.Size(920, 500)
     $dlg.MinimumSize = New-Object System.Drawing.Size(520, 300)
     $dlg.StartPosition = 'CenterParent'
     $dlg.ShowInTaskbar = $false
@@ -566,7 +584,7 @@ function ShowHistory {
     $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.HeaderStyle = 'Nonclickable'; $lv.MultiSelect = $false
     $lv.BorderStyle = 'None'; $lv.BackColor = $c.Field; $lv.ForeColor = $c.FieldText
     $lv.Dock = 'Fill'
-    foreach ($col in @(@((Tr 'When'), 128), @((Tr 'Result'), 72), @((Tr 'Rounds'), 60), @((Tr 'You played'), 150), @((Tr 'Opponent played'), 150), @((Tr 'Arena'), 160), @((Tr 'Opponent'), 120))) {
+    foreach ($col in @(@((Tr 'When'), 128), @((Tr 'Result'), 72), @((Tr 'Rounds'), 60), @((Tr 'You played'), 150), @((Tr 'Opponent played'), 150), @((Tr 'Arena'), 160), @((Tr 'Opponent'), 120), @((Tr 'Replay'), 60))) {
         [void]$lv.Columns.Add($col[0], $col[1])
     }
     $whenFormat = Tr 'yyyy-MM-dd HH:mm'
@@ -577,11 +595,13 @@ function ShowHistory {
         $it.UseItemStyleForSubItems = $false
         $it.ForeColor = $c.FieldText; $it.BackColor = $c.Field
         $res = switch ($e.Result) { 'WIN' { Tr 'Won' } 'LOSS' { Tr 'Lost' } default { Tr 'Draw' } }
-        foreach ($v in @($res, $(if ($e.Rounds -eq '?') { '' } else { $e.Rounds }), (Get-FighterName $e.Mine), (Get-FighterName $e.Theirs), (Get-ArenaName $e.Arena), (Get-OpponentLabel $e.Opponent $friends))) {
+        foreach ($v in @($res, $(if ($e.Rounds -eq '?') { '' } else { $e.Rounds }), (Get-FighterName $e.Mine), (Get-FighterName $e.Theirs), (Get-ArenaName $e.Arena), (Get-OpponentLabel $e.Opponent $friends), $(if ($e.Replay) { Tr 'yes' } else { '' }))) {
             $sub = $it.SubItems.Add([string]$v)
             $sub.ForeColor = $c.FieldText; $sub.BackColor = $c.Field
         }
         $it.SubItems[1].ForeColor = switch ($e.Result) { 'WIN' { $c.Good } 'LOSS' { $c.Bad } default { $c.Muted } }
+        $it.SubItems[7].ForeColor = $c.Accent
+        $it.Tag = $e.Replay
         [void]$lv.Items.Add($it)
     }
     $lv.EndUpdate()
@@ -610,20 +630,57 @@ function ShowHistory {
     $sum.AutoSize = $true
     $top.Controls.Add($sum)
     $top.Height = 20 + 20 * $lines.Count
-    # Below it: where the file is.
+    # Below it: the selected match's replay, and where the files are.
     $foot = New-Object System.Windows.Forms.Panel
     $foot.Dock = 'Bottom'
-    $foot.Height = 34
+    $foot.Height = 76
     $foot.BackColor = $c.Bg
+    $watch = New-Object System.Windows.Forms.Button
+    $watch.Text = Tr '&Watch the replay'
+    $watch.Font = UiFont 9.75 -Semi
+    $watch.Location = New-Object System.Drawing.Point(14, 8)
+    $watch.Size = New-Object System.Drawing.Size(180, 30)
+    StyleButton $watch
+    $note = New-Object System.Windows.Forms.Label
+    $note.UseMnemonic = $false
+    $note.AutoSize = $false
+    $note.Location = New-Object System.Drawing.Point(206, 8)
+    $note.Size = New-Object System.Drawing.Size(700, 30)
+    $note.TextAlign = 'MiddleLeft'
+    $note.Anchor = 'Top, Left, Right'
+    $note.ForeColor = $c.Muted
+    $countWith = @($entries | Where-Object { $_.Replay }).Count
+    $note.Text = if ($countWith) { Tr 'Pick a match marked "yes" in the Replay column, then Watch (or double-click it).' } else { Tr 'No replay yet: matches played with version 20261117-1517 or later have one.' }
+    # The button is lit only for a match that has a replay.
+    $syncWatch = {
+        $r = if ($lv.SelectedItems.Count) { $lv.SelectedItems[0].Tag } else { $null }
+        $watch.Enabled = [bool]$r
+        if (-not $kHighContrast) { $watch.Tag.Back = $(if ($r) { $c.Accent } else { $c.Border }); $watch.Tag.Fore = $(if ($r) { $c.OnAccent } else { $c.Muted }); $watch.Invalidate() }
+    }
+    $lv.Add_SelectedIndexChanged($syncWatch)
+    $watch.Add_Click({ if ($lv.SelectedItems.Count) { WatchReplay $lv.SelectedItems[0].Tag $note } })
+    $lv.Add_DoubleClick({ if ($lv.SelectedItems.Count -and $lv.SelectedItems[0].Tag) { WatchReplay $lv.SelectedItems[0].Tag $note } })
+    & $syncWatch
     $fileLink = New-Object System.Windows.Forms.LinkLabel
     $fileLink.Text = Tr 'Show the file (match_history.txt)'
     $fileLink.LinkBehavior = 'HoverUnderline'
     $fileLink.LinkColor = $c.Link; $fileLink.VisitedLinkColor = $c.Link; $fileLink.ActiveLinkColor = $c.AccentHot
-    $fileLink.Location = New-Object System.Drawing.Point(14, 8)
+    $fileLink.Location = New-Object System.Drawing.Point(14, 48)
     $fileLink.AutoSize = $true
     $fileLink.Enabled = Test-Path -LiteralPath $historyPath
     $fileLink.Add_LinkClicked({ if (Test-Path -LiteralPath $historyPath) { Start-Process explorer.exe -ArgumentList "/select,`"$historyPath`"" } })
+    $folderLink = New-Object System.Windows.Forms.LinkLabel
+    $folderLink.Text = Tr 'Open the replays folder'
+    $folderLink.LinkBehavior = 'HoverUnderline'
+    $folderLink.LinkColor = $c.Link; $folderLink.VisitedLinkColor = $c.Link; $folderLink.ActiveLinkColor = $c.AccentHot
+    $folderLink.Location = New-Object System.Drawing.Point(330, 48)
+    $folderLink.AutoSize = $true
+    $folderLink.Enabled = Test-Path -LiteralPath $replaysPath
+    $folderLink.Add_LinkClicked({ if (Test-Path -LiteralPath $replaysPath) { Start-Process explorer.exe -ArgumentList "`"$replaysPath`"" } })
+    $foot.Controls.Add($watch)
+    $foot.Controls.Add($note)
     $foot.Controls.Add($fileLink)
+    $foot.Controls.Add($folderLink)
     $dlg.Controls.Add($lv)
     $dlg.Controls.Add($foot)
     $dlg.Controls.Add($top)

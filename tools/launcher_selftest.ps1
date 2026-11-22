@@ -369,6 +369,27 @@ try {
     $fn = @{ [uint64]5 = 'Friend Name' }
     $ol = @((Get-OpponentLabel ([uint64]76561197960265733) $fn), (Get-OpponentLabel ([uint64]76561197960269999) $fn), (Get-OpponentLabel ([uint64]0) $fn))
     Check 'match history: opponent labels (a Steam friend by name, else the ID''s end)' (($ol -join '|') -eq 'Friend Name|player ...9999|?') ($ol -join '|')
+    # Each match's replay (the DLL's replays folder, src\net\ReplayKeeper.h names).
+    $rd = Join-Path $tmp 'replays'
+    [void](New-Item -ItemType Directory -Force $rd)
+    foreach ($n in @('2026-11-20_202034_JOHNNYCAGE_B_vs_KABAL.mk9r', '2026-11-20_202218_JOHNNYCAGE_B_vs_KABAL.mk9r', '2026-11-20_203000_KABAL_vs_JOHNNYCAGE_B.mk9r',
+            '2026-11-20_204500_SCORPION_vs_SUBZERO_2.mk9r', 'bad.mk9r', '2026-11-20_2045_SCORPION_vs_SUBZERO.mk9r', '2026-11-20_204600_SCORPION_vs_SUBZERO.txt')) {
+        [System.IO.File]::WriteAllBytes((Join-Path $rd $n), [byte[]]@(1))
+    }
+    $rf = @(Get-ReplayFiles $rd)
+    Check 'replays: the files read in order, malformed names left out' ($rf.Count -eq 4 -and $rf[0].Name -like '*202034*' -and $rf[0].P1 -eq 'JOHNNYCAGE_B' -and $rf[0].P2 -eq 'KABAL' -and
+        $rf[3].P2 -eq 'SUBZERO' -and $rf[3].Start -eq [datetime]'2026-11-20 20:45:00') "$($rf.Count) files: $(($rf | ForEach-Object { "$($_.Name)=$($_.P1)/$($_.P2)" }) -join ' ')"
+    Check 'replays: no folder, no files' (@(Get-ReplayFiles (Join-Path $tmp 'no_such_folder')).Count -eq 0)
+    $rl = @(
+        "2026-11-20 20:21:58`tWIN`t2-0`tCHAR_JOHNNYCAGE_B`tCHAR_KABAL`tBGND_Courtyard`t76561197960265733`t1",
+        "2026-11-20 20:23:52`tLOSS`t0-2`tCHAR_JOHNNYCAGE_B`tCHAR_KABAL`tBGND_Courtyard`t76561197960265733`t1",
+        "2026-11-20 20:31:00`tWIN`t2-1`tCHAR_JOHNNYCAGE_B`tCHAR_KABAL`tBGND_Courtyard`t76561197960265733`t2",
+        "2026-11-20 20:40:00`tWIN`t2-1`tCHAR_JOHNNYCAGE_B`tCHAR_KABAL`tBGND_Courtyard`t76561197960265733`t2",
+        "2026-11-20 20:46:30`tLOSS`t1-2`tCHAR_Scorpion`tCHAR_SubZero`tBGND_Pit`t76561197960265733`t1"
+    ) | ForEach-Object { ConvertFrom-MatchHistoryLine $_ }
+    $ra = @(Add-MatchReplays $rl $rf)
+    $got = ($ra | ForEach-Object { if ($_.Replay) { $_.Replay.Name.Substring(11, 6) } else { '-' } }) -join ' '
+    Check 'replays: each match gets the replay that began between the match before it and its end, fighters in side order (a match without one takes none)' ($got -eq '202034 202218 203000 - 204500') $got
     $sn = $null; $threw = $false
     try { $sn = Get-SteamFriendNames } catch { $threw = $true }
     Check 'match history: Get-SteamFriendNames returns a table without failing' ((-not $threw) -and $sn -is [hashtable])

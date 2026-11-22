@@ -1,5 +1,5 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,stagepick,stagehold,refightvote,koth,presslatch,padpreset,score,replay,codewrite,strappend,guardpage,hud,scoreview,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,stagepick,stagehold,refightvote,koth,presslatch,padgap,padpreset,score,replay,codewrite,strappend,stopkeep,guardpage,hud,scoreview,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
 #                        [-Seconds 25] [-GameDir <the folder that holds DiscContentPC>]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
@@ -36,6 +36,9 @@
 #           3000 taps through a simulated main loop with pauses of up to 400 ms: all lost ones arrive, none twice, no
 #           key left down), and the pads' reading thread (sources, the rule that a source counts only once MK9's own
 #           sampler has shown it, two threads on the latch, 3000 presses through the same loop).
+#   padgap  src\game\PadGap.h: presses the game never read (begun and ended between two samples of the controls): the
+#           pads' sources and edges, the verdict against the samples, keys, the ring between two threads, and simulated
+#           10-minute evenings with stalls: a press the game read is never counted as lost.
 #   codewrite  src\hook\CodePatch + src\common\ThreadWalk.h: code patched while 48 threads run (all suspended for a write
 #           and running after it, a write under a running thread refused), and 56 writes (what arming makes in one game
 #           frame) inside half a second. The program is not called "codepatch": Windows takes a 32-bit program with
@@ -57,6 +60,9 @@
 #           samples); and tools\replay_from_log.ps1 run on two made-up logs (tests\host\replay_sample_*.log): the
 #           PowerShell writer's file read by the C++ reader with every value as expected.
 #   strappend  src\common\StrAppend.h: AppendF never writes past its buffer and always leaves it terminated.
+#   stopkeep  src\rollback\StopKeep.h: which held blocks a mid-fight session stop keeps, the STALEWRITE check's block hash
+#           (a write anywhere in the first 1 KB is seen, unreadable memory reported), its checkpoints, and the names of
+#           MK9's disconnect types and callers.
 #   guardpage  src\common\GuardPage.h: a guarded read of another thread's stack guard page puts the guard back, so
 #           that thread can still grow its stack (a child process shows the crash without it).
 #   hud    src\debug\Hud.cpp: the network display that belongs to the game's HUD, without the game. For eight picture
@@ -105,11 +111,11 @@
 #           thread of its own. Every program on the PC waits with it, so it refuses to start while MKKE runs.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
+      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padgap', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'stopkeep', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
       [int]$Seconds = 25, [string]$GameDir = '')
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
+$known = 'hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padgap', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'stopkeep', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -238,6 +244,10 @@ if ($Only -contains 'presslatch') {
     $ok = RunSmall 'presslatch_test' 'press latch: a press between two samples of the controls' @((Join-Path $PSScriptRoot 'presslatch_test.cpp')) @('-I', (Join-Path $root 'src\game')) 120
     if (-not $ok) { $failed += 'presslatch' }
 }
+if ($Only -contains 'padgap') {
+    $ok = RunSmall 'padgap_test' 'pad gap: presses the game never read' @((Join-Path $PSScriptRoot 'padgap_test.cpp')) @('-I', (Join-Path $root 'src\game')) 120
+    if (-not $ok) { $failed += 'padgap' }
+}
 
 if ($Only -contains 'padpreset') {
     $ok = RunSmall 'padpreset_test' 'controller presets kept across game starts' @((Join-Path $PSScriptRoot 'padpreset_test.cpp')) @('-I', (Join-Path $root 'src\game')) 60
@@ -289,6 +299,11 @@ if ($Only -contains 'scoreview') {
     $ok = RunSmall 'scoreview_test' 'score in a fight: wins under the health bars, runs, fades' @((Join-Path $PSScriptRoot 'scoreview_test.cpp'),
                    (Join-Path $root 'src\debug\ScoreView.cpp'), (Join-Path $root 'src\debug\Hud.cpp')) @() 120 @('-lgdi32') @((Join-Path $out 'scoreview'))
     if (-not $ok) { $failed += 'scoreview' }
+}
+
+if ($Only -contains 'stopkeep') {
+    $ok = RunSmall 'stopkeep_test' 'blocks kept at a mid-fight stop, stale-write check, disconnect names' @((Join-Path $PSScriptRoot 'stopkeep_test.cpp')) @('-I', (Join-Path $root 'src\rollback')) 30
+    if (-not $ok) { $failed += 'stopkeep' }
 }
 
 if ($Only -contains 'keyedge') {

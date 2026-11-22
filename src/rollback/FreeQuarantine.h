@@ -27,6 +27,13 @@ void SetUnfreeAll(bool on);  // load: every block freed after S is live again (o
 void SetFrame(uint32_t gf);     // current GameFrame stamp for new entries
 void Release(uint32_t oldestNeededGf);  // free entries stamped < oldestNeededGf
 void ReleaseAll();
+// A rollback session stopped mid-fight ('why': not the match's end): the parked blocks held now (GMalloc and
+// small-block ones; MK heap blocks stay as they are) leave the quarantine for good, never given back to MK9's allocator,
+// and their hashes are recorded for the STALEWRITE check (StopKeep.h: the 2026-11-20 crash). The other held blocks go
+// back as usual. Game thread.
+void KeepParkedNow(const char* why);
+// Game thread, every frame boundary: the STALEWRITE checkpoints (2, 10, 30, 90 s after a keep).
+void StaleTick();
 // A load to snapshot frame S: frees stamped >= S happened in the abandoned timeline, so
 // those blocks are live again (the resimulation re-frees them if it still does). Returns count.
 // Older blocks freed after S by non-MK code are requeued for release instead, unless a dword in the restored

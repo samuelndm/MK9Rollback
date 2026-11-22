@@ -70,15 +70,19 @@ HOW TO PLAY
    preset each player picks (pause menu, or the player options on the character select) is kept in
    build\clang\controller_presets.txt and set again when the game reaches its menus. Delete that file to
    start on preset 1 again.
-8. SCORE AND MATCH HISTORY: every online 1 vs 1 match (Player Match or a private room) that reaches MK9's
-   results screen is counted as won, lost or drawn, read from the fighters' life bars. In a fight, each
-   player's wins today stand under that player's health bar, with "3 IN A ROW" under the one on a run.
-   After a match, over the choice: today's score against that opponent in large numbers (a day starts at
-   6:00, so a late evening counts as one), the wins in a row, the total over every day; at its right the
-   last 8 matches, at its left today's record of each fighter you chose. The window shows the score under
-   "Last match", and "Match history" at the bottom lists every match: when, the result, the rounds,
-   both fighters, the arena and the opponent. The list is build\clang\match_history.txt (one line per
-   match; updates keep it).
+8. SCORE, MATCHES AND REPLAYS: every online 1 vs 1 match (Player Match or a private room) that reaches
+   MK9's results screen is counted as won, lost or drawn, read from the fighters' life bars. The score in
+   the game is the room's: it starts at 0 - 0 when you meet an opponent and starts again when a player
+   chooses LEAVE after a match, the online match ends, or the game closes (REMATCH and CHANGE FIGHTER OR
+   ARENA keep it). In a fight, each player's wins stand under that player's health bar, with "3 IN A ROW"
+   under the one on a run. After a match, over the choice: the score in large numbers, the wins in a row;
+   at its right the room's last 8 matches, at its left its record of each fighter you chose.
+   Every match is also kept: "Matches and replays" at the bottom of the window lists all of them (when,
+   the result, the rounds, both fighters, the arena, the opponent) with the score of today and of all
+   time. A match with a replay says "yes": select it and press "Watch the replay" (the game must be
+   running with the mod), then start an offline fight (Ladder or Versus) and the match plays in it. The
+   list is build\clang\match_history.txt (one line per match), the replays build\clang\replays (updates
+   keep both).
 9. LANGUAGE: the window speaks English or Portuguese (Brazil), following Windows' display language.
    "Language" at the bottom of the window changes it (O idioma muda em "Idioma", embaixo na janela).
 

@@ -39,6 +39,7 @@
 #include "../rollback/RollbackManager.h"
 #include "../rollback/Snapshot.h"
 #include "../rollback/StateHash.h"
+#include "../rollback/StopKeep.h"
 #include "CrashLog.h"
 #include "Lab.h"
 #include "Ue3Names.h"
@@ -234,14 +235,47 @@ constexpr uintptr_t kSetPause = 0x00407AB0;
 const uint8_t kSetPauseOrig[6] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C};  // push ebp; mov ebp,esp; sub esp,0xC
 uint8_t* gSetPauseTramp = nullptr;
 void CallSetPause(int on) { reinterpret_cast<SetPauseFn>(gSetPauseTramp ? reinterpret_cast<uintptr_t>(gSetPauseTramp) : kSetPause)(on); }
+// MK9's UI BeginDisconnect(type) (0x00944C90) pauses the game at 0x00944D42 for each disconnect it starts. 2026-11-20
+// 20:14:55 such a pause came mid-fight, 40 frames before the two games went out of sync, and the log could not say which
+// disconnect or why. 'bdEbp' is BeginDisconnect's frame (standard prologue): its type at +8, its return at +4, and the
+// frame above it (the Disconnect wrapper 0x0081C640's, also standard) holds that one's return at +4.
+void LogDisconnectPause(uint32_t bdEbp, bool refused) {
+    static int logged = 0;
+    if (logged >= 40) return;
+    ++logged;
+    uint32_t type = 0xFFFFFFFF, ret = 0, upEbp = 0, upRet = 0;
+    const bool ok = bdEbp && CrashLog::SafeRead32(bdEbp + 8, &type) && CrashLog::SafeRead32(bdEbp + 4, &ret);
+    if (ok && CrashLog::SafeRead32(bdEbp, &upEbp) && upEbp > bdEbp) CrashLog::SafeRead32(upEbp + 4, &upRet);
+    if (!ok) {
+        Logger::Info("DISCONNECT: MK9 began a disconnect (its pause call at 00944D42; the type could not be read); the pause %s",
+                     refused ? "is refused, the session goes on" : "goes through");
+        return;
+    }
+    uint32_t gi = 0, state = 0xFFFFFFFF, gf = 0;  // FG_GAME_INFO: +0x4 game state, +0x70 game frame
+    if (CrashLog::SafeRead32(MK9Game::Get().gameInfoPtr, &gi) && gi) {
+        CrashLog::SafeRead32(gi + 0x4, &state);
+        CrashLog::SafeRead32(gi + 0x70, &gf);
+    }
+    Logger::Info("DISCONNECT: MK9 began a disconnect: BeginDisconnect(%s = %u), called from %08X (%s), the frame above from "
+                 "%08X; game state %d, MK9's frame %u; the pause it asks for %s",
+                 StopKeep::DisconnectTypeName(type), type, ret, StopKeep::DisconnectCallerName(ret), upRet, (int)state, gf,
+                 refused ? "is refused, the session goes on" : "goes through (no rollback session)");
+}
 void __cdecl SetPauseGuard(int on) {
+    const uint32_t from = (uint32_t)(uintptr_t)__builtin_return_address(0) - 5;
+    // The hook at 0x00407AB0 is a jmp, so this function's frame sits directly on its caller's: [ebp] = the caller's ebp.
+    uint32_t callerEbp = 0;
+    if (on && from == StopKeep::kBeginDisconnectPause)
+        CrashLog::SafeRead32((uint32_t)(uintptr_t)__builtin_frame_address(0), &callerEbp);
     if (on && (Rollback::NetplayRunning() || Rollback::PlaybackRunning())) {
         static int refused = 0;
         if (refused++ < 20)
             Logger::Info("PAUSE: the game asked to pause during the netplay session (call from %08X); refused, the session goes on",
-                         (unsigned)(uintptr_t)__builtin_return_address(0) - 5);
+                         from);
+        if (from == StopKeep::kBeginDisconnectPause) LogDisconnectPause(callerEbp, true);
         return;
     }
+    if (on && from == StopKeep::kBeginDisconnectPause) LogDisconnectPause(callerEbp, false);
     CallSetPause(on);
 }
 

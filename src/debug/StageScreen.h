@@ -66,9 +66,10 @@ struct State {  // plain data, no pointers
     uint32_t seed = 0;               // the roulette's length (the same number on both screens)
     uint64_t phaseSinceMs = 0;       // GetTickCount64 when the phase began (the roulette's clock)
     char note[72] = "";              // one more line: the reason of a fallback, a trial run's remark
-    // kVote: the score against this opponent (net\ScoreKeeper.h): a scoreboard over the panel (today's wins of each
-    // player in large numbers, the wins in a row, every day's total), the last matches at its right and today's record
-    // of each fighter this player chose at its left. board.on 0: none of it.
+    // kVote: the score of this room (net\ScoreKeeper.h: the matches against this opponent since the two met in this
+    // game, until one of them leaves): a scoreboard over the panel (each player's wins in large numbers, the wins in a
+    // row, the draws and longest runs), the room's last matches at its right and its record of each fighter this player
+    // chose at its left. board.on 0: none of it.
     Score::Board board;
     char name[kMaxCells][30] = {};
     uint8_t pic[kMaxCells] = {};     // tiles: the cell's picture, its place in ArenaPics' sheet + 1; 0: none (RANDOM)
@@ -119,7 +120,8 @@ void DisplayName(const char* tableName, char* out, int cap);
 // Tiles are drawn: they are wanted and the cells fit them.
 bool Tiles(int cells, bool wanted);
 // The grid for a number of cells. Names: 3 columns up to 30 cells, 4 above (the smaller face). Tiles: 8 columns,
-// each cell a picture 16:9 (the game's pictures are 16:9 squeezed into a square) and room for two lines of its name.
+// each cell a picture 16:9 (the game's pictures are 16:9 squeezed into a square) and room for two lines of its name;
+// a short last row of tiles stands in the middle under the full rows (2026-11-21).
 struct Box {
     int x0, y0, x1, y1;
 };
@@ -131,7 +133,9 @@ struct Layout {
     Box pic[kMaxCells] = {};  // tiles: the picture's place in its cell
 };
 Layout LayoutOf(int cells, bool tiles, const Hud::View& v);
-// The cursor after a step (dx, dy: -1, 0, 1), wrapping at the edges and skipping the holes of a short last row.
+// The cursor after a step (dx, dy: -1, 0, 1), wrapping at the edges. The list skips the holes of a short last row; a
+// step into the tiles' centred last row goes to the tile under the column (the nearest end tile beside it), and a step
+// out of it to the column over the tile.
 uint8_t Move(int cells, bool tiles, uint8_t from, int dx, int dy);
 // A name on at most two lines of a width: broken at the space that leaves the two lines most alike, and cut where
 // even that does not fit. Returns the number of lines (1 or 2).

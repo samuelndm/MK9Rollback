@@ -2956,6 +2956,10 @@ void GgpoStop(const char* why) {
         strncpy(gOvStopWhy, why, sizeof gOvStopWhy - 1);
         gOvStopWhy[sizeof gOvStopWhy - 1] = 0;
         gOvStopAt = GetTickCount();
+        // The fight goes on without the session: the quarantine's parked blocks are kept for good, never given back to
+        // MK9's allocator, while their stale writers may still run (FreeQuarantine::KeepParkedNow, StopKeep.h: the
+        // 2026-11-20 crash at the next stage load).
+        FreeQuarantine::KeepParkedNow(why);
     }
     // A session that stops mid-fight says so (round 3): the other game stops with it within a frame or two instead of
     // standing at its prediction limit until the 3 s disconnect timeout. Not at a normal end, where both games stop by
@@ -5482,6 +5486,7 @@ bool OnTickEntry(void* engine, float dt) {
         }
     }
     FreeQuarantine::SetFrame(F);
+    FreeQuarantine::StaleTick();
     AllocWatch::SetFrame(F);
     // gQuarantineMargin frames past the ring: a safety margin for state that still points at a block freed just outside
     // the window. (Added for the 2026-11-04 regression crash, which turned out to be a garbage-collected light component

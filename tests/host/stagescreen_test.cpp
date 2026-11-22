@@ -888,8 +888,11 @@ int main(int argc, char** argv) {
             for (int i = 0; i < cells; ++i) {
                 uint8_t at = (uint8_t)i;
                 for (int k = 0; k < l.rows; ++k) at = Move(cells, tiles, at, 0, 1);
-                // A column of a short last row has one cell less: a full turn of it is one step shorter.
-                const bool shortColumn = (l.rows - 1) * l.cols + i % l.cols >= cells;
+                // A short last row: the list's has holes at its right (a full turn of such a column is one step
+                // shorter); the tiles' stands in the middle, and the columns beside its ends come back to its end tiles'
+                // columns.
+                const int lastN = cells - (l.rows - 1) * l.cols, shift = l.tiles ? (l.cols - lastN) / 2 : 0, c = i % l.cols;
+                const bool shortColumn = l.tiles ? l.rows > 1 && (c < shift || c >= shift + lastN) : (l.rows - 1) * l.cols + c >= cells;
                 if (!shortColumn) turns &= at == i;
             }
             onCell &= Move(cells, tiles, 200, 1, 0) == cells - 1 && Move(cells, tiles, kNoCell, 0, 0) == cells - 1;
@@ -901,9 +904,24 @@ int main(int argc, char** argv) {
         Check(Move(29, false, 0, -1, 0) == 2 && Move(29, false, 2, 1, 0) == 0 && Move(29, false, 0, 0, -1) == 27 && Move(29, false, 28, 0, 1) == 1 &&
                   Move(29, false, 28, 1, 0) == 27,
               "29 cells in 3 columns: the edges wrap, and the short last row is stepped over");
-        Check(Move(29, true, 0, -1, 0) == 7 && Move(29, true, 7, 1, 0) == 0 && Move(29, true, 0, 0, -1) == 24 && Move(29, true, 28, 0, 1) == 4 &&
-                  Move(29, true, 28, 1, 0) == 24 && Move(29, true, 5, 0, -1) == 21 && Move(29, true, 21, 0, 1) == 5 && Move(29, true, 12, 1, 0) == 13,
-              "29 tiles in 8 columns: the edges wrap, and the short last row is stepped over");
+        Check(Move(29, true, 0, -1, 0) == 7 && Move(29, true, 7, 1, 0) == 0 && Move(29, true, 0, 0, -1) == 24 && Move(29, true, 28, 0, 1) == 5 &&
+                  Move(29, true, 28, 1, 0) == 24 && Move(29, true, 5, 0, -1) == 28 && Move(29, true, 21, 0, 1) == 28 && Move(29, true, 12, 1, 0) == 13 &&
+                  Move(29, true, 17, 0, 1) == 24 && Move(29, true, 24, 0, -1) == 17 && Move(29, true, 26, 0, -1) == 19 && Move(29, true, 23, 0, 1) == 28 &&
+                  Move(29, true, 16, 0, 1) == 24,
+              "29 tiles in 8 columns: the edges wrap, and a step into or out of the centred last row goes to the tile under / over the column");
+        {
+            // The tiles' short last row stands in the middle: five of eight, one and a half tiles in from each side.
+            const Layout l = LayoutOf(29, true, Hud::View{0, 0, 1920, 1080});
+            const int cw = l.cell[0].x1 - l.cell[0].x0;
+            const int left = l.cell[24].x0 - l.cell[0].x0, right = l.cell[7].x1 - l.cell[28].x1;
+            Check(l.cell[24].y0 == l.cell[16].y1 && left == right && left >= cw * 3 / 2 - 1 && left <= cw * 3 / 2 + 1 &&
+                      l.cell[25].x0 == l.cell[24].x1,
+                  "29 tiles: the last row of five is centred under the eight above it");
+            const Layout full = LayoutOf(32, true, Hud::View{0, 0, 1920, 1080});
+            Check(full.cell[24].x0 == full.cell[0].x0 && full.cell[31].x1 == full.cell[7].x1, "32 tiles: a full last row is not moved");
+            const Layout list = LayoutOf(29, false, Hud::View{0, 0, 1920, 1080});
+            Check(list.cell[27].x0 == list.cell[0].x0, "the list of names keeps its last row at the left");
+        }
         Check(Move(40, true, 0, -1, 0) == Move(40, false, 0, -1, 0) && Move(40, true, 0, -1, 0) == 3, "more cells than the tiles hold move as the list does");
     }
 

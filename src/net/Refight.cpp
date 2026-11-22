@@ -216,6 +216,7 @@ void SetStep(Step s, uint64_t now) {
     gStepAt = now;
 }
 void EndPending(const char* why);
+void BoxQuietEnd(const char* why);
 
 // The panel is gone and the game has its controls. A re-fight both players chose, and both know of, goes on from here.
 void Finish(uint64_t now, const char* why) {
@@ -227,6 +228,7 @@ void Finish(uint64_t now, const char* why) {
     gX.Close();
     gBot.Close();
     gPress.Reset();
+    BoxQuietEnd("the panel closed");
     Input::SetPanelPass(0);
     if (Input::PanelHold()) Input::SetPanelHold(false);
     SetStep(Step::kIdle, now);
@@ -444,6 +446,8 @@ void NoteOutcome() {
              o == Vote::kRefight ? "REMATCH: THE SAME FIGHTERS, THE SAME ARENA" : o == Vote::kChange ? "BACK TO THE CHARACTER SELECT"
              : o == Vote::kLeave ? (iLeave ? "LEAVING" : "THE OPPONENT LEAVES") : "");
     if (o != Vote::kPending) Logger::Info("REFIGHT the two choices give: %s", RefightVote::OutcomeText(o));
+    // A player leaves: the score of this room ends here (it stays on this panel; the next match starts a new one).
+    if (o == Vote::kLeave && gMode == kModeOn) ScoreKeeper::RoomOver(iLeave ? "this player chose LEAVE" : "the other player chose LEAVE");
 }
 
 // The online session's Kombat Kodes, through guarded reads. False: no online session (an offline game), or not readable.
@@ -562,6 +566,40 @@ void QuietTick(uint32_t state) {
     Logger::Info("REFIGHT quiet: on (game state %u): no sound is started while the cover is up on MK9's character select; it ends by itself "
                  "%u ms after the mod last asked for it",
                  state, kQuietKeepMs);
+}
+// MK9's rematch box under the panel is pressed again with this player's pick every half second until the box is over,
+// which is when the other player has answered too (RefightVote::Presser: the box reads no pad for a moment after it
+// begins). The box sounds each press it reads, also one more "confirm" of a pick it already has: "if the user choose to
+// fight again the sound of the button keeps pinging ... is very annoying" (2026-11-21). The first round of presses is
+// heard (the sound of the player's choice); from the second round on no sound is started until the box is over, the
+// presses end or the panel closes. 'refightquiet 0' turns this off with the rest.
+bool gBoxQuietOn = false;
+int gBoxQuietPress = 0, gBoxQuietLast = 0;
+void BoxQuietEnd(const char* why) {
+    if (!gBoxQuietOn) return;
+    gBoxQuietOn = false;
+    SoundDedupe::QuietOff();
+    char names[400] = "";
+    const uint32_t held = SoundDedupe::QuietTake(names, sizeof names);
+    Logger::Info("REFIGHT box quiet: over (%s): %u sound(s) of MK9's rematch box were not started while the mod pressed this player's pick "
+                 "again (presses %d to %d)%s%s",
+                 why, held, gBoxQuietPress, gBoxQuietLast, held ? "; the first of them: " : "", held ? names : "");
+}
+// After this tick's presses are set (the box reads them in this tick's update), and at the start of every tick.
+void BoxQuietTick() {
+    if (!gQuiet || gMode != kModeOn || gStep != Step::kVoting || gBoxOver || !gPress.Repeating())
+        return BoxQuietEnd(!gQuiet ? "'refightquiet 0'" : gStep != Step::kVoting || gBoxOver ? "MK9's rematch box is over or the panel closed"
+                                                                                               : "the presses ended");
+    if (gQuietOn) return;  // (the character select's quiet, or a test's, holds everything already)
+    SoundDedupe::Quiet(kQuietKeepMs);
+    gBoxQuietLast = gPress.presses;
+    if (gBoxQuietOn) return;
+    gBoxQuietOn = true;
+    gBoxQuietPress = gPress.presses;
+    SoundDedupe::QuietTake(nullptr, 0);
+    Logger::Info("REFIGHT box quiet: on: MK9's rematch box is pressed again with this player's pick (press %d, the other player has not "
+                 "answered on MK9's side yet); no sound is started until the box is over",
+                 gPress.presses);
 }
 // 'refightquiet <ms>' (a look at one PC): the same quiet for that long, whatever the game shows, and the same lines.
 void QuietTest(uint64_t now, uint32_t state) {
@@ -843,6 +881,7 @@ void Tick() {
     NoteFight(now, state);
     Pending(now, state);
     QuietTest(now, state);
+    BoxQuietTick();  // (ends it when the panel or its presses are gone)
     // MK9's rematch screen has begun: the panel opens in the first tick that allows it.
     if (gWantOpen && gStep == Step::kIdle) {
         if (gMode != kModeOn || state == kSelectState || state == kLoadState) {
@@ -900,6 +939,7 @@ void Tick() {
     }
     // MK9's own box under the panel: the presses of this player's choice (none in a test, none once the box is over).
     Input::SetPanelPass(gMode == kModeOn && gStep == Step::kVoting ? gPress.Tick() : 0);
+    BoxQuietTick();  // (a repeated press is not heard: before the box reads it in this tick's update)
     Publish(now);
 }
 
@@ -939,6 +979,7 @@ void OnNative(uint32_t id, uint32_t firstOperand) {
         const uint64_t now = GetTickCount64();
         gBoxOver = true;
         gPress.Reset();
+        BoxQuietEnd("MK9's rematch box is over");
         Input::SetPanelPass(0);
         NoteOutcome();
         if (gOutcome == Vote::kPending) snprintf(gNote, sizeof gNote, "%s", "DECIDED ON MK9'S OWN BOX");
@@ -1173,7 +1214,7 @@ bool Active() { return gStep != Step::kIdle || gWantOpen; }
 
 void Shutdown() {
     gWantOpen = false;
-    gQuietOn = false;
+    gQuietOn = gBoxQuietOn = false;
     SoundDedupe::QuietOff();
     ReleaseAuto();
     ScriptRng::SetMatchPlayers(nullptr, nullptr);

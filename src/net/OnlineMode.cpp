@@ -61,6 +61,7 @@ uint8_t* gExchangeTramp = nullptr;
 uint8_t* gIdleTramp = nullptr;
 
 uint64_t gPeer = 0;
+uint32_t gMatchEnds = 0;  // MatchReset calls (game thread)
 bool gAuto = false;  // 'online auto': gPeer is found in the game's connection, per match
 ULONGLONG gLastScan = 0;
 bool gScanLogged = false;  // per match
@@ -1030,6 +1031,7 @@ void Disengage(const char* why) {
 // The end of an online match (the connection's data inactive for 20 s, or a different connection): ready for the next
 // one, which proposes its delay from its own round trips.
 void MatchReset(const char* why) {
+    ++gMatchEnds;
     Disengage(why);
     gFailedThisMatch = false;
     gSessionThisMatch = false;
@@ -1128,6 +1130,8 @@ bool OneOnOne() {
 bool KingOfTheHill() { return gKoth.in; }
 
 uint64_t Opponent() { return gPeer && gPeer != kAutoPeer ? gPeer : 0; }
+
+uint32_t MatchEnds() { return gMatchEnds; }
 
 bool Install() {
     if (gExchangeTramp && gIdleTramp && gSendTramp) return true;

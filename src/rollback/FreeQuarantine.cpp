@@ -18,6 +18,7 @@
 #include "../hook/ObjectHooks.h"
 #include "ParallelMem.h"
 #include "RollbackManager.h"
+#include "StopKeep.h"
 
 namespace {
 constexpr uintptr_t kGMallocPtr = 0x00E3EFC8;
@@ -848,6 +849,126 @@ void SetProtectLate(bool on) {
                  on ? "stay live when a later restore (cinema) puts a reference to them back" : "are released whatever later restores put back");
 }
 
+}  // namespace FreeQuarantine
+
+namespace {
+// The parked blocks kept at the last mid-fight session stop (StopKeep.h), with their hashes at the stop. Game thread
+// only: GgpoStop (KeepParkedNow), StaleTick and NewTimeline run there.
+struct KeptBlock {
+    uint32_t addr, size, hash, caller;
+    bool hashed;
+};
+std::vector<KeptBlock> gKept;
+char gKeepWhy[96] = "";
+DWORD gKeptAt = 0;                // GetTickCount at the keep
+uint32_t gKeptGf = 0;             // gFrame at the keep
+StopKeep::Schedule gStaleSchedule;
+bool gStaleRestartChecked = false;
+uint32_t gKeptRunBlocks = 0;      // every keep of this game run
+uint64_t gKeptRunBytes = 0;
+constexpr uint32_t kMaxHashed = 50000;  // hundreds to ~11,000 in a fight; beyond this kept but not checked (bounded time)
+
+bool GuardedRead(uint32_t a, uint32_t* v) { return CrashLog::SafeRead32(a, v); }
+
+void StaleCheckpoint(const char* when) {
+    uint32_t checked = 0, written = 0, unread = 0;
+    std::unordered_map<uint32_t, uint32_t> by;  // free caller -> written blocks
+    char eg[200];
+    int egLen = 0, egN = 0;
+    for (const KeptBlock& k : gKept) {
+        if (!k.hashed) continue;
+        uint32_t h = 0;
+        if (!StopKeep::HashBlock(k.addr, k.size, GuardedRead, &h)) {
+            ++unread;
+            continue;
+        }
+        ++checked;
+        if (h == k.hash) continue;
+        ++written;
+        ++by[k.caller];
+        uint32_t d0 = 0;
+        if (egN < 3 && GuardedRead(k.addr, &d0)) {
+            egLen = AppendF(eg, sizeof eg, egLen, " %08X (%u bytes, freed by %08X; first dword now %08X)", k.addr, k.size, k.caller, d0);
+            ++egN;
+        }
+    }
+    eg[egLen] = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> top;
+    for (auto& [c, n] : by) top.push_back({n, c});
+    std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    char callers[160];
+    int cl = 0;
+    for (size_t i = 0; i < top.size() && i < 5; ++i) cl = AppendF(callers, sizeof callers, cl, " %08X x%u", top[i].second, top[i].first);
+    callers[cl] = 0;
+    Logger::Info("STALEWRITE after the stop (%s), %s, %.1f s later (gf %u at the stop, %u now): %u of %u kept parked blocks were "
+                 "written since the stop%s; %u unreadable now; freed by:%s; e.g.%s",
+                 gKeepWhy, when, (GetTickCount() - gKeptAt) / 1000.0, gKeptGf, (unsigned)gFrame, written, checked,
+                 written ? " -- each of those would have been on MK9's free list while written (the 2026-11-20 crash)" : "", unread,
+                 cl ? callers : " -", egLen ? eg : " -");
+}
+}  // namespace
+
+namespace FreeQuarantine {
+
+void KeepParkedNow(const char* why) {
+    if (!gLockInit) return;
+    std::vector<std::pair<void*, PendingFree>> parked;
+    EnterCriticalSection(&gLock);
+    for (auto it = gList.begin(); it != gList.end();) {
+        if (it->second.parked && StopKeep::KeepKind(it->second.kind)) {
+            parked.emplace_back(it->first, it->second);
+            it = gList.erase(it);  // parked entries are never listed in gDue
+        } else {
+            ++it;
+        }
+    }
+    const size_t left = gList.size();
+    LeaveCriticalSection(&gLock);
+    if (!gKept.empty()) {  // the previous stop's check is still running: its last word, then this stop's
+        StaleCheckpoint("superseded by another stop");
+        gKept.clear();
+    }
+    snprintf(gKeepWhy, sizeof gKeepWhy, "%s", why ? why : "?");
+    uint32_t hashed = 0;
+    uint64_t bytes = 0;
+    for (auto& [ptr, pf] : parked) {
+        KeptBlock k{(uint32_t)(uintptr_t)ptr, pf.size, 0, pf.caller, false};
+        bytes += pf.size;
+        if (hashed < kMaxHashed && StopKeep::HashBlock(k.addr, k.size, GuardedRead, &k.hash)) {
+            k.hashed = true;
+            ++hashed;
+        }
+        gKept.push_back(k);
+    }
+    gKeptRunBlocks += (uint32_t)parked.size();
+    gKeptRunBytes += bytes;
+    gKeptAt = GetTickCount();
+    gKeptGf = gFrame;
+    gStaleSchedule = StopKeep::Schedule{};
+    gStaleRestartChecked = false;
+    Logger::Info("QUARANTINE: %u parked blocks (~%llu KB) kept, never given back to MK9's allocator: the session stopped "
+                 "mid-fight (%s) and the fight goes on, while some of the game's code still writes such blocks after freeing "
+                 "them; the other %u held blocks go back as usual; %u blocks (~%llu KB) kept in this game run; %u hashed for "
+                 "the STALEWRITE check",
+                 (unsigned)parked.size(), (unsigned long long)(bytes >> 10), why ? why : "?", (unsigned)left, gKeptRunBlocks,
+                 (unsigned long long)(gKeptRunBytes >> 10), hashed);
+    if (gKept.empty()) std::vector<KeptBlock>().swap(gKept);
+}
+
+void StaleTick() {
+    if (gKept.empty()) return;
+    const uint32_t at = gStaleSchedule.Due(GetTickCount() - gKeptAt);
+    if (!at) return;
+    char when[32];
+    snprintf(when, sizeof when, "checkpoint %u s", at / 1000);
+    StaleCheckpoint(when);
+    if (gStaleSchedule.Done()) {
+        Logger::Info("STALEWRITE check over: the %u kept blocks stay allocated for the rest of the game run (never given back)",
+                     (unsigned)gKept.size());
+        std::vector<KeptBlock>().swap(gKept);  // the records only: the blocks themselves stay as they are
+    }
+}
+
 void ReleaseAll() {
     if (!gLockInit) return;
     EnterCriticalSection(&gAllocLock);
@@ -991,7 +1112,15 @@ void ClearRestoreBlocks() {
 // NATIVETRACE 004597E0 returning a countdown 4 frames ahead in every replay (and, likely, the Shang Tsung intro-morph
 // failure in the same session). Online the next session's own releases normally shield the old entries.
 volatile LONG gRelFloor = 0;
-void NewTimeline() { gRelFloor = gRelHead; }
+void NewTimeline() {
+    gRelFloor = gRelHead;
+    // The first timeline restart (or session renumbering) after a keep: the fight that went on after the stop ended or
+    // resumed (not the restart whose ReleaseAll did the keep, a moment ago).
+    if (!gKept.empty() && !gStaleRestartChecked && GetTickCount() - gKeptAt >= 500) {
+        gStaleRestartChecked = true;
+        StaleCheckpoint("at the next timeline restart");
+    }
+}
 
 bool RecentlyReleased(const void* p, uint32_t span, uint32_t* freedGf, uint32_t* releasedGf, uint32_t* caller, uint32_t* block,
                       uint32_t minReleasedGf) {

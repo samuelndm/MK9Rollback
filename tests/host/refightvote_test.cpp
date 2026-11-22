@@ -197,6 +197,35 @@ void Presses() {
         }
         Expect(!both, "the two buttons are never down together");
     }
+    // Repeating(): from the first press of the second round on (the presses MK9's box sounds again), never before.
+    {
+        Presser p;
+        Expect(!p.Repeating(), "no pick: not repeating");
+        p.Accept();
+        bool early = false, later = true;
+        for (int t = 0; t < RefightVote::kAgainTicks * 4; ++t) {
+            p.Tick();
+            if (t < RefightVote::kAgainTicks) early = early || p.Repeating();
+            else later = later && p.Repeating();
+        }
+        Expect(!early, "an accept's first press is not a repeat (its sound is the player's choice)");
+        Expect(later, "an accept's later presses are repeats, from the second round's first tick on");
+        p.Leave();
+        bool leaveEarly = false, leaveLater = true;
+        for (int t = 0; t < RefightVote::kAgainTicks * 3; ++t) {
+            p.Tick();
+            if (t < RefightVote::kAgainTicks) leaveEarly = leaveEarly || p.Repeating();
+            else leaveLater = leaveLater && p.Repeating();
+        }
+        Expect(!leaveEarly, "a leave's two first presses are not repeats");
+        Expect(leaveLater, "a leave's later rounds are repeats");
+        Presser q;
+        q.Accept();
+        for (int t = 0; t < RefightVote::kAgainTicks * (RefightVote::kMaxPresses + 2); ++t) q.Tick();
+        Expect(q.done && !q.Repeating(), "a used-up presser presses nothing, and nothing is held back for it");
+        q.Reset();
+        Expect(!q.Repeating(), "a reset presser is not repeating");
+    }
 }
 
 // ---- two games' panels over a link ----

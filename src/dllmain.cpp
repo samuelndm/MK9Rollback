@@ -15,6 +15,7 @@
 #include "game/MK9Game.h"
 #include "game/MotdSkip.h"
 #include "game/PadPreset.h"
+#include "game/PadGap.h"
 #include "game/PressLatch.h"
 #include "hook/CodePatch.h"
 #include "hook/GameLoopHook.h"
@@ -95,6 +96,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI MK9R_Unload(LPVOID) {
     // First, so that the waits below pass before the module goes: the message hook an open panel has on the window's
     // thread comes off (a key release it held back is posted to the game), and the pads' reading thread ends.
     PressLatch::Shutdown();
+    PadGap::Shutdown();  // its counting hook and its pad reading thread, the same way
     Overlay::Disable();  // the stub passes through until CodePatch::RestoreAll removes it
     if (Overlay::SheetHeld()) {
         // The stage screen's picture texture is the one thing the display keeps on the game's device. Only the render

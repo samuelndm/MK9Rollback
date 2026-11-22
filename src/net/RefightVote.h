@@ -191,6 +191,10 @@ struct Presser {
         done = false;
     }
     void Reset() { *this = Presser{}; }
+    // The presses of the pick's first round are made (one "confirm", or "back" twice) and the box is still pressed again:
+    // MK9's box sounds every press it reads, also one more of a pick it already has ("the sound of the button keeps
+    // pinging", 2026-11-21), so these are not heard (Refight.cpp).
+    bool Repeating() const { return want && !done && presses > (want == 2 ? 2 : 1); }
     // One engine tick under the box. Returns the mask the game's pads read this tick (0: nothing held).
     uint32_t Tick() {
         if (!want || done) return 0;

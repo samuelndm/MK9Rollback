@@ -12,6 +12,7 @@
 #include "../debug/StageScreen.h"
 #include "../game/Input.h"
 #include "../game/MK9Game.h"
+#include "../game/PadGap.h"
 #include "../game/PressLatch.h"
 #include "../hook/ObjectHooks.h"
 #include "../rollback/RollbackManager.h"
@@ -957,6 +958,12 @@ bool Command(const char* line) {
         Logger::Info("STAGELATCH %d (%s; it takes effect when a panel next takes the controls)", atoi(arg) != 0 ? 1 : 0,
                      atoi(arg) != 0 ? "a press that falls between two samples of the controls reaches the panel"
                                     : "the panel reads MK9's samples alone, as before 2026-11-13");
+    } else if (!strcmp(verb, "padgap") && n == 2) {
+        PadGap::SetMode(atoi(arg));
+        Logger::Info("PADGAP mode %d (%s)", PadGap::Mode(),
+                     PadGap::Mode() == 0   ? "off"
+                     : PadGap::Mode() == 1 ? "presses the game never read are counted while a rollback session has the controls"
+                                           : "presses the game never read are counted always, outside sessions too");
     } else if (!strcmp(verb, "stagestatus")) {
         char pics[720], look[220];
         ArenaPics::Describe(pics, sizeof pics);

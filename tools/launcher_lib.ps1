@@ -13,7 +13,8 @@
 #   New-LogScrubState / Protect-LogLine / Protect-LogFile / Save-LogsZip   logs for a public bug report
 #   New-MatchFacts / Update-MatchFacts / Format-MatchFacts   the window's "Last match" line
 #   Read-MatchHistory / Get-MatchTally / Format-MatchRecord   the window's score line and its match list (the DLL's
-#                          match_history.txt); Get-FighterName / Get-ArenaName / Get-OpponentLabel for the list
+#                          match_history.txt); Get-FighterName / Get-ArenaName / Get-OpponentLabel for the list;
+#                          Get-ReplayFiles / Add-MatchReplays: each match's replay file (the DLL's replays folder)
 #   Get-ConnectionHint     Wi-Fi or cable (slow: run it in the background)
 #   New-LogoBitmap         the mark (window icon, header, launcher\app.ico), and $script:UiColors
 # Windows PowerShell 5.1, ASCII only. What a player reads is written in English and goes through Tr
@@ -549,6 +550,46 @@ function Read-MatchHistory([string]$path) {
         }
     } catch { }
     $list.ToArray()
+}
+# The replays the DLL wrote (src\net\ReplayKeeper.h): <the DLL's folder>\replays\<date>_<time>_<P1>_vs_<P2>.mk9r, the
+# time being when the match's session began, the fighters the game's names without CHAR_, and "_2" ... added when the
+# name was taken. Oldest first: Path, Name, Start, P1, P2. Malformed names are left out.
+function Get-ReplayFiles([string]$folder) {
+    $list = New-Object System.Collections.Generic.List[object]
+    try {
+        if ($folder -and (Test-Path -LiteralPath $folder)) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $folder -Filter '*.mk9r' -File -ErrorAction SilentlyContinue)) {
+                if ($f.Name -notmatch '^(\d{4}-\d{2}-\d{2})_(\d{6})_(.+?)_vs_(.+?)(?:_\d{1,2})?\.mk9r$') { continue }
+                $t = [datetime]::MinValue
+                if (-not [datetime]::TryParseExact("$($Matches[1]) $($Matches[2])", 'yyyy-MM-dd HHmmss', [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::None, [ref]$t)) { continue }
+                $list.Add([pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Start = $t; P1 = $Matches[3]; P2 = $Matches[4] })
+            }
+        }
+    } catch { }
+    @($list.ToArray() | Sort-Object Start, Name)
+}
+# Gives each entry of the match history (ConvertFrom-MatchHistoryLine's objects) a Replay property: the replay file of
+# that match, or $null. A match's line is written when it ends, its replay is named after the moment it began: the
+# file is the newest one that began after the entry before it ended and no later than this one ended, and whose two
+# fighters are the entry's in its sides' order (player 1 first). Returns the entries.
+function Add-MatchReplays($entries, $replays) {
+    $prev = [datetime]::MinValue
+    foreach ($e in @($entries | Where-Object { $_ } | Sort-Object Time)) {
+        $mine = "$($e.Mine)" -replace '^(?i)CHAR_', ''
+        $theirs = "$($e.Theirs)" -replace '^(?i)CHAR_', ''
+        $p1 = if ($e.Side -eq 2) { $theirs } else { $mine }
+        $p2 = if ($e.Side -eq 2) { $mine } else { $theirs }
+        $hit = $null
+        foreach ($r in @($replays)) {
+            if (-not $r -or $r.Start -le $prev -or $r.Start -gt $e.Time) { continue }
+            if ($r.P1 -ne $p1 -or $r.P2 -ne $p2) { continue }
+            $hit = $r
+        }
+        $e | Add-Member -NotePropertyName Replay -NotePropertyValue $hit -Force
+        $prev = $e.Time
+    }
+    @($entries)
 }
 # Where today began: 06:00 of this date, or of the day before when it is earlier.
 function Get-ScoreDayStart([datetime]$now = (Get-Date)) {

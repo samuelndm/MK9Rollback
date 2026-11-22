@@ -53,10 +53,11 @@ The window has a "Having trouble?" button with the same list:
 - A delay-based lockstep mode instead of rollback stays in the DLL for testing (`tools\netplay.ps1`); the window
   always plays rollback.
 - Score and match history: each online 1 vs 1 match that reaches MK9's results screen is counted as won, lost or drawn
-  (read from the fighters' life bars, `src\net\Score.h`) and written to `build\clang\match_history.txt`. In a fight
-  each player's wins today stand under the health bar (and the wins in a row of the one on a run); after a match a
-  scoreboard, the last matches and today's record of each fighter stand around the choice; the window lists every
-  match ("Match history").
+  (read from the fighters' life bars, `src\net\Score.h`) and written to `build\clang\match_history.txt`. The score in
+  the game is the room's (`src\net\ScoreKeeper.h`: from meeting an opponent until a player leaves, the online match
+  ends or the game closes). In a fight each player's wins stand under the health bar (and the wins in a row of the
+  one on a run); after a match a scoreboard, the room's last matches and its record of each fighter stand around the
+  choice; the window lists every match with its replay ("Matches and replays", "Watch the replay").
 
 ## Build
 

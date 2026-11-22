@@ -7,6 +7,7 @@
 #include "../debug/Logger.h"
 #include "../hook/CodePatch.h"
 #include "MK9Game.h"
+#include "PadGap.h"
 #include "PressLatch.h"
 
 namespace {
@@ -343,7 +344,10 @@ extern "C" void __cdecl MK9R_Sampler() {
     ReassertPanelHold();  // before the sampler can write a player's press into a record the panel holds
     if (!gCapture) {
         gPending = false;
+        LARGE_INTEGER before;
+        QueryPerformanceCounter(&before);
         reinterpret_cast<void(__cdecl*)()>(kSampler)();
+        PadGap::OnSample(before.QuadPart, false, PanelHold());  // ends a session's count; 'padgap 2' counts here too
         return;
     }
     if (gDefer) {
@@ -411,6 +415,8 @@ void SampleCapture() {
     LARGE_INTEGER sampledAt;
     QueryPerformanceCounter(&sampledAt);
     gLocalHwQpc = sampledAt.QuadPart;
+    // Presses that began and ended before this sample with none in between (PadGap.h): counted, nothing changed.
+    PadGap::OnSample(t0.QuadPart, true, gPanelLog);
     static uint32_t sLoggedKey = ~0u, sNonZero = 0;
     uint32_t key = 0;
     for (int k = 0; k < 6; ++k) {

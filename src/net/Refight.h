@@ -52,7 +52,10 @@
 //                      fighters' colours are kept too; 'refight direct A B c1 c2' gives them colours c1 / c2 (0 or 1)
 //   refightkodes 0|1   0 (the start): a rematch's versus screen starts at 0-0-0 and the players enter their kodes;
 //                      1: the last fight's kodes, locked
-//   refightquiet 0|1   1 (the start): the hidden character select of a re-fight is not heard; 0: it is
+//   refightquiet 0|1   1 (the start): the hidden character select of a re-fight is not heard, nor MK9's rematch box
+//                      under the panel while the mod presses this player's pick on it again (every half second until
+//                      the other player has answered: "the sound of the button keeps pinging", 2026-11-21; the first
+//                      press is heard); 0: both are
 //   refightquiet <ms>  a look at one PC (100 to 120000): no sound is started for that long, whatever the game shows,
 //                      and the same "REFIGHT quiet" lines name what was held back. Seen so in one game, 2026-11-14:
 //                      a fighter's lock on the character select starts two sounds through the method at +0x1C, the

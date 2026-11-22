@@ -534,10 +534,11 @@ void DrawBanner(Canvas& c, const State& s, const Hud::View& v) {
 }
 
 // ---- the score against this opponent, around the choice after a match (State::board, net\Score.h) ----
-// Over the panel a scoreboard: each player's wins today in large numbers, YOU at the left and OPP at the right as on
-// the panel's plates; under them the wins in a row and the total over every day. At the panel's right the last
-// matches against this opponent, the newest at the top (the match just played framed); at its left today's record of
-// each fighter this player chose. Both columns stand in the frame's room beside the panel.
+// Over the panel a scoreboard: each player's wins in this room (since the two met in this game, until one leaves:
+// net\ScoreKeeper.h) in large numbers, YOU at the left and OPP at the right as on the panel's plates; under them the
+// wins in a row, the draws and the longest runs. At the panel's right the room's last matches, the newest at the top
+// (the match just played framed); at its left the room's record of each fighter this player chose. Both columns stand
+// in the frame's room beside the panel.
 constexpr float kBoardTop = 20.0f, kBoardBottom = 240.0f, kBoardHalfW = 440.0f;
 constexpr float kBoardHead = 54.0f, kBoardNumbers = 146.0f, kBoardRun = 190.0f, kBoardInfo = 225.0f;
 constexpr float kBoardLabel = 236.0f, kBoardNumberGap = 52.0f, kBoardDashW = 36.0f, kBoardDashH = 8.0f;
@@ -554,7 +555,8 @@ void RunText(const Score::Board& b, char* out, size_t n, bool* mine) {
     if (b.streak >= 2) snprintf(out, n, "YOU: %d WINS IN A ROW", b.streak);
     else if (b.streak <= -2) snprintf(out, n, "OPPONENT: %d WINS IN A ROW", -b.streak);
 }
-// Every day's total, today's draws and today's longest runs, apart by wide spaces; "" when there is nothing more to say.
+// This room's draws and longest runs, apart by wide spaces; "" when there is nothing more to say. (Every day's total
+// left the panel with the room score, 2026-11-21: every match stays in the window's list of matches and replays.)
 void InfoText(const Score::Board& b, char* out, size_t n) {
     out[0] = 0;
     size_t k = 0;
@@ -566,9 +568,8 @@ void InfoText(const Score::Board& b, char* out, size_t n) {
         const int x = snprintf(out + k, n - k, fmt, a, c);
         if (x > 0) k += (size_t)x;
     };
-    if (b.allKnown && b.all.Matches() > b.today.Matches()) add("ALL TIME %d - %d", b.all.wins, b.all.losses);
-    if (b.today.draws) add("DRAWN TODAY %d%.0d", b.today.draws, 0);
-    if (b.bestMine >= 2 || b.bestTheirs >= 2) add("BEST RUN TODAY: YOU %d, OPP %d", b.bestMine, b.bestTheirs);
+    if (b.today.draws) add("DRAWN %d%.0d", b.today.draws, 0);
+    if (b.bestMine >= 2 || b.bestTheirs >= 2) add("BEST RUN: YOU %d, OPP %d", b.bestMine, b.bestTheirs);
     if (k >= n) out[n - 1] = 0;
 }
 uint32_t RecordRgb(const Score::Tally& t) { return t.wins > t.losses ? kMineInk : t.wins < t.losses ? kTheirsInk : 0xE0E0E0; }
@@ -592,7 +593,7 @@ void DrawBoardLook(Sk::Canvas& c, const State& s, const Hud::View& v, const Box&
     const Box S{cx - U(fr, kBoardHalfW), fr.y + U(fr, kBoardTop), cx + U(fr, kBoardHalfW), fr.y + U(fr, kBoardBottom)};
     const int room = S.x1 - S.x0 - 2 * U(fr, 30.0f);
     LookGround(c, fr, S, cx, 360.0f);
-    LookCentre(c, fr, Sk::kName, "SCORE TODAY", kBoardHead, Grey(205));
+    LookCentre(c, fr, Sk::kName, "SCORE", kBoardHead, Grey(205));
     char mine[12], theirs[12];
     snprintf(mine, sizeof mine, "%d", std::min(b.today.wins, 9999));
     snprintf(theirs, sizeof theirs, "%d", std::min(b.today.losses, 9999));
@@ -644,13 +645,13 @@ void DrawBoardLook(Sk::Canvas& c, const State& s, const Hud::View& v, const Box&
         }
     }
 
-    // Today's fighters, at the panel's left.
+    // This room's fighters, at the panel's left.
     const Box L{fr.x + U(fr, kColumnGap), P.y0, P.x0 - U(fr, kColumnGap), P.y1};
     if (b.fighters > 0 && L.x1 - L.x0 > U(fr, 240.0f)) {
         const int mid = (L.x0 + L.x1) / 2;
         LookGround(c, fr, L, mid, 150.0f);
         LookWriteAt(c, Sk::kLine, "YOUR FIGHTERS", mid, L.y0 + U(fr, kColumnHead), Grey(255));
-        LookWriteAt(c, Sk::kName, "TODAY, WINS - LOSSES", mid, L.y0 + U(fr, kColumnSub), Grey(180));
+        LookWriteAt(c, Sk::kName, "WINS - LOSSES", mid, L.y0 + U(fr, kColumnSub), Grey(180));
         const int rowH = U(fr, kFighterRowH), inner = rowH - U(fr, kMatchRowGap);
         int y = L.y0 + U(fr, kFighterTop);
         for (int i = 0; i < b.fighters && y + inner <= L.y1 - pad; ++i, y += rowH) {
@@ -663,7 +664,7 @@ void DrawBoardLook(Sk::Canvas& c, const State& s, const Hud::View& v, const Box&
             Sk::Write(c, Sk::kLine, t, right - wRec, textBase, Sk::Pm(RecordRgb(f.t), 255));
             Sk::Write(c, Sk::kLine, FitBy(lineWidth, f.name, right - wRec - U(fr, 16.0f) - x, cut, sizeof cut), x, textBase, Grey(240));
         }
-        snprintf(t, sizeof t, "MATCHES TODAY: %d", b.today.Matches());
+        snprintf(t, sizeof t, "MATCHES: %d", b.today.Matches());
         LookWriteAt(c, Sk::kName, t, mid, L.y1 - U(fr, 22.0f), Grey(190));
     }
 }
@@ -685,7 +686,7 @@ void DrawBoardPlain(Canvas& c, const State& s, const Hud::View& v, const Box& pa
     const Box S{cx - U(fr, kBoardHalfW), fr.y + U(fr, 36.0f), cx + U(fr, kBoardHalfW), panel.y0 - U(fr, 12.0f)};
     const int room = S.x1 - S.x0 - 2 * U(fr, 30.0f);
     PlainGround(c, fr, S);
-    Centre(c, fr, kSmallFace, "SCORE TODAY", 70.0f, kLabel, false);
+    Centre(c, fr, kSmallFace, "SCORE", 70.0f, kLabel, false);
     char mine[12], theirs[12];
     snprintf(mine, sizeof mine, "%d", std::min(b.today.wins, 9999));
     snprintf(theirs, sizeof theirs, "%d", std::min(b.today.losses, 9999));
@@ -730,7 +731,7 @@ void DrawBoardPlain(Canvas& c, const State& s, const Hud::View& v, const Box& pa
     if (b.fighters > 0 && L.x1 - L.x0 > U(fr, 240.0f)) {
         const int mid = (L.x0 + L.x1) / 2;
         PlainGround(c, fr, L);
-        WriteAt(c, kMainFace, "YOUR FIGHTERS TODAY", mid, L.y0 + U(fr, 40.0f), kWhite);
+        WriteAt(c, kMainFace, "YOUR FIGHTERS", mid, L.y0 + U(fr, 40.0f), kWhite);
         const int rowH = U(fr, 46.0f);
         int y = L.y0 + U(fr, 58.0f);
         for (int i = 0; i < b.fighters && y + rowH <= L.y1 - pad; ++i, y += rowH) {
@@ -740,7 +741,7 @@ void DrawBoardPlain(Canvas& c, const State& s, const Hud::View& v, const Box& pa
             Hud::Write(c, kMainFace, t, right - wRec, yb, RecordRgb(f.t), 255, false);
             Hud::Write(c, kMainFace, Fit(kMainFace, f.name, right - wRec - U(fr, 14.0f) - x, cut, sizeof cut), x, yb, kWhite, 255, false);
         }
-        snprintf(t, sizeof t, "MATCHES TODAY: %d", b.today.Matches());
+        snprintf(t, sizeof t, "MATCHES: %d", b.today.Matches());
         WriteAt(c, kSmallFace, t, mid, L.y1 - U(fr, 18.0f), kLabel);
     }
     (void)capS;
@@ -1070,11 +1071,16 @@ Layout LayoutOf(int cells, bool tiles, const Hud::View& v) {
     l.panel = Box{cx - U(fr, geo.halfW), fr.y + U(fr, geo.top), cx + U(fr, geo.halfW), fr.y + U(fr, geo.bottom)};
     const int cw = U(fr, tiles ? kTileW : d.cellW), rh = U(fr, tiles ? kTileH : d.rowH);
     const int gx = cx - cw * l.cols / 2, gy = fr.y + U(fr, geo.gridTop);
+    // The tiles' short last row stands in the middle under the full rows ("make the grid more pretty? like centered",
+    // 2026-11-21: 28 arenas and RANDOM left five tiles at the left of the last row).
+    const int lastRow = l.rows - 1, lastN = cells - lastRow * l.cols;
+    const int lastShift = tiles && lastN < l.cols ? cw * (l.cols - lastN) / 2 : 0;
     // A tile's picture: as wide as the tile allows, 16:9.
     const int in = U(fr, kTilePicInset), pw = cw - 2 * in, ph = (pw * 9 + 8) / 16;
     for (int i = 0; i < cells; ++i) {
         const int col = i % l.cols, row = i / l.cols;
-        l.cell[i] = Box{gx + col * cw, gy + row * rh, gx + (col + 1) * cw, gy + (row + 1) * rh};
+        const int x = gx + col * cw + (row == lastRow ? lastShift : 0);
+        l.cell[i] = Box{x, gy + row * rh, x + cw, gy + (row + 1) * rh};
         if (tiles) l.pic[i] = Box{l.cell[i].x0 + in, l.cell[i].y0 + in, l.cell[i].x0 + in + pw, l.cell[i].y0 + in + ph};
     }
     return l;
@@ -1100,13 +1106,23 @@ uint8_t Move(int cells, bool tiles, uint8_t from, int dx, int dy) {
     cells = std::clamp(cells, 0, kMaxCells);
     if (cells <= 0) return kNoCell;
     if (from >= cells) return (uint8_t)(cells - 1);
-    const int cols = Tiles(cells, tiles) ? kTileCols : DimsOf(cells).cols, rows = (cells + cols - 1) / cols;
+    const bool tileForm = Tiles(cells, tiles);
+    const int cols = tileForm ? kTileCols : DimsOf(cells).cols, rows = (cells + cols - 1) / cols;
     int col = from % cols, row = from / cols;
     dx = dx > 0 ? 1 : dx < 0 ? -1 : 0;
     dy = dy > 0 ? 1 : dy < 0 ? -1 : 0;
     for (int k = 0; dx && k < cols; ++k) {
         col = (col + dx + cols) % cols;
         if (row * cols + col < cells) break;
+    }
+    if (dy && tileForm && rows > 1) {
+        // The tiles' short last row stands in the middle (LayoutOf): a step into it goes to the tile under the column,
+        // counted from the row's first tile (shift columns in), and a step out of it to the column over that tile.
+        const int lastN = cells - (rows - 1) * cols, shift = (cols - lastN) / 2;
+        const int to = (row + dy + rows) % rows;
+        if (row == rows - 1) col = std::min(col + shift, cols - 1);
+        if (to == rows - 1) col = std::clamp(col - shift, 0, lastN - 1);
+        return (uint8_t)(to * cols + col);
     }
     for (int k = 0; dy && k < rows; ++k) {
         row = (row + dy + rows) % rows;
@@ -1263,14 +1279,7 @@ static void DemoBoard(int kind, Score::Board* b) {
     using Score::kDraw;
     using Score::kLoss;
     using Score::kWin;
-    char t[24];
-    const int olderW = kind == 3 ? 37 : kind == 4 ? 128 : 0, olderL = kind == 3 ? 36 : kind == 4 ? 127 : 0;
-    for (int i = 0, w = 0, l = 0; w < olderW || l < olderL; ++i) {
-        const bool win = (i % 2 == 0 && w < olderW) || l >= olderL;
-        snprintf(t, sizeof t, "2026-11-15 2%d:%02d:00", i / 60 % 4, i % 60);
-        DemoMatch(b, win ? kWin : kLoss, win ? 2 : 1, win ? 1 : 2, "CHAR_SCORPION", "CHAR_SUBZERO_B", t, false);
-        (win ? w : l) += 1;
-    }
+    char t[24];  // (one room: every match is the room's, as ScoreKeeper adds them)
     struct M {
         Score::Result r;
         int a, c;

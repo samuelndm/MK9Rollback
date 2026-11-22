@@ -2,7 +2,6 @@
 
 #include <windows.h>
 
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,8 +32,6 @@ constexpr uint32_t kOneOnOneLookMs = 500;  // in a fight, how often the match is
 constexpr uint32_t kNamesLookMs = 500;     // and the fighters' and the arena's names, until read
 constexpr uint32_t kTestIdleMs = 6000;     // 'score test': no fight update this long after a fight: the match is over
 constexpr uint32_t kWriteWaitMs = 30000;   // a decided match waits this long at most for the session to end before its line is written
-constexpr uint32_t kBoardLookMs = 2000;    // outside a fight, how often the board is checked against the opponent and the day
-constexpr long kFileCap = 8L << 20;        // a history larger than this is not read (a line is about 100 bytes)
 
 bool gOn = true;      // 'score 0|1'
 bool gTest = false;   // 'score test 0|1': every fight counts, offline too, into match_history_test.txt (a look at one PC)
@@ -56,19 +53,20 @@ Score::Entry gPendingEntry;
 bool gPendingTest = false;
 ULONGLONG gPendingAt = 0;
 
-// The board against the current opponent: read from the file outside a fight (gBoard.allKnown), each counted match
-// added at once (so the choice after the match shows it before its line is written), read again after the line is.
+// The room's board (ScoreKeeper.h): in memory only, each counted match added at once (so the choice after the match
+// shows it before its line is written). Every match of the room is "today" in it (Board::Add(e, true)).
 Score::Board gBoard;
-bool gBoardTest = false;        // gBoard is the test file's (opponent 0)
-char gBoardSince[24] = "";      // the day it was counted for
-ULONGLONG gBoardLookAt = 0;     // the next look at the opponent and the day
+bool gBoardTest = false;        // gBoard is a 'score test' room (opponent 0)
+uint32_t gRoomEnds = 0;         // Online::MatchEnds() when the room began
+bool gRoomOver = false;         // a player chose LEAVE after the room's last match
+int gRooms = 0;                 // rooms begun in this game
 
 // This game's score against the last counted match's opponent (the log's "this game" numbers).
 uint64_t gTallyOpponent = 0;
 bool gHaveTally = false;
 Tally gSession;
 int gCounted = 0, gNotCounted = 0;
-int gWriteFailures = 0, gReadFailures = 0;
+int gWriteFailures = 0;
 
 uint32_t GameState() {
     const uint32_t gi = *reinterpret_cast<const volatile uint32_t*>(MK9Game::Get().gameInfoPtr);
@@ -79,6 +77,34 @@ uint32_t GameFrame() {
     return gi ? *reinterpret_cast<const volatile uint32_t*>(gi + MK9Game::kGameInfoGameFrame) : 0;
 }
 bool SessionRuns() { return Rollback::NetplayRunning() || Rollback::NetplayStarting() || Rollback::gIsResimulating; }
+
+// The room's board is this opponent's, and the players have not been apart since its last match.
+bool SameRoom(uint64_t opponent, bool test) {
+    return gBoard.on && !gRoomOver && gBoardTest == test && gBoard.opponent == opponent && (test || gRoomEnds == Online::MatchEnds());
+}
+// Before a counted match's numbers are shown or added: a new room where the last one is over.
+void EnsureRoom(uint64_t opponent, bool test) {
+    if (SameRoom(opponent, test)) return;
+    const char* why = !gBoard.on                    ? "the first counted match in this game"
+                      : gBoardTest != test          ? "'score test' changed"
+                      : gRoomOver                   ? "a player chose LEAVE after the last match"
+                      : gBoard.opponent != opponent ? "another opponent"
+                                                    : "MK9's online match had ended since the last match (the players were apart)";
+    if (gBoard.on)
+        Logger::Info("SCORE room %d is over (%d won, %d lost, %d drawn in %d match(es)): %s", gRooms, gBoard.today.wins, gBoard.today.losses,
+                     gBoard.today.draws, gBoard.today.Matches(), why);
+    gBoard = Score::Board{};
+    gBoard.on = 1;
+    gBoard.allKnown = 1;
+    gBoard.opponent = opponent;
+    gBoardTest = test;
+    gRoomEnds = Online::MatchEnds();
+    gRoomOver = false;
+    ++gRooms;
+    Logger::Info("SCORE room %d begins (%s): the score, the last matches and the fighters start at nothing; every match is still written to "
+                 "match_history.txt",
+                 gRooms, test ? "'score test'" : opponent ? "this opponent" : "the opponent is not known");
+}
 
 void StartMatch(ULONGLONG now, bool test) {
     if (gInMatch && gJudge.frames > 60) {
@@ -94,8 +120,8 @@ void StartMatch(ULONGLONG now, bool test) {
     gNamesRead = gArenaRead = false;
     gNamesAt = 0;
     gLastFightAt = now;
-    Logger::Info("SCORE: a %s fight began: the two fighters' lives are read until the match is over%s", test ? "fight ('score test')" : "one-on-one online",
-                 gBoard.on ? "" : " (no score read for this opponent yet: the fight shows none)");
+    Logger::Info("SCORE: a %s fight began: the two fighters' lives are read until the match is over", test ? "fight ('score test')" : "one-on-one online");
+    if (test) EnsureRoom(0, true);  // (an online match's room is settled once its opponent is known: SampleFight)
 }
 
 void ReadNames(ULONGLONG now) {
@@ -122,7 +148,7 @@ void ReadNames(ULONGLONG now) {
 void SampleFight(ULONGLONG now) {
     gLastFightAt = now;
     if (!gSide) gSide = gTestMatch ? 1 : Online::LocalPlayer();
-    if (!gOpponent && !gTestMatch) gOpponent = Online::Opponent();
+    if (!gOpponent && !gTestMatch && (gOpponent = Online::Opponent()) != 0) EnsureRoom(gOpponent, false);  // the fight's numbers from its start
     ReadNames(now);
     const Fighter::State p1 = Fighter::Read(0), p2 = Fighter::Read(1);
     if (!p1.valid || !p2.valid) return;
@@ -137,64 +163,6 @@ void LocalTime(char* out, size_t n) {
     SYSTEMTIME t;
     GetLocalTime(&t);
     snprintf(out, n, "%04u-%02u-%02u %02u:%02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-}
-
-// Where today began (Score::DayStart: 06:00 of this date, or of the date before when it is earlier than that).
-void TodayStart(char* out, size_t n) {
-    SYSTEMTIME t, prev;
-    GetLocalTime(&t);
-    prev = t;
-    FILETIME ft;
-    if (SystemTimeToFileTime(&t, &ft)) {
-        ULARGE_INTEGER u;
-        u.LowPart = ft.dwLowDateTime, u.HighPart = ft.dwHighDateTime;
-        u.QuadPart -= 24ull * 3600 * 10000000;
-        ft.dwLowDateTime = u.LowPart, ft.dwHighDateTime = u.HighPart;
-        if (!FileTimeToSystemTime(&ft, &prev)) prev = t;
-    }
-    Score::DayStart(t.wYear, t.wMonth, t.wDay, t.wHour, prev.wYear, prev.wMonth, prev.wDay, out, n);
-}
-
-// The board against one opponent from the file (the whole file is read: it grows by a line per match). A file that is
-// not there yet is an empty board. False: not read (gBoard stays as it was). Never while a rollback session runs.
-bool LoadBoard(const wchar_t* path, uint64_t opponent, bool test, const char* why) {
-    if (!path[0]) return false;
-    char since[24];
-    TodayStart(since, sizeof since);
-    Score::Board b;
-    int skipped = 0;
-    long size = 0;
-    FILE* f = _wfopen(path, L"rb");
-    if (!f) {
-        if (errno != ENOENT) {
-            if (gReadFailures++ < 4) Logger::Info("SCORE: %ls could not be read (errno %d): the score shown is this game's", path, errno);
-            return false;
-        }
-        b.on = 1, b.allKnown = 1, b.opponent = opponent;  // no file yet: nothing played
-    } else {
-        if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        char* text = size >= 0 && size <= kFileCap ? static_cast<char*>(malloc((size_t)size + 1)) : nullptr;
-        const size_t got = text ? fread(text, 1, (size_t)size, f) : 0;
-        fclose(f);
-        if (!text || got != (size_t)size) {
-            free(text);
-            if (gReadFailures++ < 4) Logger::Info("SCORE: %ls could not be read (%ld bytes): the score shown is this game's", path, size);
-            return false;
-        }
-        text[got] = 0;
-        Score::BoardOf(text, opponent, since, &b, &skipped);
-        free(text);
-    }
-    gBoard = b;
-    gBoardTest = test;
-    snprintf(gBoardSince, sizeof gBoardSince, "%s", since);
-    Logger::Info("SCORE board (%s): against this opponent today (since %s) %d won, %d lost, %d drawn; every day %d - %d - %d; %s %d in a row; "
-                 "today's best runs %d and %d; %d fighter(s) today; from %ls (%ld bytes%s)",
-                 why, since, b.today.wins, b.today.losses, b.today.draws, b.all.wins, b.all.losses, b.all.draws,
-                 b.streak > 0 ? "this player" : b.streak < 0 ? "the opponent" : "nobody", b.streak < 0 ? -b.streak : b.streak, b.bestMine,
-                 b.bestTheirs, b.fighters, path, size, skipped ? ", some lines not read" : "");
-    return true;
 }
 
 // Appends the line (a new file gets its header first). False: not written.
@@ -218,9 +186,7 @@ void WritePending(const char* how) {
         if (gWriteFailures++ < 4) Logger::Info("SCORE: %ls could not be written (error %lu): this match is in the score until the game closes, not in the history", path, e);
         return;
     }
-    char why[80];
-    snprintf(why, sizeof why, "the match's line written%s", how);
-    LoadBoard(path, gPendingEntry.opponent, gPendingTest, why);  // read back: the board as the file has it
+    Logger::Info("SCORE: the match's line is written to %ls%s", path, how);
 }
 
 void FinishMatch(const char* where) {
@@ -252,47 +218,30 @@ void FinishMatch(const char* where) {
     snprintf(e.arena, sizeof e.arena, "%s", gArenaRead ? gArena : "?");
     e.opponent = gOpponent;
     e.side = gSide;
-    // The board at once (the choice after the match opens now); the file's own count replaces it once the line is written.
-    if (!gBoard.on || gBoard.opponent != gOpponent || gBoardTest != gTestMatch) {
-        gBoard = Score::Board{};
-        gBoard.on = 1;
-        gBoard.opponent = gOpponent;
-        gBoardTest = gTestMatch;
-    }
+    // The room's board at once (the choice after the match opens now).
+    EnsureRoom(gOpponent, gTestMatch);
     gBoard.Add(e, true);
     char rounds[16];
     if (f.roundsKnown) snprintf(rounds, sizeof rounds, "%d-%d", f.mine, f.theirs);
     else snprintf(rounds, sizeof rounds, "not known");
     Logger::Info("SCORE: the match is over (%s): this player %s, rounds %s (%d - %d - %d drawn read before the last), %s against %s on %s "
                  "(lives at the end %.3f and %.3f; side %d, opponent %s); this game's score against this opponent: %d won, %d lost, %d drawn; "
-                 "today %d - %d - %d, %s %d in a row",
+                 "room %d: %d - %d - %d, %s %d in a row",
                  where, Score::ResultText(f.result), rounds, gJudge.rounds[gSide - 1], gJudge.rounds[2 - gSide], gJudge.drawn, e.myFighter,
                  e.theirFighter, e.arena, gJudge.life[0], gJudge.life[1], gSide, gOpponent ? "known" : "not known", gSession.wins, gSession.losses,
-                 gSession.draws, gBoard.today.wins, gBoard.today.losses, gBoard.today.draws,
+                 gSession.draws, gRooms, gBoard.today.wins, gBoard.today.losses, gBoard.today.draws,
                  gBoard.streak > 0 ? "this player" : gBoard.streak < 0 ? "the opponent" : "nobody", gBoard.streak < 0 ? -gBoard.streak : gBoard.streak);
     gPending = true;
     gPendingTest = gTestMatch;
     gPendingAt = GetTickCount64();
 }
 
-// Outside a fight, now and then: the board for the coming fight's opponent, and again when a new day began.
-void LookAtBoard(ULONGLONG now, bool test) {
-    if (gInMatch || gPending || now < gBoardLookAt || SessionRuns()) return;
-    gBoardLookAt = now + kBoardLookMs;
-    const uint64_t opponent = test ? 0 : Online::Opponent();
-    if (!test && !opponent) return;
-    char since[24];
-    TodayStart(since, sizeof since);
-    if (gBoard.on && gBoard.allKnown && gBoard.opponent == opponent && gBoardTest == test && !strcmp(since, gBoardSince)) return;
-    LoadBoard(test ? gTestPath : gPath, opponent, test, test ? "'score test'" : gBoard.on && gBoard.opponent == opponent ? "a new day" : "the coming match's opponent");
-}
-
-// The fight's numbers (debug\ScoreView.h): in a counted match's fight, once this player's side and the board for this
+// The fight's numbers (debug\ScoreView.h): in a counted match's fight, once this player's side and the room of this
 // opponent are known.
 void PublishBadge(uint32_t state) {
     ScoreView::Badge b;
     const bool fight = gOn && gInMatch && state == kFightState && gSide;
-    const bool ours = gBoard.on && gBoardTest == gTestMatch && (gTestMatch || gBoard.opponent == (gOpponent ? gOpponent : Online::Opponent()));
+    const bool ours = fight && SameRoom(gTestMatch ? 0 : gOpponent ? gOpponent : Online::Opponent(), gTestMatch);
     if (fight && ours) {
         b.on = 1;
         b.mySide = (uint8_t)gSide;
@@ -322,8 +271,6 @@ void Step(ULONGLONG now, uint32_t state) {
             SampleFight(now);
         } else if (gInMatch && now - gLastFightAt >= kTestIdleMs) {
             FinishMatch("'score test': no fight update for 6 s");
-        } else if (!gInMatch) {
-            LookAtBoard(now, true);
         }
         return;
     }
@@ -346,7 +293,6 @@ void Step(ULONGLONG now, uint32_t state) {
                          (unsigned)gJudge.frames);
         }
         gInMatch = false;
-        LookAtBoard(now, false);
     }
 }
 }  // namespace
@@ -371,6 +317,14 @@ bool FillBoard(Score::Board* out) {
     return true;
 }
 
+void RoomOver(const char* why) {
+    if (!gBoard.on || gRoomOver) return;
+    gRoomOver = true;
+    Logger::Info("SCORE room %d ends: %s (%d won, %d lost, %d drawn in %d match(es)); its board stays on this panel, the next match starts a "
+                 "new room",
+                 gRooms, why ? why : "a player left", gBoard.today.wins, gBoard.today.losses, gBoard.today.draws, gBoard.today.Matches());
+}
+
 bool PanelLine(char* out, size_t n) {
     if (!out || !n) return false;
     out[0] = 0;
@@ -386,14 +340,14 @@ bool Command(const char* line) {
         char panel[96];
         PanelLine(panel, sizeof panel);
         Logger::Info("SCORE status: %s%s; %s; %d match(es) counted in this game, %d not; against the last match's opponent this game: %d won, "
-                     "%d lost, %d drawn; board %s: today %d - %d - %d, every day %d - %d - %d%s, %s %d in a row, %d row(s), %d fighter(s); "
+                     "%d lost, %d drawn; room %d%s: %d - %d - %d, %s %d in a row, %d row(s), %d fighter(s); online match ends %u (the room's %u); "
                      "panel line \"%s\"; file %ls",
                      gOn ? "on" : "off ('score 1')", gTest ? ", TEST (every fight counts, into match_history_test.txt)" : "",
                      gInMatch ? "a match is being read" : "no match being read", gCounted, gNotCounted, gSession.wins, gSession.losses,
-                     gSession.draws, !gBoard.on ? "none" : gBoardTest ? "of the test file" : gBoard.allKnown ? "from the file" : "this game's only",
-                     gBoard.today.wins, gBoard.today.losses, gBoard.today.draws, gBoard.all.wins, gBoard.all.losses, gBoard.all.draws,
-                     gBoardSince[0] ? "" : " (no day)", gBoard.streak > 0 ? "this player" : gBoard.streak < 0 ? "the opponent" : "nobody",
-                     gBoard.streak < 0 ? -gBoard.streak : gBoard.streak, gBoard.rows, gBoard.fighters, panel, gPath);
+                     gSession.draws, gRooms, !gBoard.on ? " (none yet)" : gRoomOver ? " (over: a player left)" : gBoardTest ? " ('score test')" : "",
+                     gBoard.today.wins, gBoard.today.losses, gBoard.today.draws, gBoard.streak > 0 ? "this player" : gBoard.streak < 0 ? "the opponent" : "nobody",
+                     gBoard.streak < 0 ? -gBoard.streak : gBoard.streak, gBoard.rows, gBoard.fighters, (unsigned)Online::MatchEnds(), (unsigned)gRoomEnds,
+                     panel, gPath);
         return true;
     }
     if (!strcmp(arg, "0") || !strcmp(arg, "1")) {
@@ -407,7 +361,6 @@ bool Command(const char* line) {
         sscanf(line, "%*s %*s %7s", v);
         gTest = !strcmp(v, "1");
         gInMatch = false;
-        gBoardLookAt = 0;  // the test file's board at the next tick outside a fight
         Logger::Info("SCORE test %s", gTest ? "on: EVERY fight counts (offline too, this PC's player is player 1), into match_history_test.txt"
                                             : "off: online one-on-one matches only");
         return true;

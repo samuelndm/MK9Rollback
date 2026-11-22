@@ -58,6 +58,9 @@ void Tick();                             // every engine tick (handshake, arming
 bool SkipNative();                       // the native exchange is replaced right now
 int LocalPlayer();                       // 1 or 2: which fighter this game controls in the online fight (0 = unknown)
 uint64_t Opponent();                     // the current opponent's SteamID64 (named, or found in this match's connection); 0 unknown
+// How many online matches this mode has seen end (the connection quiet for 20 s, a new connection, the King of the Hill
+// room left): a different number than before means the players were apart in between (net\ScoreKeeper.h's room).
+uint32_t MatchEnds();
 bool Engaged();                          // armed through the online mode for the current fight
 void OnSessionStop(const char* why);     // a P2P session ended: idle-timer grace period; a timeline restart re-arms
 // A session frame is about to start, live or replayed, with the game's state as that frame finds it (RollbackManager's
