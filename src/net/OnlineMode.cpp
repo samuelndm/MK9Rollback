@@ -20,6 +20,7 @@
 #include "FinisherRule.h"
 #include "HelloProto.h"
 #include "KothRoom.h"
+#include "PingRule.h"
 #include "Refight.h"
 #include "StageFlow.h"
 #include "StagePick.h"
@@ -73,8 +74,8 @@ int gDelay = 1;  // the fixed input delay (unused with gPingDelay)
 // it has kPingFinal round trips (or at the fight's connection, with what it has); the session uses the larger of the
 // two proposals, so both games run the same delay. GGPO would also accept a different delay per side.
 bool gPingDelay = false;
-constexpr uint32_t kPingKeep = 16, kPingMin = 4, kPingFinal = 8;
-constexpr int kMaxRollbackDelay = 6;  // DelayFromPing's largest rollback delay (4 before 2026-11-06)
+constexpr uint32_t kPingKeep = PingRule::kKeep, kPingMin = 4, kPingFinal = 8;
+constexpr int kMaxRollbackDelay = PingRule::kMaxRollbackDelay;  // DelayFromPing's largest rollback delay (4 before 2026-11-06)
 // Everything this game proposes fits what a hello may carry (the other game's values are cut to it when read).
 static_assert(kMaxRollbackDelay <= HelloProto::kMaxDelay, "the ping's proposals must fit the hello's delay range");
 uint32_t gPing[kPingKeep] = {}, gPingCount = 0;  // round trips in ms (ring; gPingCount counts every sample)
@@ -374,14 +375,13 @@ void StartWifiProbe() {  // once per match (MatchReset), and when the mod is arm
 
 const char* WifiText(int wifi) { return wifi > 0 ? "on Wi-Fi" : wifi == 0 ? "not on Wi-Fi" : "unknown"; }
 
-// The second-highest of the kept round trips: one late hello does not decide the delay. 0 without samples.
-uint32_t PingEstimate(uint32_t* median) {
-    const uint32_t n = gPingCount < kPingKeep ? gPingCount : kPingKeep;
-    uint32_t s[kPingKeep];
-    memcpy(s, gPing, n * sizeof s[0]);
-    std::sort(s, s + n);
-    if (median) *median = n ? s[n / 2] : 0;
-    return n >= 2 ? s[n - 2] : n ? s[0] : 0;
+// The second-highest of the kept round trips (one late hello does not decide the delay), for the log lines; 0 without
+// samples. What decides the delay: PingRule::DelayFor (median and second-highest).
+uint32_t PingEstimate(uint32_t* median, uint32_t* lowest = nullptr) {
+    const PingRule::Readings r = PingRule::Summarize(gPing, gPingCount);
+    if (median) *median = r.median;
+    if (lowest) *lowest = r.lowest;
+    return r.secondHighest;
 }
 
 // The smallest delay (frames of 1000/60 ms) the round trip allows, from 2 up to 3 (Safe mode) or from 1 up to 6
@@ -400,9 +400,9 @@ uint32_t PingEstimate(uint32_t* median) {
 // dropped). b34/b35 (two games on one PC): delay 1 at a 20-30 ms and a 40-60 ms simulated round trip had the hitches of
 // delay 2, but on a PC slowed by 6 ms a tick the replays it adds cost ~119 hitches a minute (delay 2: 5-40). So delay 1 up
 // to a 50 ms round trip, and only while this PC keeps up: gCpuFloor.
-// Hellos are sent and read at a fixed point of each game's tick, so a round trip reads as whole frames (33, 50, 67 ms;
-// the field log's second-highest was 49-51 in 14 of 19 matches): the limit is 3 frames plus a margin, not 50 exactly.
-constexpr uint32_t kDelay1UpToMs = 55;
+// Hellos are sent and read at a fixed point of each game's tick, so a round trip reads as whole frames (33, 50, 67 ms):
+// the limit is 3 frames plus a margin, not 50 exactly. Since 2026-11-22 the median decides delay 1, not the
+// second-highest (PingRule.h: two spikes of 67 put a whole match of the user's 22 ms link at delay 2).
 // The smallest rollback delay this PC runs without replay hitches: 1 until a round at delay 1 had kCpuHitchesPerK or more
 // live frames >= 25 ms with a replay per 1000 frames (FramePace::TakeReplayHitches), then 2 for the rest of the game's run
 // (a PC does not get faster; the next rounds and matches propose 2, and the larger proposal wins).
@@ -411,16 +411,7 @@ constexpr uint32_t kCpuHitchesPerK = 3;
 int DelayFromPing(uint32_t margin = 0) {
     const bool lockstep = Rollback::Lockstep();
     if (gPingCount < kPingMin) return lockstep ? 3 : 2;
-    const uint32_t est = PingEstimate(nullptr) + margin;
-    if (lockstep) return est + 10 <= 2u * 2000 / 60 ? 2 : 3;
-    if (est <= kDelay1UpToMs) return gCpuFloor > 1 ? gCpuFloor : 1;
-    // Half a frame above the 6, 8, 12 and 15 frames the limits were (round 3, timing audit): a hello round trip reads as
-    // whole frames give or take a millisecond, so a link of exactly 8 frames read 133 or 134 ms and its delay flipped
-    // between 3 and 4 from match to match (the same for 100, 200 and 250 ms). kDelay1UpToMs got the same margin in rc20.
-    static constexpr uint32_t kRollbackUpTo[] = {108, 142, 208, 258};  // delays 2, 3, 4, 5
-    for (int d = 2; d <= 5; ++d)
-        if (est <= kRollbackUpTo[d - 2]) return d;
-    return kMaxRollbackDelay;
+    return PingRule::DelayFor(PingRule::Summarize(gPing, gPingCount), lockstep, margin, gCpuFloor);
 }
 
 // The delay the last round trips allow now (0: not adapting); below the running session's only with kDownMarginMs spare.
@@ -437,16 +428,16 @@ int AgreedDelay() { return gPeerDelay > OwnDelay() ? gPeerDelay : OwnDelay(); }
 void FinalizeDelay(const char* when) {
     gOwnDelay = DelayFromPing();
     gLastHelloTx = 0;  // tell the other game at the next tick
-    uint32_t median = 0;
-    const uint32_t est = PingEstimate(&median);
+    uint32_t median = 0, lowest = 0;
+    const uint32_t est = PingEstimate(&median, &lowest);
     const uint32_t n = gPingCount < kPingKeep ? gPingCount : kPingKeep;
     if (gPingCount < kPingMin)
         Logger::Info("ONLINE: input delay %d proposed %s (only %u round trip(s) measured: the usual delay)", gOwnDelay, when,
                      (unsigned)gPingCount);
     else
         Logger::Info("ONLINE: round trip to the other game %u ms (second-highest of %u hellos, median %u ms; %u read late and "
-                     "not counted): input delay %d proposed %s (%s)",
-                     (unsigned)est, (unsigned)n, (unsigned)median, (unsigned)gLateHelloReads, gOwnDelay, when,
+                     "not counted; lowest %u ms): input delay %d proposed %s (%s)",
+                     (unsigned)est, (unsigned)n, (unsigned)median, (unsigned)gLateHelloReads, (unsigned)lowest, gOwnDelay, when,
                      Rollback::Lockstep() ? "Safe mode" : "rollback");
 }
 

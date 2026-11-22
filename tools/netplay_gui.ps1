@@ -208,11 +208,23 @@ if ($kHighContrast) {
         Quiet = $sc::Control; QuietText = $sc::GrayText; Running = $sc::Control; Banner = $sc::Info; BannerText = $sc::InfoText }
 } else {
     $c = @{ Bg = Hex 'Bg'; Panel = Hex 'Panel'; Field = Hex 'Field'; Border = Hex 'Border'; Text = Hex 'Text'; Muted = Hex 'Muted'
-        FieldText = [System.Drawing.ColorTranslator]::FromHtml('#D5D9DF'); Accent = Hex 'Accent'; AccentHot = Hex 'AccentHot'; AccentDown = Hex 'AccentDown'
-        OnAccent = [System.Drawing.Color]::White; Good = Hex 'Good'; Warn = Hex 'Warn'; Bad = Hex 'Bad'; Idle = Hex 'Idle'
-        Link = [System.Drawing.ColorTranslator]::FromHtml('#B9C2CE'); LinkOff = [System.Drawing.ColorTranslator]::FromHtml('#5A626D')
-        Quiet = [System.Drawing.ColorTranslator]::FromHtml('#252A32'); QuietText = Hex 'Muted'
-        Running = [System.Drawing.ColorTranslator]::FromHtml('#17301F'); Banner = [System.Drawing.ColorTranslator]::FromHtml('#2B2113'); BannerText = Hex 'Text' }
+        FieldText = [System.Drawing.ColorTranslator]::FromHtml('#E2D8C6'); Accent = Hex 'Accent'; AccentHot = Hex 'AccentHot'; AccentDown = Hex 'AccentDown'
+        OnAccent = [System.Drawing.ColorTranslator]::FromHtml('#FBEBC0'); Good = Hex 'Good'; Warn = Hex 'Warn'; Bad = Hex 'Bad'; Idle = Hex 'Idle'
+        Link = [System.Drawing.ColorTranslator]::FromHtml('#CDBB97'); LinkOff = [System.Drawing.ColorTranslator]::FromHtml('#5C5045')
+        Quiet = [System.Drawing.ColorTranslator]::FromHtml('#241A15'); QuietText = Hex 'Muted'
+        Running = [System.Drawing.ColorTranslator]::FromHtml('#14281A'); Banner = [System.Drawing.ColorTranslator]::FromHtml('#2E1A0E'); BannerText = Hex 'Text' }
+}
+# The arena look's extra colours: gold for the title, the rules and the button edges; the header's dark red; the
+# credit strip under the footer. With high contrast, the system's.
+if ($kHighContrast) {
+    $c.Gold = $c.Text; $c.GoldDim = $c.Border; $c.Blood = $c.Panel; $c.Strip = $c.Bg
+} else {
+    $c.Gold = Hex 'Gold'; $c.GoldDim = Hex 'GoldDim'; $c.Blood = Hex 'Blood'; $c.Strip = [System.Drawing.ColorTranslator]::FromHtml('#070504')
+}
+# The title and the big button's font: Impact (on every Windows since XP; another font if it is missing).
+function DisplayFont([single]$size) { New-Object System.Drawing.Font('Impact', $size) }
+function Mix($a, $b, [double]$t) {
+    [System.Drawing.Color]::FromArgb([int]($a.R + ($b.R - $a.R) * $t), [int]($a.G + ($b.G - $a.G) * $t), [int]($a.B + ($b.B - $a.B) * $t))
 }
 function UiFont([single]$size, [switch]$Bold, [switch]$Semi) {
     if ($Semi) { return New-Object System.Drawing.Font('Segoe UI Semibold', $size) }
@@ -256,10 +268,27 @@ function Link($parent, [string]$text, $x, $y, $w, [string]$align = 'MiddleLeft')
     $l.TabStop = $true
     Place $l $parent $x $y $w 22
 }
-function Rule($y) {
+# A rule across the window: a gold line that fades out at both ends ($strong: brighter, the header's edge).
+function Rule($y, [int]$h = 1, [switch]$Strong) {
     $r = New-Object System.Windows.Forms.Panel
     $r.BackColor = $c.Border
-    Place $r $form 0 $y 460 1
+    if (-not $kHighContrast) {
+        $r.BackColor = $c.Bg
+        $r.Tag = if ($Strong) { $c.Gold } else { $c.GoldDim }
+        $r.Add_Paint({ param($s, $e) PaintFade $e.Graphics $s.ClientRectangle $s.Tag $c.Bg })
+    }
+    Place $r $form 0 $y 460 $h
+}
+function PaintFade($g, $rect, $mid, $edge) {
+    if ($rect.Width -lt 2 -or $rect.Height -lt 1) { return }
+    $wide = New-Object System.Drawing.Rectangle(($rect.X - 1), $rect.Y, ($rect.Width + 2), $rect.Height)
+    $br = New-Object System.Drawing.Drawing2D.LinearGradientBrush($wide, $edge, $edge, [single]0)
+    $blend = New-Object System.Drawing.Drawing2D.ColorBlend(3)
+    $blend.Colors = [System.Drawing.Color[]]@($edge, $mid, $edge)
+    $blend.Positions = [single[]]@(0, 0.5, 1)
+    $br.InterpolationColors = $blend
+    $g.FillRectangle($br, $rect)
+    $br.Dispose()
 }
 $script:dpi = 96.0
 try { $g0 = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:dpi = [double]$g0.DpiX; $g0.Dispose() } catch { }
@@ -294,10 +323,18 @@ function PaintButton($b, $g) {
     $g.Clear($b.Parent.BackColor)
     $fill = if ($t.Pressed) { $t.Down } elseif ($t.Over) { $t.Hot } else { $t.Back }
     $r = [single](Scaled $t.Radius)
-    $path = RoundedPath 0 0 $b.Width $b.Height $r
-    $brush = New-Object System.Drawing.SolidBrush($fill)
+    # Lit from above: lighter at the top, darker at the bottom; a gold edge on a red (ready) button, a bronze one else.
+    $path = RoundedPath 0.5 0.5 ($b.Width - 1) ($b.Height - 1) $r
+    $all = New-Object System.Drawing.Rectangle(0, 0, $b.Width, ($b.Height + 1))
+    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($all, (Mix $fill ([System.Drawing.Color]::FromArgb(255, 120, 60)) 0.10), (Mix $fill ([System.Drawing.Color]::Black) 0.45), [single]90)
     $g.FillPath($brush, $path)
-    $brush.Dispose(); $path.Dispose()
+    $lit = $fill.ToArgb() -eq $c.Accent.ToArgb() -or $fill.ToArgb() -eq $c.AccentHot.ToArgb() -or $fill.ToArgb() -eq $c.AccentDown.ToArgb()
+    $edgeColor = if ($lit) { $c.Gold } else { $c.Border }
+    $edgePen = New-Object System.Drawing.Pen($edgeColor, [single][Math]::Max(1, (Scaled 1)))
+    $g.DrawPath($edgePen, $path)
+    $shine = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(45, 255, 240, 210), [single]1)
+    $g.DrawLine($shine, [single]($r), [single](Scaled 2), [single]($b.Width - $r), [single](Scaled 2))
+    $brush.Dispose(); $path.Dispose(); $edgePen.Dispose(); $shine.Dispose()
     # The keyboard's focus mark, once Windows shows such marks (after Tab or Alt): WM_QUERYUISTATE, UISF_HIDEFOCUS.
     $marks = $false
     try { $marks = $b.Focused -and (([int64][MK9R.Native]::SendMessage($b.Handle, 0x0129, [IntPtr]::Zero, [IntPtr]::Zero) -band 1) -eq 0) } catch { }
@@ -309,6 +346,10 @@ function PaintButton($b, $g) {
         $pen.Dispose(); $ring.Dispose()
     }
     $flags = [System.Windows.Forms.TextFormatFlags]'HorizontalCenter, VerticalCenter, SingleLine, HidePrefix'
+    if ($lit) {
+        $sh = $b.ClientRectangle; $sh.Offset((Scaled 1), (Scaled 2))
+        [System.Windows.Forms.TextRenderer]::DrawText($g, $b.Text, $b.Font, $sh, (Mix $fill ([System.Drawing.Color]::Black) 0.65), $flags)
+    }
     [System.Windows.Forms.TextRenderer]::DrawText($g, $b.Text, $b.Font, $b.ClientRectangle, $t.Fore, $flags)
 }
 
@@ -321,11 +362,39 @@ $logo.SizeMode = 'Zoom'
 $logo.BackColor = $c.Panel
 try { $logo.Image = New-LogoBitmap (Scaled 48) } catch { }
 [void](Place $logo $header 20 18 48 48)
-[void](Label $header 'MK9 Rollback' 80 13 240 32 (UiFont 16 -Semi) $c.Text)
-[void](Label $header (Tr 'Rollback netcode for Mortal Kombat Komplete Edition') 82 47 366 20 (UiFont 9) $c.Muted)
-$verLabel = Label $header $kVersionText 300 20 148 18 (UiFont 8.25) $c.Muted
+$kTitle = 'MK9 ROLLBACK'
+$kTitleFont = DisplayFont 21
+if ($kHighContrast) {
+    [void](Label $header $kTitle 80 10 240 36 $kTitleFont $c.Text)
+} else {
+    # The arena look: dark red to black from the left, the title in gold with a shadow (painted, so it can shade).
+    $logo.BackColor = [System.Drawing.Color]::Transparent
+    $header.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $all = $s.ClientRectangle
+        $back = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Rectangle(-1, 0, ($all.Width + 2), $all.Height)), $c.Blood, $c.Panel, [single]0)
+        $blend = New-Object System.Drawing.Drawing2D.ColorBlend(3)
+        $blend.Colors = [System.Drawing.Color[]]@($c.Blood, (Mix $c.Blood $c.Panel 0.55), $c.Panel)
+        $blend.Positions = [single[]]@(0, 0.45, 1)
+        $back.InterpolationColors = $blend
+        $g.FillRectangle($back, $all)
+        $back.Dispose()
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $at = New-Object System.Drawing.PointF([single](Scaled 78), [single](Scaled 8))
+        $shadow = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(200, 0, 0, 0))
+        $g.DrawString($kTitle, $kTitleFont, $shadow, [single]($at.X + (Scaled 2)), [single]($at.Y + (Scaled 2)))
+        $box = New-Object System.Drawing.RectangleF($at.X, $at.Y, [single](Scaled 260), [single](Scaled 40))
+        $gold = New-Object System.Drawing.Drawing2D.LinearGradientBrush($box, (Hex 'AccentA'), (Hex 'AccentB'), [single]90)
+        $g.DrawString($kTitle, $kTitleFont, $gold, $at)
+        $shadow.Dispose(); $gold.Dispose()
+    })
+}
+$tagline = Label $header (Tr 'Rollback netcode for Mortal Kombat Komplete Edition') 81 50 366 20 (UiFont 9) $c.Muted
+$verLabel = Label $header $kVersionText 300 14 148 18 (UiFont 8.25) $c.Muted
 $verLabel.TextAlign = 'TopRight'
-[void](Rule 84)
+if (-not $kHighContrast) { $tagline.BackColor = [System.Drawing.Color]::Transparent; $verLabel.BackColor = [System.Drawing.Color]::Transparent }
+[void](Rule 84 2 -Strong)
 
 # What is going on now: a coloured dot, one line, and one sentence of what to do next.
 $dot = Label $form ([string][char]0x25CF) 18 97 22 28 (UiFont 13) $c.Idle
@@ -333,8 +402,8 @@ $headline = Label $form '' 40 98 404 28 (UiFont 12.5 -Semi) $c.Text
 $subline = Label $form '' 21 128 420 38 (UiFont 9) $c.Muted
 
 $play = New-Object System.Windows.Forms.Button
-$play.Font = UiFont 14 -Bold
-StyleButton $play 7
+$play.Font = DisplayFont 19
+StyleButton $play 4
 [void](Place $play $form 20 172 420 54)
 $form.AcceptButton = $play
 
@@ -381,19 +450,63 @@ $matchLabel = Label $form (Tr 'Last match: none yet.') 21 486 420 20 (UiFont 9) 
 $recordLabel = Label $form (Tr 'Score: no online match counted yet.') 21 506 420 20 (UiFont 9) $c.Text
 $hintLabel = Label $form '' 21 528 420 20 (UiFont 9) $c.Warn
 [void](Rule 556)
-$trouble = Link $form (Tr '&Having trouble?') 19 568 110
-$saveLogs = Link $form (Tr '&Save logs to the Desktop') 136 568 166
-$updLink = Link $form (Tr '&Check for updates') 300 568 142 'MiddleRight'
+# The footer: two centred rows of links with gold diamonds between them (CenterRow places them once the window is
+# scaled: their widths depend on the language and the display), then the credit strip.
+function FooterLink([string]$text, $y) {
+    $l = Link $form $text 0 $y 100 'MiddleCenter'
+    $l.AutoSize = $true
+    $l
+}
+function Diamond($y) {
+    $d = Label $form ([string][char]0x25C6) 0 $y 10 22 (UiFont 6.75) $c.GoldDim
+    $d.AutoSize = $true
+    $d
+}
+$trouble = FooterLink (Tr '&Having trouble?') 566
+$footDot1 = Diamond 566
+$saveLogs = FooterLink (Tr '&Save logs to the Desktop') 566
+$footDot2 = Diamond 566
+$updLink = FooterLink (Tr '&Check for updates') 566
 # Where "Go back to the previous version" was until 2026-11-16: with updates installed by themselves, an older version
 # would only be updated again at the next start.
-$langLink = Link $form (Tr '&Language: {0}' (Get-UiLanguageName $script:UiLang)) 19 592 240
-$historyLink = Link $form (Tr '&Matches and replays') 280 592 162 'MiddleRight'
-# The credit line: the author's nickname and the project's page (the releases' repository, updater.ps1 $kUpdateRepo).
+$historyLink = FooterLink (Tr '&Matches and replays') 590
+$footDot3 = Diamond 590
+$langLink = FooterLink (Tr '&Language: {0}' (Get-UiLanguageName $script:UiLang)) 590
+$kFooterRows = @(@($trouble, $footDot1, $saveLogs, $footDot2, $updLink), @($historyLink, $footDot3, $langLink))
+function CenterRow($items) {
+    $gap = Scaled 10
+    $total = 0
+    foreach ($i in $items) { $total += $i.Width }
+    $total += $gap * ($items.Count - 1)
+    $x = [int](($form.ClientSize.Width - $total) / 2)
+    $mid = $items[0].Top + [int]($items[0].Height / 2)
+    foreach ($i in $items) { $i.Left = $x; $i.Top = $mid - [int]($i.Height / 2); $x += $i.Width + $gap }
+}
+# The credit strip: the author's nickname and the project's page (the releases' repository, updater.ps1 $kUpdateRepo).
 $kProjectUrl = 'https://github.com/samuelndm/MK9Rollback'
-$creditLabel = Label $form (Tr 'Made by Gyros') 21 616 170 22 (UiFont 9) $c.Muted
-$creditLabel.TextAlign = 'MiddleLeft'
-$creditLink = Link $form 'github.com/samuelndm/MK9Rollback' 192 616 250 'MiddleRight'
+$strip = New-Object System.Windows.Forms.Panel
+$strip.BackColor = $c.Strip
+[void](Place $strip $form 0 616 460 28)
+$kCreditBy = Tr 'Made by Gyros'
+$kCreditUrl = 'github.com/samuelndm/MK9Rollback'
+$creditLink = New-Object System.Windows.Forms.LinkLabel
+$creditLink.Text = "$kCreditBy   $([char]0x00B7)   $kCreditUrl"
+$creditLink.LinkArea = New-Object System.Windows.Forms.LinkArea(($creditLink.Text.Length - $kCreditUrl.Length), $kCreditUrl.Length)
+$creditLink.TextAlign = 'MiddleCenter'
+$creditLink.Font = UiFont 8.25
+$creditLink.ForeColor = $c.GoldDim
+$creditLink.LinkBehavior = 'HoverUnderline'
+$creditLink.LinkColor = $c.Muted; $creditLink.VisitedLinkColor = $c.Muted; $creditLink.ActiveLinkColor = $c.Gold
+$creditLink.UseMnemonic = $false
+[void](Place $creditLink $strip 0 0 460 28)
 $creditLink.Add_LinkClicked({ try { Start-Process $kProjectUrl } catch { Say $kProjectUrl } })
+if (-not $kHighContrast) {
+    $creditLink.ForeColor = $c.Gold
+    $stripEdge = New-Object System.Windows.Forms.Panel
+    $stripEdge.BackColor = $c.Strip
+    $stripEdge.Add_Paint({ param($s, $e) PaintFade $e.Graphics $s.ClientRectangle $c.GoldDim $c.Strip })
+    [void](Place $stripEdge $strip 0 0 460 1)
+}
 
 # The window's icon: the mark at the title bar's and the taskbar's sizes. The title bar and the window's edge take the
 # header's colours where Windows can (dark title bar: Windows 10 1809 and later; the colours: Windows 11). Registered
@@ -424,6 +537,7 @@ $form.Add_HandleCreated({
 $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $form.ResumeLayout($true)
+foreach ($row in $kFooterRows) { CenterRow $row }
 # A small screen at a high scaling: scroll instead of cutting the bottom links off.
 $work = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
 if ($form.Height -gt $work.Height) { $form.AutoScroll = $true; $form.Height = $work.Height }

@@ -1,10 +1,14 @@
 # Host-side tests: no game, no injection. Built with the project's compiler into build\hosttests, at BelowNormal priority.
-#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,startsync,flow,stagepick,stagehold,refightvote,koth,presslatch,padgap,padpreset,score,replay,codewrite,strappend,stopkeep,guardpage,hud,scoreview,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
+#   .\tests\host\run.ps1 [-GgpoLib build\clang\libggpo.a] [-Only hello,finisher,pingrule,startsync,flow,stagepick,stagehold,refightvote,koth,presslatch,padgap,padpreset,score,replay,codewrite,strappend,stopkeep,guardpage,hud,scoreview,keyedge,syswatch,arenapics,stagescreen,ggpo,logger]
 #                        [-Seconds 25] [-GameDir <the folder that holds DiscContentPC>]
 #
 #   hello   src\net\HelloProto: the online mode's hello parsing, build comparison and ready decision.
 #   finisher  src\net\FinisherRule.h: the frame where a session is handed back to MK9's netcode in the finisher phase;
 #           two simulated games with different rollback histories must pick the same one.
+#   pingrule  src\net\PingRule.h: the online mode's input delay from the hello round trips. Against the rule it replaced
+#           (Safe mode unchanged; rollback's delay never larger, smaller only by the delay-1 rule), the field evenings'
+#           52 match starts (all at delay 1), and simulated links measured the way the games measure them (ticks at a
+#           random offset, spikes): a link of up to 2 frames gets delay 1, one longer than 3 frames never does.
 #   startsync  src\net\StartSync.h: the start alignment of a session's two games; two simulated games that reach frame 0
 #           at different moments exchange their timing over simulated links (trips of 0.1-80 ms, jitter, loss, the
 #           harness's loopback channel) and must end with their frame grids together, only the earlier game moving.
@@ -111,11 +115,11 @@
 #           thread of its own. Every program on the PC waits with it, so it refuses to start while MKKE runs.
 # Exit code: the number of tests that failed.
 param([string]$GgpoLib = 'build\clang\libggpo.a',
-      [string[]]$Only = @('hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padgap', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'stopkeep', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
+      [string[]]$Only = @('hello', 'finisher', 'pingrule', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padgap', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'stopkeep', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger'),
       [int]$Seconds = 25, [string]$GameDir = '')
 $ErrorActionPreference = 'Continue'
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })  # -File passes "a,b" as one string
-$known = 'hello', 'finisher', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padgap', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'stopkeep', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
+$known = 'hello', 'finisher', 'pingrule', 'startsync', 'flow', 'stagepick', 'stagehold', 'refightvote', 'koth', 'presslatch', 'padgap', 'padpreset', 'score', 'replay', 'codewrite', 'strappend', 'stopkeep', 'guardpage', 'hud', 'scoreview', 'keyedge', 'syswatch', 'arenapics', 'stagescreen', 'ggpo', 'logger', 'winlock'
 $unknown = @($Only | Where-Object { $_ -notin $known })
 if ($unknown.Count -or -not $Only.Count) { Write-Host "unknown or no test: '$($unknown -join ', ')' ($($known -join ', '))"; exit 99 }
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -209,6 +213,11 @@ function ArenaPackage {
         if (Test-Path $f) { return (Resolve-Path $f).Path }
     }
     return ''
+}
+
+if ($Only -contains 'pingrule') {
+    $ok = RunSmall 'pingrule_test' 'input delay from the hello round trips' @((Join-Path $PSScriptRoot 'pingrule_test.cpp')) @('-I', (Join-Path $root 'src\net')) 60
+    if (-not $ok) { $failed += 'pingrule' }
 }
 
 if ($Only -contains 'flow') {

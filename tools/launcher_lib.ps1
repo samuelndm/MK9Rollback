@@ -718,9 +718,10 @@ function Get-ConnectionHint {
 # brought (its allow-list takes no image file). A dark tile with a counter-clockwise arrow ("roll back") in the accent
 # colours, and a 9 inside from 32 px up. Returns a 32-bit bitmap of $size x $size; the caller disposes it.
 $script:UiColors = @{
-    Bg = '#0F1114'; Panel = '#171A1F'; Field = '#1C2026'; Border = '#2B3038'; Text = '#E8EAED'; Muted = '#9AA3AF'
-    Accent = '#F26B1D'; AccentHot = '#FF8534'; AccentDown = '#D4570F'; AccentA = '#FFB020'; AccentB = '#F0442C'
-    Good = '#3CCB7F'; Warn = '#FFB020'; Bad = '#FF5A52'; Idle = '#6B7380'
+    Bg = '#0D0A09'; Panel = '#160F0D'; Field = '#130E0C'; Border = '#3B2A1C'; Text = '#EEE6D6'; Muted = '#A6977F'
+    Accent = '#A8121A'; AccentHot = '#C81A23'; AccentDown = '#7E0D13'; AccentA = '#F3CF6E'; AccentB = '#B8862E'
+    Gold = '#D4AF5A'; GoldDim = '#7A5E2C'; Blood = '#3A0A0C'
+    Good = '#5BC27A'; Warn = '#E8B04A'; Bad = '#FF5A52'; Idle = '#6E6458'
 }
 function New-LogoBitmap([int]$size) {
     Add-Type -AssemblyName System.Drawing
@@ -740,10 +741,10 @@ function New-LogoBitmap([int]$size) {
         $tile.AddArc($m + $w - $d, $m + $w - $d, $d, $d, 0, 90); $tile.AddArc($m, $m + $w - $d, $d, $d, 90, 90)
         $tile.CloseFigure()
         $all = New-Object System.Drawing.RectangleF(0, 0, $n, $n)
-        $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($all, [System.Drawing.ColorTranslator]::FromHtml('#262A32'),
-            [System.Drawing.ColorTranslator]::FromHtml('#101216'), [single]90)
+        $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($all, [System.Drawing.ColorTranslator]::FromHtml('#4A0E10'),
+            [System.Drawing.ColorTranslator]::FromHtml('#120807'), [single]90)
         $g.FillPath($bg, $tile)
-        $edge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(70, 255, 255, 255), [single][Math]::Max(1, $n * 0.012))
+        $edge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 212, 175, 90), [single][Math]::Max(1, $n * 0.012))
         $g.DrawPath($edge, $tile)
         # the arrow: an open ring, its head at the upper left pointing counter-clockwise
         $small = $size -lt 32
@@ -770,7 +771,7 @@ function New-LogoBitmap([int]$size) {
             $font = New-Object System.Drawing.Font('Segoe UI', [single]($n * 0.27), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
             $fmt = New-Object System.Drawing.StringFormat
             $fmt.Alignment = [System.Drawing.StringAlignment]::Center; $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
-            $white = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml('#F4F5F7'))
+            $white = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml('#F6E3B4'))
             $g.DrawString('9', $font, $white, (New-Object System.Drawing.RectangleF(0, [single]($n * 0.02), $n, $n)), $fmt)
             $font.Dispose(); $fmt.Dispose(); $white.Dispose()
         }
